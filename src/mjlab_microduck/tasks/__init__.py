@@ -75,7 +75,20 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_tippy_taps_env_cfg import (
+    make_microduck_tippy_taps_env_cfg,
+    MicroduckTippyTapsRlCfg,
+)
 from .backlash import make_backlash_variant
+
+# Tippy taps — excited-dog alternating foot taps on the spot (go-ducks skill)
+register_mjlab_task(
+    task_id="Mjlab-TippyTaps-Flat-MicroDuck",
+    env_cfg=make_microduck_tippy_taps_env_cfg(),
+    play_env_cfg=make_microduck_tippy_taps_env_cfg(play=True),
+    rl_cfg=MicroduckTippyTapsRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Standard velocity task
 register_mjlab_task(

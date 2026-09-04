@@ -7186,3 +7186,144 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Tâche TIPPY TAPS — excited-dog alternating foot taps on the spot             #
+# --------------------------------------------------------------------------- #
+# Port of microduck_local's `tippy_taps` behavior (jonathanhawkins/microduck-lab,
+# branch go). Per-env memory (which foot was up last, time since the last real
+# lift, whether the spawn has touched down) is updated ONCE per env step by
+# `_tt_update`, keyed on `common_step_counter`, so the reward terms below stay
+# order-independent and zero-weight-safe. Fresh episodes re-arm everything.
+
+TT_MIN_AIR_S = 0.04     # shorter is contact chatter, not a lift
+TT_MAX_AIR_S = 0.25     # longer is a balance hold, not a tap
+TT_IDLE_GRACE_S = 0.30  # double support this long between taps is free
+TT_IDLE_FULL_S = 0.80   # idle penalty saturates at 1.0 here
+
+
+def _tt_update(env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg) -> None:
+    tick = int(env.common_step_counter)
+    if getattr(env, "_tt_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_tt_prev_up"):
+        env._tt_prev_up = torch.full((n,), -1, dtype=torch.long, device=dev)
+        env._tt_cur_up = torch.full((n,), -1, dtype=torch.long, device=dev)
+        env._tt_alternated = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._tt_idle = torch.zeros(n, device=dev)
+        env._tt_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._tt_home = torch.zeros(n, 2, device=dev)
+    env._tt_tick = tick
+
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0                       # (B, 2) bool
+    air = torch.nan_to_num(sensor.data.current_air_time[:, :2], nan=0.0)
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    fresh = env.episode_length_buf <= 1
+    env._tt_prev_up[fresh] = -1
+    env._tt_cur_up[fresh] = -1
+    env._tt_alternated[fresh] = False
+    env._tt_idle[fresh] = 0.0
+    env._tt_landed[fresh] = False
+    env._tt_home[fresh] = root_xy[fresh]
+
+    up = ~found
+    one_up = up.sum(dim=1) == 1
+    cur = torch.where(one_up, up[:, 1].long(), torch.full_like(env._tt_cur_up, -1))
+    new_lift = one_up & (cur != env._tt_cur_up)
+    alternated_new = new_lift & (env._tt_prev_up >= 0) & (cur != env._tt_prev_up)
+    env._tt_alternated = torch.where(new_lift, alternated_new, env._tt_alternated & one_up)
+    env._tt_prev_up = torch.where(new_lift, cur, env._tt_prev_up)
+    env._tt_cur_up = cur
+    env._tt_landed |= found.all(dim=1)
+    real_lift = (air >= TT_MIN_AIR_S).any(dim=1)
+    env._tt_idle = torch.where(real_lift, torch.zeros_like(env._tt_idle),
+                               env._tt_idle + env.step_dt)
+
+
+def _tt_in_window(env: ManagerBasedRlEnv, sensor_name: str,
+                  min_air: float, max_air: float) -> torch.Tensor:
+    """(B,) bool: exactly one foot up AND that foot's current air time is a tap."""
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0
+    air = torch.nan_to_num(sensor.data.current_air_time[:, :2], nan=0.0)
+    up = ~found
+    one_up = up.sum(dim=1) == 1
+    window = (air >= min_air) & (air <= max_air)
+    return one_up & (up & window).any(dim=1)
+
+
+def tt_tap_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_air: float = TT_MIN_AIR_S,
+    max_air: float = TT_MAX_AIR_S,
+    gate_tilt_above_deg: float = 40.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """The main dish, per step, 0..1: upright with exactly one foot briefly up."""
+    _tt_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    upright = 1.0 - _fallen_mask(env, asset, 0.0, gate_tilt_above_deg)
+    return _tt_in_window(env, sensor_name, min_air, max_air).float() * upright
+
+
+def tt_switch_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    min_air: float = TT_MIN_AIR_S,
+    max_air: float = TT_MAX_AIR_S,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1 per step: the foot that is up is the OTHER one from the last lift.
+    What turns a one-legged hop into taps."""
+    _tt_update(env, sensor_name, asset_cfg)
+    return (_tt_in_window(env, sensor_name, min_air, max_air) & env._tt_alternated).float()
+
+
+def tt_idle_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    grace_s: float = TT_IDLE_GRACE_S,
+    full_s: float = TT_IDLE_FULL_S,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 cost (negative weight): time since the last real lift, past a
+    grace period. The anti-"learned to stand" pressure. Flicker-proof: a
+    one-step contact loss is not a lift."""
+    _tt_update(env, sensor_name, asset_cfg)
+    return torch.clamp((env._tt_idle - grace_s) / max(full_s - grace_s, 1e-6), 0.0, 1.0)
+
+
+def tt_hop_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1 cost (negative weight): both feet off the floor, once the spawn has
+    touched down (the standing spawn drops its last millimetres — not the
+    policy's fault)."""
+    _tt_update(env, sensor_name, asset_cfg)
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0
+    return ((~found).all(dim=1) & env._tt_landed).float()
+
+
+def tt_drift_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded cost (negative weight): squared distance from where the
+    episode started. Velocity tracking at zero command prices drift SPEED; a
+    slow shuffle beats that, so this anchors POSITION too (lab lesson)."""
+    _tt_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    d2 = torch.sum(torch.square(root_xy - env._tt_home), dim=1)
+    return torch.clamp(d2 / 0.01, 0.0, max_cost)   # saturates at 10 cm
