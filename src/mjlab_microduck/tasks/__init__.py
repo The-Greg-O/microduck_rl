@@ -75,6 +75,10 @@ from .microduck_roulade_env_cfg import (
     make_microduck_roulade_env_cfg,
     MicroduckRouladeRlCfg,
 )
+from .microduck_happy_spin_env_cfg import (
+    make_microduck_happy_spin_env_cfg,
+    MicroduckHappySpinRlCfg,
+)
 from .microduck_tippy_taps_env_cfg import (
     make_microduck_tippy_taps_env_cfg,
     MicroduckTippyTapsRlCfg,
@@ -256,6 +260,18 @@ register_mjlab_task(
     env_cfg=make_microduck_spin_env_cfg(),
     play_env_cfg=make_microduck_spin_env_cfg(play=True),
     rl_cfg=MicroduckSpinRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# HappySpin — episodic excited-dog twirl on the legged model: one fast 360°
+# turn on the spot from a stand, then stand still, inside a 4 s window.
+# (Distinct from Mjlab-Spin-Flat-MicroDuck above, which is the cyclic roller
+# gesture on the ground-pick phase slot.)
+register_mjlab_task(
+    task_id="Mjlab-HappySpin-Flat-MicroDuck",
+    env_cfg=make_microduck_happy_spin_env_cfg(),
+    play_env_cfg=make_microduck_happy_spin_env_cfg(play=True),
+    rl_cfg=MicroduckHappySpinRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

@@ -7365,3 +7365,203 @@ def tt_drift_penalty(
     root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
     d2 = torch.sum(torch.square(root_xy - env._tt_home), dim=1)
     return torch.clamp(d2 / 0.01, 0.0, max_cost)   # saturates at 10 cm
+
+
+# --------------------------------------------------------------------------- #
+# HAPPY SPIN — one fast 360° turn on the spot, then stand still                 #
+# --------------------------------------------------------------------------- #
+# Episodic skill, walk model, built on the velocity recipe (tippy-taps pattern).
+# Per-env memory (accumulated yaw, the spin/settle phase latch, the episode's
+# start position) is updated ONCE per env step by `_hs_update`, keyed on
+# `common_step_counter`, so the reward terms below stay order-independent and
+# zero-weight-safe. Fresh episodes re-arm everything.
+#
+# DIRECTION IS FIXED: counter-clockwise, i.e. +z yaw rate in the trunk frame.
+# The 61D observation contract has no free slot to tell the policy which way to
+# turn, so a per-env random direction would be unobservable and unlearnable —
+# one direction it is (`HS_DIRECTION`).
+
+HS_TARGET_YAW = 2.0 * math.pi   # one full turn
+HS_DIRECTION = 1.0              # +1 = counter-clockwise (+z yaw rate)
+HS_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the spin pays
+HS_RATE_CAP = 2.0 * math.pi     # progress pay saturates at 1 turn/s (rad/s)
+
+
+def _hs_update(
+    env: ManagerBasedRlEnv,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+) -> None:
+    """Tick the per-env spin memory exactly once per env step.
+
+    Buffers:
+      ``_hs_raw``      the raw signed yaw integral in the commanded direction.
+                       May go negative: spinning backwards is simply not
+                       progress.
+      ``_hs_yaw``      the PROGRESS POTENTIAL: the running maximum of
+                       ``_hs_raw``, clamped to [0, target_yaw]. Monotone by
+                       construction, so a back-and-forth wobble cannot re-earn
+                       the same degrees twice, and over-spinning past the full
+                       turn pays nothing at all.
+      ``_hs_prev_yaw`` the previous step's potential → the progress term pays
+                       Δ, which is potential-based: the whole turn is worth the
+                       same total however it is executed, and holding pays 0.
+      ``_hs_done``     latched True the step ``_hs_yaw`` reaches ``target_yaw``
+                       → the SETTLE phase. Latched, so a wobble past the line
+                       cannot re-open the spin phase and farm the bonus twice.
+      ``_hs_just_done`` True only on the single step the latch flipped.
+      ``_hs_home``     trunk xy at episode start, for the drift cost.
+    """
+    tick = int(env.common_step_counter)
+    if getattr(env, "_hs_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_hs_yaw"):
+        env._hs_raw = torch.zeros(n, device=dev)
+        env._hs_yaw = torch.zeros(n, device=dev)
+        env._hs_prev_yaw = torch.zeros(n, device=dev)
+        env._hs_done = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._hs_just_done = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._hs_home = torch.zeros(n, 2, device=dev)
+    env._hs_tick = tick
+
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    fresh = env.episode_length_buf <= 1
+    env._hs_raw[fresh] = 0.0
+    env._hs_yaw[fresh] = 0.0
+    env._hs_prev_yaw[fresh] = 0.0
+    env._hs_done[fresh] = False
+    env._hs_just_done[fresh] = False
+    env._hs_home[fresh] = root_xy[fresh]
+
+    omega_z = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    env._hs_prev_yaw = env._hs_yaw.clone()
+    env._hs_raw = env._hs_raw + direction * omega_z * env.step_dt
+    env._hs_yaw = torch.maximum(
+        env._hs_yaw, torch.clamp(env._hs_raw, 0.0, target_yaw)
+    )
+    reached = env._hs_yaw >= target_yaw
+    env._hs_just_done = reached & ~env._hs_done
+    env._hs_done = env._hs_done | reached
+
+
+def _hs_upright(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, gate_tilt_above_deg: float
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return 1.0 - _fallen_mask(env, asset, 0.0, gate_tilt_above_deg)
+
+
+def hs_progress_reward(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    rate_cap: float = HS_RATE_CAP,
+    gate_tilt_above_deg: float = HS_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """The main dish, 0..1 per step: yaw progress toward the full turn.
+
+    Pays Δ(progress potential)/(rate_cap · dt) — potential-based, so holding
+    still pays zero, a back-and-forth wobble cannot re-earn the same degrees
+    (the potential is a running maximum), and spinning on past the full turn
+    pays nothing (it is clamped at ``target_yaw``). No explicit settle-phase
+    gate is needed for any of that; the potential simply stops moving. Capped
+    at 1.0 per step so extra violence past ~1 turn/s buys nothing, and zeroed
+    while tilted past the upright gate.
+    """
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    delta = env._hs_yaw - env._hs_prev_yaw
+    rate = torch.clamp(delta / max(rate_cap * env.step_dt, 1e-6), 0.0, 1.0)
+    return rate * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def hs_complete_bonus(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    gate_tilt_above_deg: float = HS_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1, ONE step per episode: the full turn just completed, upright.
+
+    One-shot on purpose — a per-step "you are done" reward is the jackpot the
+    playbook warns about (arrive early, then farm), and would buy a ballistic
+    whip. The incentive to be FAST comes from the settle term instead: finish
+    sooner and more of the 4 s episode is spent collecting settle pay, which
+    only pays while actually still and standing.
+    """
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    return env._hs_just_done.float() * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def hs_settle_reward(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    rate_std: float = 1.0,
+    pose_std: float = 0.4,
+    joint_indices: Optional[list] = None,
+    gate_tilt_above_deg: float = HS_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step, settle phase only: stopped AND back in the STAND pose.
+
+    A PRODUCT of Gaussians (yaw rate → 0, legs → HOME), not a sum: an additive
+    pair has a compromise basin where a still-spinning crouch scores most of
+    the stack, while the product collapses on either deficient factor. Both
+    stds are wide enough that the first policy to complete a turn scores
+    visibly.
+    """
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    omega_z = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    still = torch.exp(-((omega_z / rate_std) ** 2))
+    pose = pose_target_match(
+        env, target_overrides=None, asset_cfg=asset_cfg,
+        std=pose_std, joint_indices=joint_indices,
+    )
+    settling = env._hs_done.float()
+    return still * pose * settling * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def hs_drift_penalty(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    max_cost: float = 1.0,
+    saturate_m: float = 0.10,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): squared distance travelled from
+    where the episode started. On the spot means on the spot — velocity
+    tracking at a zero linear command prices drift SPEED, and a slow creep
+    beats that (tippy-taps lesson), so anchor POSITION too."""
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    d2 = torch.sum(torch.square(root_xy - env._hs_home), dim=1)
+    return torch.clamp(d2 / max(saturate_m**2, 1e-9), 0.0, max_cost)
+
+
+def hs_tilt_penalty(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): 1 - cos(trunk tilt). A spin wants
+    the yaw axis vertical; this prices the lean without touching yaw rate
+    (unlike `angular_momentum`, whose 3D norm fights the trick itself and is
+    dropped from this task)."""
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0
+    )
+    return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
