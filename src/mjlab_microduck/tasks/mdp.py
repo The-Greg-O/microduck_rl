@@ -7385,6 +7385,17 @@ HS_TARGET_YAW = 2.0 * math.pi   # one full turn
 HS_DIRECTION = 1.0              # +1 = counter-clockwise (+z yaw rate)
 HS_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the spin pays
 HS_RATE_CAP = 2.0 * math.pi     # progress pay saturates at 1 turn/s (rad/s)
+# The completion bonus fires when the turn is WITHIN this much of the target,
+# not on crossing it. Crossing-triggered, the bonus rewarded arriving at 360°
+# with whatever yaw rate got you there — and the cheapest way to arrive is to
+# arrive fast, which is why the trained policy sailed on to 415–457°. Firing a
+# few degrees early opens the settle/heading/overshoot phase during the last
+# few degrees of the turn, so the pay for DECELERATING into the target starts
+# before the target is reached. Progress keeps paying right through 360° (the
+# potential still climbs to `target_yaw`), so the early latch costs nothing.
+HS_COMPLETE_TOL = math.radians(5.0)
+HS_HEADING_STD = math.radians(10.0)    # settle-phase heading Gaussian
+HS_OVERSHOOT_SAT = math.radians(90.0)  # over-rotation cost saturates here
 
 
 def _hs_update(
@@ -7403,13 +7414,22 @@ def _hs_update(
                        ``_hs_raw``, clamped to [0, target_yaw]. Monotone by
                        construction, so a back-and-forth wobble cannot re-earn
                        the same degrees twice, and over-spinning past the full
-                       turn pays nothing at all.
+                       turn pays nothing at all. Note "nothing at all" is not
+                       the same as "costs something" — the clamp made
+                       over-rotation FREE, which is what `hs_overshoot_penalty`
+                       and `hs_heading_reward` are for; ``_hs_raw`` is the
+                       unclamped integral they read.
       ``_hs_prev_yaw`` the previous step's potential → the progress term pays
                        Δ, which is potential-based: the whole turn is worth the
                        same total however it is executed, and holding pays 0.
-      ``_hs_done``     latched True the step ``_hs_yaw`` reaches ``target_yaw``
-                       → the SETTLE phase. Latched, so a wobble past the line
-                       cannot re-open the spin phase and farm the bonus twice.
+      ``_hs_done``     latched True the step ``_hs_yaw`` comes within
+                       ``HS_COMPLETE_TOL`` of ``target_yaw`` → the SETTLE
+                       phase. Latched, so a wobble past the line cannot re-open
+                       the spin phase and farm the bonus twice. The tolerance
+                       is what makes a controlled arrival pay better than a
+                       fast crossing: the settle stack (settle + heading) opens
+                       while the last few degrees are still being turned, and
+                       progress keeps paying through them.
       ``_hs_just_done`` True only on the single step the latch flipped.
       ``_hs_home``     trunk xy at episode start, for the drift cost.
     """
@@ -7443,7 +7463,7 @@ def _hs_update(
     env._hs_yaw = torch.maximum(
         env._hs_yaw, torch.clamp(env._hs_raw, 0.0, target_yaw)
     )
-    reached = env._hs_yaw >= target_yaw
+    reached = env._hs_yaw >= target_yaw - HS_COMPLETE_TOL
     env._hs_just_done = reached & ~env._hs_done
     env._hs_done = env._hs_done | reached
 
@@ -7472,6 +7492,12 @@ def hs_progress_reward(
     gate is needed for any of that; the potential simply stops moving. Capped
     at 1.0 per step so extra violence past ~1 turn/s buys nothing, and zeroed
     while tilted past the upright gate.
+
+    NOT gated on the spin phase: the completion latch flips ``HS_COMPLETE_TOL``
+    BEFORE the full turn, and progress must keep paying through those last few
+    degrees — otherwise the early latch would hand the policy a shortcut,
+    ending the turn 5° short. Progress and the settle stack overlap for exactly
+    that sliver, which is the window a controlled deceleration lives in.
     """
     _hs_update(env, asset_cfg, direction, target_yaw)
     delta = env._hs_yaw - env._hs_prev_yaw
@@ -7486,13 +7512,20 @@ def hs_complete_bonus(
     gate_tilt_above_deg: float = HS_UPRIGHT_GATE_DEG,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0/1, ONE step per episode: the full turn just completed, upright.
+    """0/1, ONE step per episode: the turn just reached the target, upright.
 
     One-shot on purpose — a per-step "you are done" reward is the jackpot the
     playbook warns about (arrive early, then farm), and would buy a ballistic
     whip. The incentive to be FAST comes from the settle term instead: finish
     sooner and more of the 4 s episode is spent collecting settle pay, which
     only pays while actually still and standing.
+
+    Fires WITHIN ``HS_COMPLETE_TOL`` of the target rather than on crossing it.
+    A crossing trigger is indifferent to the yaw rate at the crossing, and the
+    fastest way to cross is to still be spinning hard — which is how the first
+    trained policy sailed on to 415–457°. Firing a few degrees early opens the
+    heading and overshoot terms while the turn is still finishing, so the
+    argmax is arriving at 360° SLOW.
     """
     _hs_update(env, asset_cfg, direction, target_yaw)
     return env._hs_just_done.float() * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
@@ -7526,6 +7559,80 @@ def hs_settle_reward(
     )
     settling = env._hs_done.float()
     return still * pose * settling * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def hs_heading_reward(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    std: float = HS_HEADING_STD,
+    gate_tilt_above_deg: float = HS_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step, settle phase only: STOP ON THE STARTING HEADING.
+
+    Gaussian on the wrapped heading error between the current yaw and the
+    target heading (start yaw + one turn). The measured v1 policy spun the full
+    360° cleanly and then kept going to 415–457°, settling 55–100° past where
+    it started, because nothing in the stack ever mentioned the FINAL HEADING:
+    the progress potential clamps at one turn, the completion bonus is
+    one-shot, and settle pays for a zero yaw rate in the STAND pose facing any
+    direction at all. This is the term that says which direction.
+
+    Wrapping is what makes it a heading and not a second yaw integral, and it
+    is safe here because the term is gated on the completion latch: "one turn
+    short" is not reachable without having first completed the turn, and
+    unwinding a whole turn to re-reach the same wrapped heading forfeits the
+    settle phase it would be paid in. `direction` and `target_yaw` are taken
+    for the shared memory tick, not used directly — the error is read off the
+    raw integral, which already carries both.
+
+    `std` ≈ 10°: tight enough that the argmax is stopping ON the mark rather
+    than near it. The COARSE gradient — the one the current 55–100°-over policy
+    can actually feel — is `hs_overshoot_penalty`, which is linear over exactly
+    that range; this Gaussian is the peak it descends into. Neither term alone
+    would do: a wide Gaussian has no answer at small errors, a bounded ramp has
+    no peak.
+    """
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    err = wrap_to_pi(env._hs_raw - target_yaw)
+    aligned = torch.exp(-((err / max(std, 1e-6)) ** 2))
+    return (
+        aligned
+        * env._hs_done.float()
+        * _hs_upright(env, asset_cfg, gate_tilt_above_deg)
+    )
+
+
+def hs_overshoot_penalty(
+    env: ManagerBasedRlEnv,
+    direction: float = HS_DIRECTION,
+    target_yaw: float = HS_TARGET_YAW,
+    max_cost: float = 1.0,
+    saturate_rad: float = HS_OVERSHOOT_SAT,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): degrees turned past the full turn.
+
+    Reads the RAW yaw integral, not the progress potential. The potential is
+    clamped at ``target_yaw``, which is why over-rotation used to be exactly
+    free: past 360° the potential stops moving, so spinning on cost the policy
+    nothing but the settle pay it was in no hurry to collect. This prices it.
+
+    Linear in the overshoot up to ``saturate_rad`` (90°), then flat — bounded,
+    per the playbook, so it can never outweigh completing the turn and can
+    never make "don't spin at all" the argmax. Being instantaneous rather than
+    a running maximum is deliberate: a policy that overshoots and then turns
+    back onto the mark stops paying, which is the correction we want, and it
+    lands where `hs_heading_reward` peaks anyway.
+
+    Gated on the completion latch — over-rotation is not a concept before the
+    turn is done (and the raw integral cannot exceed the target before then).
+    """
+    _hs_update(env, asset_cfg, direction, target_yaw)
+    over = torch.clamp(env._hs_raw - target_yaw, min=0.0)
+    cost = torch.clamp(over / max(saturate_rad, 1e-6), 0.0, max_cost)
+    return cost * env._hs_done.float()
 
 
 def hs_drift_penalty(

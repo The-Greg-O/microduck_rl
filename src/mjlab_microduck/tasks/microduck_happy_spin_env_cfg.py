@@ -25,12 +25,26 @@ the ground-pick slot. This one is legged, episodic, and command-free.
 Reward design, in the playbook's terms:
   - `spin_progress` pays Δ(accumulated yaw) — potential-based, so holding
     still pays zero and there is nothing to farm; capped per step (no pay for
-    violence past ~1 turn/s) and capped in total at one turn (no over-spinning).
+    violence past ~1 turn/s) and capped in total at one turn (no pay for
+    over-spinning — but see `overshoot`: no pay is not the same as a cost).
   - `spin_complete` is ONE step, not a per-step "you are done" — that would be
-    the jackpot the playbook warns about and would buy a ballistic whip.
+    the jackpot the playbook warns about and would buy a ballistic whip. It
+    fires a few degrees SHORT of the turn rather than on crossing it, so the
+    settle stack is already paying while the last degrees are turned and a
+    controlled arrival beats a fast crossing.
+  - `heading` is the term v1 was missing: a Gaussian (std 10°) on the wrapped
+    heading error against the STARTING heading, settle phase only. v1 spun a
+    clean 360° and then coasted to 415–457°, because nothing in the stack ever
+    said where to stop — settle pays for stillness facing any direction at all.
+  - `overshoot` is its coarse partner: a bounded ramp on the degrees turned
+    past 2π, saturating at 90°, reading the RAW yaw integral (the progress
+    potential clamps at 2π, which is exactly what hid the over-rotation). The
+    Gaussian supplies the peak, the ramp supplies the gradient a 55°-over
+    policy can actually feel.
   - Speed is bought by the SETTLE phase instead: finishing early leaves more of
-    the 4 s episode collecting settle pay, and settle only pays while upright,
-    stopped and back in the STAND pose. Flopping after a fast whip scores ~0.
+    the 4 s episode collecting settle + heading pay, and both only pay while
+    upright, stopped and back in the STAND pose. Flopping after a fast whip
+    scores ~0 — and so, now, does whipping past the mark.
   - `settle` is a PRODUCT of Gaussians (stopped × pose), not a sum: an additive
     pair has a compromise basin where a still-turning crouch keeps most of it.
   - `angular_momentum` is DELETED (its 3D norm fights the trick directly) and
@@ -62,6 +76,9 @@ STAND_Z = 0.115  # measured standing trunk z at HOME (standup env)
 
 HS_DIRECTION = microduck_mdp.HS_DIRECTION      # +1 = counter-clockwise
 HS_TARGET_YAW = microduck_mdp.HS_TARGET_YAW    # 2π, one full turn
+HS_COMPLETE_TOL = microduck_mdp.HS_COMPLETE_TOL  # bonus fires within 5° of the turn
+HS_HEADING_STD = microduck_mdp.HS_HEADING_STD    # 10° heading Gaussian
+HS_OVERSHOOT_SAT = microduck_mdp.HS_OVERSHOOT_SAT  # over-rotation cost saturates at 90°
 
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
@@ -72,12 +89,55 @@ _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 # Finishing at t=1 s scores ~1800, at t=2 s ~1600, never spinning ~1000, and
 # whipping round then falling ~450 (the settle/upright/height stack all gate on
 # upright, and `fell_over` terminates the rest of the episode).
+#
+# v1 MEASURED (happy-spin-v1, ckpt 1999, BAM, noise + DR on, 3 seeds): the spin
+# works — 360° at 0.74–0.88 s, no falls, drift < 8 cm — but TOTAL yaw came out
+# 415 / 457 / 415°, i.e. it settles 55–100° PAST its starting heading. Every
+# term above is blind to that: the progress potential clamps at 2π (so the 55th
+# degree past pays zero, but costs zero too), the completion bonus is one-shot
+# and fires on CROSSING (indifferent to the yaw rate you cross at, and the
+# cheapest crossing is a fast one), and `settle` pays for a zero yaw rate in the
+# STAND pose FACING ANYWHERE. Over-rotation was free. Two terms price it:
+#
+#   `heading`   W_HEADING × exp(-(wrapped heading error / 10°)²), settle phase,
+#               the peak: stopping ON the starting heading.
+#   `overshoot` W_OVERSHOOT × min(1, raw yaw past 2π / 90°), the coarse ramp the
+#               current policy can actually feel, reading the RAW integral (the
+#               clamped potential is exactly what hid the overshoot).
+#
+# The arithmetic, summed over a real 4 s episode at the measured completion time
+# t ≈ 0.8 s (40 steps of turn, 160 settle steps; only the two NEW terms — they
+# are the whole delta from v1's stack, and are what
+# `test_stopping_on_the_mark_beats_crossing_fast_and_drifting` computes):
+#
+#   final heading   heading pay   overshoot cost      net
+#     360° (mark)        +640            −0          +640
+#     370° (+10°)        +249           −35          +215
+#     415° (+55°)         +11          −184          −173   ← v1's best seed
+#     457° (+97°)          +5          −302          −297   ← v1's worst seed
+#
+# So "stop at 360 ± 10°" beats "cross fast and drift to 420" by 390 (the
+# tightest pairing) to 940 (dead-on vs the worst seed), on an episode that
+# totals ~1800: over-rotation goes from free to a fifth or a half of the
+# episode return. Both terms stay bounded, so completing the turn (worth
+# W_PROGRESS/dt = 200 in progress alone, plus the whole settle stack) is never
+# in question — "don't spin" still scores ~1000 against ~2400.
+#
+# And the fix does not simply buy slowness: the settle stack is now 7/step
+# (settle 3 + heading 4), so each 0.1 s shaved off the turn is still worth
+# 5 × 7 = 35 — but crossing fast and landing 55° over costs ~400. Spending
+# 0.2 s decelerating into the mark wins by an order of magnitude. The
+# completion bonus firing 5° EARLY (HS_COMPLETE_TOL) is what opens that
+# window: heading and overshoot are live while the last degrees are still
+# being turned, and `spin_progress` keeps paying right through 360°.
 W_PROGRESS = 4.0
 W_COMPLETE = 5.0
 W_SETTLE = 3.0
+W_HEADING = 4.0
 W_HEIGHT = 1.0
 W_TRACK_LIN = 1.0      # velocity's 2.0, halved: stillness is context, not the task
 W_DRIFT = -1.5
+W_OVERSHOOT = -2.0
 W_TILT = -0.5
 
 
@@ -145,6 +205,30 @@ def make_microduck_happy_spin_env_cfg(
             # from a spin is a big transient and must stay affordable.
             "pose_std": 0.4,
             "joint_indices": _LEG_JOINTS,
+        },
+    )
+    # WHERE it stops, not just that it stops. Gated on the completion latch,
+    # so the wrapped error is unambiguous: "one turn short" is unreachable
+    # without having completed the turn first.
+    cfg.rewards["heading"] = RewardTermCfg(
+        func=microduck_mdp.hs_heading_reward,
+        weight=W_HEADING,
+        params={
+            "direction": HS_DIRECTION,
+            "target_yaw": HS_TARGET_YAW,
+            "std": HS_HEADING_STD,
+        },
+    )
+    # The cost of the degrees past the turn, read off the RAW integral: the
+    # progress potential is clamped at 2π, which is precisely what made
+    # over-rotation free. Bounded, so it cannot outweigh completing the turn.
+    cfg.rewards["overshoot"] = RewardTermCfg(
+        func=microduck_mdp.hs_overshoot_penalty,
+        weight=W_OVERSHOOT,
+        params={
+            "direction": HS_DIRECTION,
+            "target_yaw": HS_TARGET_YAW,
+            "saturate_rad": HS_OVERSHOOT_SAT,
         },
     )
     # Trunk at standing height, both phases: a twirl, not a squat-and-scoot.
