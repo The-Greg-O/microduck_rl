@@ -3598,6 +3598,44 @@ def velocity_command_ranges_curriculum(
     return torch.tensor([current_lin_vel])
 
 
+def speed_ceiling_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    speed_stages: list[dict],
+) -> torch.Tensor:
+    """Raise ONLY the upper bound of ``ranges.lin_vel_x`` by stage.
+
+    The run task's speed curriculum: the backward/lateral/angular ranges stay
+    fixed (running backwards fast is not the skill), so unlike
+    ``velocity_command_ranges_curriculum`` this never widens a range
+    symmetrically and never touches lin_vel_y / ang_vel_z. The forward-only
+    bucket (``rel_forward_envs``) samples inside the same lin_vel_x range, so
+    raising the ceiling here raises the top of that bucket too.
+
+    speed_stages: list of ``{"step": int, "ceiling": float}`` (steps are env
+    steps = iteration × NUM_STEPS_PER_ENV). Latest elapsed stage wins; the
+    first stage applies before its step.
+
+    Mutates the live CommandManager term cfg — CommandManager deepcopies
+    ``env.cfg.commands`` at init, so writing to ``env.cfg`` is a silent no-op.
+    """
+    del env_ids  # Unused.
+
+    command_term = env.command_manager.get_term(command_name)
+    assert command_term is not None, f"Command term '{command_name}' not found"
+    cfg = command_term.cfg
+
+    ceiling = speed_stages[0]["ceiling"]
+    for stage in speed_stages:
+        if env.common_step_counter >= stage["step"]:
+            ceiling = stage["ceiling"]
+
+    lo, _ = cfg.ranges.lin_vel_x
+    cfg.ranges.lin_vel_x = (lo, ceiling)
+    return torch.tensor([ceiling])
+
+
 def projected_gravity(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,

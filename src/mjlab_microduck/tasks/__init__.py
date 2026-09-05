@@ -79,6 +79,10 @@ from .microduck_tippy_taps_env_cfg import (
     make_microduck_tippy_taps_env_cfg,
     MicroduckTippyTapsRlCfg,
 )
+from .microduck_run_env_cfg import (
+    make_microduck_run_env_cfg,
+    MicroduckRunRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Tippy taps — excited-dog alternating foot taps on the spot (go-ducks skill)
@@ -87,6 +91,24 @@ register_mjlab_task(
     env_cfg=make_microduck_tippy_taps_env_cfg(),
     play_env_cfg=make_microduck_tippy_taps_env_cfg(play=True),
     rl_cfg=MicroduckTippyTapsRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Run — the GPU run recipe: speed is the biggest term, a 55% forward-only
+# command bucket, and a curriculum on the forward speed ceiling.
+register_mjlab_task(
+    task_id="Mjlab-Run-Flat-MicroDuck",
+    env_cfg=make_microduck_run_env_cfg(),
+    play_env_cfg=make_microduck_run_env_cfg(play=True),
+    rl_cfg=MicroduckRunRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-Run-Rough-MicroDuck",
+    env_cfg=make_microduck_run_env_cfg(rough=True),
+    play_env_cfg=make_microduck_run_env_cfg(play=True, rough=True),
+    rl_cfg=MicroduckRunRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
