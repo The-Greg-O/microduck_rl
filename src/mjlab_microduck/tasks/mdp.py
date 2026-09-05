@@ -7425,68 +7425,6 @@ def _hs_update(
         env._hs_just_done = torch.zeros(n, dtype=torch.bool, device=dev)
         env._hs_home = torch.zeros(n, 2, device=dev)
     env._hs_tick = tick
-# Tâche BOW — the play bow: dip, hold, rise, stand                             #
-# --------------------------------------------------------------------------- #
-# A dog's invitation to play: from a stand, dip the trunk down and forward
-# (~3 cm crouch, trunk slightly nose-down), head lowered, hold ~1 s, then rise
-# back to the standing pose — all inside a 4 s episode, FEET PLANTED throughout.
-#
-# Structure mirrors the tippy-taps block above: a single per-env memory
-# (`_bow_update`) is refreshed ONCE per env step, keyed on `common_step_counter`,
-# and every reward term calls it first, so the terms stay order-independent and
-# zero-weight-safe. Fresh episodes (episode_length_buf <= 1) re-arm everything.
-#
-# The phase is driven by TIME, not by state: dip 0–1 s, hold 1–2 s, rise 2–3 s,
-# stand 3–4 s. Time is legitimate here (unlike the roulade waypoint disaster)
-# because the trunk targets are a SLEWED ramp, not a per-phase step: being ahead
-# of the ramp pays zero, so there is no "arrive early and farm it" jackpot
-# (AGENTS.md "No jackpots"). Two blends carry it:
-#   s (`_bow_blend`) 0→1 over the dip, 1 through the hold, 1→0 over the rise,
-#     0 in the stand — drives the trunk height and pitch targets.
-#   r (`_bow_rise`)  0 until the hold ends, 0→1 over the rise, 1 in the stand —
-#     gates the head LIFT so the head is at HOME at t=0, down at the hold, and
-#     lifted at the finish (head target = s·down + r·up).
-
-BOW_DIP_END_S = 1.0
-BOW_HOLD_END_S = 2.0
-BOW_RISE_END_S = 3.0
-BOW_STAND_END_S = 4.0
-
-BOW_PHASE_DIP, BOW_PHASE_HOLD, BOW_PHASE_RISE, BOW_PHASE_STAND = 0, 1, 2, 3
-
-# Measured on the walk model (see the cfg docstring): trunk z at HOME, the bow
-# crouch, and the nose-down trunk pitch of the bow.
-BOW_STAND_Z = 0.115
-BOW_CROUCH_Z = 0.085
-BOW_PITCH_RAD = 0.1745  # 10° nose-down
-
-# Head deltas from HOME on [neck_pitch, head_pitch] (servo indices 5, 6).
-# Signs verified by forward kinematics on robot_walk.xml: (-0.30, +0.35) drops
-# the mouth_tip site ~3.9 cm and moves it ~1.5 cm forward (head down + nose
-# forward); (+0.25, -0.25) lifts it ~1.8 cm. Do NOT flip these from intuition:
-# positive neck_pitch tucks the chin and raises the beak.
-BOW_HEAD_DOWN = (-0.30, 0.35)
-BOW_HEAD_UP = (0.25, -0.25)
-BOW_HEAD_JOINTS = (5, 6)
-
-
-def _bow_update(
-    env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
-) -> None:
-    """Refresh the per-env bow memory once per env step (phase, blends, the
-    episode's home xy, and whether the spawn has touched down)."""
-    tick = int(env.common_step_counter)
-    if getattr(env, "_bow_tick", None) == tick:
-        return
-    n, dev = env.num_envs, env.device
-    if not hasattr(env, "_bow_blend"):
-        env._bow_t = torch.zeros(n, device=dev)
-        env._bow_phase = torch.zeros(n, dtype=torch.long, device=dev)
-        env._bow_blend = torch.zeros(n, device=dev)
-        env._bow_rise = torch.zeros(n, device=dev)
-        env._bow_home = torch.zeros(n, 2, device=dev)
-        env._bow_landed = torch.zeros(n, dtype=torch.bool, device=dev)
-    env._bow_tick = tick
 
     asset: Entity = env.scene[asset_cfg.name]
     root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
@@ -7627,6 +7565,76 @@ def hs_tilt_penalty(
         1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0
     )
     return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
+
+
+# --------------------------------------------------------------------------- #
+# Tâche BOW — the play bow: dip, hold, rise, stand                             #
+# --------------------------------------------------------------------------- #
+# A dog's invitation to play: from a stand, dip the trunk down and forward
+# (~3 cm crouch, trunk slightly nose-down), head lowered, hold ~1 s, then rise
+# back to the standing pose — all inside a 4 s episode, FEET PLANTED throughout.
+#
+# Structure mirrors the tippy-taps block above: a single per-env memory
+# (`_bow_update`) is refreshed ONCE per env step, keyed on `common_step_counter`,
+# and every reward term calls it first, so the terms stay order-independent and
+# zero-weight-safe. Fresh episodes (episode_length_buf <= 1) re-arm everything.
+#
+# The phase is driven by TIME, not by state: dip 0–1 s, hold 1–2 s, rise 2–3 s,
+# stand 3–4 s. Time is legitimate here (unlike the roulade waypoint disaster)
+# because the trunk targets are a SLEWED ramp, not a per-phase step: being ahead
+# of the ramp pays zero, so there is no "arrive early and farm it" jackpot
+# (AGENTS.md "No jackpots"). Two blends carry it:
+#   s (`_bow_blend`) 0→1 over the dip, 1 through the hold, 1→0 over the rise,
+#     0 in the stand — drives the trunk height and pitch targets.
+#   r (`_bow_rise`)  0 until the hold ends, 0→1 over the rise, 1 in the stand —
+#     gates the head LIFT so the head is at HOME at t=0, down at the hold, and
+#     lifted at the finish (head target = s·down + r·up).
+
+BOW_DIP_END_S = 1.0
+BOW_HOLD_END_S = 2.0
+BOW_RISE_END_S = 3.0
+BOW_STAND_END_S = 4.0
+
+BOW_PHASE_DIP, BOW_PHASE_HOLD, BOW_PHASE_RISE, BOW_PHASE_STAND = 0, 1, 2, 3
+
+# Measured on the walk model (see the cfg docstring): trunk z at HOME, the bow
+# crouch, and the nose-down trunk pitch of the bow.
+BOW_STAND_Z = 0.115
+BOW_CROUCH_Z = 0.085
+BOW_PITCH_RAD = 0.1745  # 10° nose-down
+
+# Head deltas from HOME on [neck_pitch, head_pitch] (servo indices 5, 6).
+# Signs verified by forward kinematics on robot_walk.xml: (-0.30, +0.35) drops
+# the mouth_tip site ~3.9 cm and moves it ~1.5 cm forward (head down + nose
+# forward); (+0.25, -0.25) lifts it ~1.8 cm. Do NOT flip these from intuition:
+# positive neck_pitch tucks the chin and raises the beak.
+BOW_HEAD_DOWN = (-0.30, 0.35)
+BOW_HEAD_UP = (0.25, -0.25)
+BOW_HEAD_JOINTS = (5, 6)
+
+
+def _bow_update(
+    env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
+) -> None:
+    """Refresh the per-env bow memory once per env step (phase, blends, the
+    episode's home xy, and whether the spawn has touched down)."""
+    tick = int(env.common_step_counter)
+    if getattr(env, "_bow_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_bow_blend"):
+        env._bow_t = torch.zeros(n, device=dev)
+        env._bow_phase = torch.zeros(n, dtype=torch.long, device=dev)
+        env._bow_blend = torch.zeros(n, device=dev)
+        env._bow_rise = torch.zeros(n, device=dev)
+        env._bow_home = torch.zeros(n, 2, device=dev)
+        env._bow_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._bow_tick = tick
+
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    fresh = env.episode_length_buf <= 1
     env._bow_home[fresh] = root_xy[fresh]
     env._bow_landed[fresh] = False
 
