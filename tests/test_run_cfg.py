@@ -333,3 +333,10 @@ def test_ladder_keeps_climbing_above_the_last_fixed_rung():
     assert steps[-1] - steps[-2] == 500 * 24 or steps[-1] - steps[-2] == 500
     # A lower ceiling still clips in place.
     assert run_speed_stages(ceiling=0.8, scale=1.0)[-1]["ceiling"] == 0.8
+
+
+def test_turn_in_place_bucket_is_a_knob(monkeypatch):
+    from mjlab_microduck.tasks.microduck_run_env_cfg import make_microduck_run_env_cfg
+    assert make_microduck_run_env_cfg().commands["twist"].rel_turn_in_place_envs == 0.0
+    monkeypatch.setenv("MICRODUCK_RUN_TURN_FRAC", "0.15")
+    assert make_microduck_run_env_cfg().commands["twist"].rel_turn_in_place_envs == 0.15

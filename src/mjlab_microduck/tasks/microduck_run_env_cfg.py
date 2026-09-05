@@ -55,6 +55,7 @@ sweep them without a code change — HF Jobs pass env, not patches):
                                standing, action_rate), default 1.0. >1 stretches
                                the whole schedule for a longer run.
   MICRODUCK_RUN_FORWARD_FRAC   forward-only env fraction, default 0.55.
+  MICRODUCK_RUN_TURN_FRAC      turn-in-place env fraction, default 0.0.
   MICRODUCK_RUN_AIR_MIN/_MAX   air_time window in seconds, default 0.15/0.35.
 
 Deliberate deviations from the transcribed recipe, and why:
@@ -115,6 +116,8 @@ DEFAULT_AIR_MAX = 0.35
 SPEED_CEILING = _env_float("MICRODUCK_RUN_SPEED_CEILING", DEFAULT_SPEED_CEILING)
 STAGE_SCALE = _env_float("MICRODUCK_RUN_STAGE_SCALE", DEFAULT_STAGE_SCALE)
 FORWARD_FRAC = _env_float("MICRODUCK_RUN_FORWARD_FRAC", DEFAULT_FORWARD_FRAC)
+DEFAULT_TURN_FRAC = 0.0
+TURN_FRAC = _env_float("MICRODUCK_RUN_TURN_FRAC", DEFAULT_TURN_FRAC)
 AIR_MIN = _env_float("MICRODUCK_RUN_AIR_MIN", DEFAULT_AIR_MIN)
 AIR_MAX = _env_float("MICRODUCK_RUN_AIR_MAX", DEFAULT_AIR_MAX)
 
@@ -265,8 +268,10 @@ def make_microduck_run_env_cfg(
     # at exactly 0.3 — that is the intended "always a real forward command",
     # and the ceiling stage is what moves the top of the bucket.)
     command.rel_forward_envs = forward_frac
-    # The walk policy owns spinning on the spot; this one owns going fast.
-    command.rel_turn_in_place_envs = 0.0
+    # Turn-in-place bucket (lin = 0, |wz| forced to [0.4*max, max]). The
+    # recipe had 0; the office found the run policy could not turn on the
+    # spot and fell there, so it is a knob (MICRODUCK_RUN_TURN_FRAC).
+    command.rel_turn_in_place_envs = _env_float("MICRODUCK_RUN_TURN_FRAC", DEFAULT_TURN_FRAC)
 
     # ── Rewards ──────────────────────────────────────────────────────────────
     # Speed is the biggest term in the stack.
