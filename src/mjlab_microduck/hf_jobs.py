@@ -344,6 +344,14 @@ def submit(argv: list[str]) -> int:
             if os.environ.get(k):
                 env[k] = os.environ[k]
 
+    # Experiment knobs: any MICRODUCK_* variable set in the launching shell
+    # rides into the job, so a series can vary a task's knobs without a code
+    # change (MICRODUCK_IN_HF_JOB above is set by us, not forwarded).
+    for k, v in os.environ.items():
+        if k.startswith("MICRODUCK_") and k not in env:
+            env[k] = v
+            print(f"[env] forwarding {k}={v}")
+
     volumes = [Volume(type="dataset", source=src_repo, mount_path="/src", read_only=True)]
 
     # Persistent uv cache — opt-in via --uv-cache (see the flag's help text:
