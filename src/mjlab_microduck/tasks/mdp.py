@@ -7719,12 +7719,43 @@ BOW_HEAD_DOWN = (-0.30, 0.35)
 BOW_HEAD_UP = (0.25, -0.25)
 BOW_HEAD_JOINTS = (5, 6)
 
+# ── Rising out of the crouch ────────────────────────────────────────────────
+# Checkpoint 1999 of bow-v1 dipped correctly (trunk 0.127 → 0.088 m by 1.3 s,
+# 10° nose-down, both feet planted) and then NEVER ROSE: it sat at 0.088 m
+# through the rise and the stand phase. Parking was cheap — the stand-phase
+# pose term and the height ramp back up did not outweigh what rising RISKS
+# (the foot-lift cost, and the collapse termination forfeiting the rest of the
+# episode). Three constants close that gap; the weights that use them live in
+# the cfg, with the per-step arithmetic written out there.
+BOW_RISEN_TOL = 0.01        # "back up" = trunk within 1 cm of BOW_STAND_Z
+BOW_NOT_RISEN_BAND = 0.02   # below STAND_Z - 2 cm at the finish = still crouched
+BOW_FLICKER_S = 0.04        # airborne shorter than this is a contact flicker,
+                            # not a hop: a rise that unweights a heel for a
+                            # frame must not be priced as a foot lift.
+
 
 def _bow_update(
     env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
 ) -> None:
-    """Refresh the per-env bow memory once per env step (phase, blends, the
-    episode's home xy, and whether the spawn has touched down)."""
+    """Refresh the per-env bow memory once per env step.
+
+    Holds the phase and the two blends, the episode's home xy, whether the
+    spawn has touched down, the PER-FOOT airborne clock (for the flicker
+    exemption in `bow_foot_lift_penalty`), and the two rise latches:
+
+      ``_bow_dipped``     latched once the trunk has actually reached the
+                          crouch band — so "risen" can only be earned by a
+                          robot that bowed, never by one that just stood there.
+      ``_bow_risen``      latched the first step at/after the hold ends with
+                          the trunk back within ``BOW_RISEN_TOL`` of
+                          ``BOW_STAND_Z`` and BOTH FEET PLANTED.
+      ``_bow_just_risen`` True only on the single step that latch flipped —
+                          the one-shot the `risen` bonus pays.
+
+    The latch thresholds are module constants, not call parameters: the memory
+    is memoized per env step, so the first reward term to call in a step would
+    otherwise decide them for all the others.
+    """
     tick = int(env.common_step_counter)
     if getattr(env, "_bow_tick", None) == tick:
         return
@@ -7736,14 +7767,25 @@ def _bow_update(
         env._bow_rise = torch.zeros(n, device=dev)
         env._bow_home = torch.zeros(n, 2, device=dev)
         env._bow_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._bow_air_t = torch.zeros(n, 2, device=dev)
+        env._bow_dipped = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._bow_risen = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._bow_just_risen = torch.zeros(n, dtype=torch.bool, device=dev)
     env._bow_tick = tick
 
     asset: Entity = env.scene[asset_cfg.name]
     root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    root_z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
 
     fresh = env.episode_length_buf <= 1
     env._bow_home[fresh] = root_xy[fresh]
     env._bow_landed[fresh] = False
+    env._bow_air_t[fresh] = 0.0
+    env._bow_dipped[fresh] = False
+    env._bow_risen[fresh] = False
+    env._bow_just_risen[fresh] = False
 
     t = env.episode_length_buf.to(torch.float32) * env.step_dt
     env._bow_t = t
@@ -7763,7 +7805,23 @@ def _bow_update(
 
     sensor = env.scene.sensors[sensor_name]
     found = sensor.data.found[:, :2] > 0
-    env._bow_landed |= found.all(dim=1)
+    planted = found.all(dim=1)
+    env._bow_landed |= planted
+
+    # Per-foot airborne clock: reset on every touch, integrated while in the
+    # air. `bow_foot_lift_penalty` thresholds it, so a one-frame contact
+    # flicker during the rise is free while a real hop is not.
+    env._bow_air_t = torch.where(
+        found, torch.zeros_like(env._bow_air_t), env._bow_air_t + env.step_dt
+    )
+
+    # The rise latches. `dipped` is the "you actually bowed" gate; without it a
+    # robot that simply stood still for two seconds would collect the one-shot.
+    env._bow_dipped |= root_z <= (BOW_CROUCH_Z + BOW_RISEN_TOL)
+    back_up = root_z >= (BOW_STAND_Z - BOW_RISEN_TOL)
+    reached = (t >= BOW_HOLD_END_S) & env._bow_dipped & back_up & planted
+    env._bow_just_risen = reached & ~env._bow_risen
+    env._bow_risen = env._bow_risen | reached
 
 
 def _bow_nose_up(asset: Entity) -> torch.Tensor:
@@ -7884,19 +7942,77 @@ def bow_stand_pose_reward(
 def bow_foot_lift_penalty(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
+    flicker_s: float = BOW_FLICKER_S,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0..1 cost (negative weight): the FRACTION of feet off the floor, once
-    the spawn has touched down.
+    """0..1 cost (negative weight): the FRACTION of feet SUSTAINEDLY off the
+    floor, once the spawn has touched down.
 
     The anti-fall constraint that matters most for this trick — Microducks
     fall while rising out of a crouch, and every one of those falls starts
     with a foot leaving the ground. Charged per foot so a single lift already
-    costs, and both feet airborne costs double."""
+    costs, and both feet airborne costs double.
+
+    A foot is only charged once it has been airborne for ``flicker_s``
+    (default 40 ms = 2 control steps). Pushing up out of a crouch momentarily
+    unweights a heel, and at weight -3.0 charging that one-frame flicker made
+    the rise itself look expensive — which is exactly how bow-v1 learned to
+    park in the crouch. The exemption is a window, not a discount: a foot that
+    stays up past it is charged for every step after, so a hop still costs
+    almost as much as before."""
     _bow_update(env, sensor_name, asset_cfg)
     sensor = env.scene.sensors[sensor_name]
     found = sensor.data.found[:, :2] > 0
-    return (~found).float().mean(dim=1) * env._bow_landed.float()
+    sustained = (~found) & (env._bow_air_t + 1e-6 >= flicker_s)
+    return sustained.float().mean(dim=1) * env._bow_landed.float()
+
+
+def bow_risen_bonus(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1, ONE step per episode: the trunk came back up.
+
+    Pays the first step at or after the hold ends (t >= BOW_HOLD_END_S) on
+    which the robot — having actually reached the crouch — has its trunk back
+    within ``BOW_RISEN_TOL`` of ``BOW_STAND_Z`` with BOTH FEET PLANTED.
+
+    One-shot on purpose, exactly like `hs_complete_bonus`: a per-step "you are
+    up" reward is the jackpot AGENTS.md warns about. The incentive to rise
+    EARLY comes from the per-step stand-phase stack instead — get up sooner
+    and more of the episode is spent collecting it."""
+    _bow_update(env, sensor_name, asset_cfg)
+    return env._bow_just_risen.float()
+
+
+def bow_not_risen_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    stand_z: float = BOW_STAND_Z,
+    crouch_z: float = BOW_CROUCH_Z,
+    band: float = BOW_NOT_RISEN_BAND,
+    start_s: float = BOW_RISE_END_S,
+    end_s: float = BOW_STAND_END_S,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 cost (negative weight): still crouched at the finish.
+
+    Two bounded ramps multiplied, so it is a SLOPE out of the crouch rather
+    than a cliff: one in TIME (0 at ``start_s``, 1 at ``end_s`` — the stand
+    phase) and one in DEPTH (0 at ``stand_z - band``, 1 at ``crouch_z``).
+    Zero everywhere before the stand phase, so it cannot tax the bow itself,
+    and its gradient points up at every height in between — a robot 5 mm
+    higher pays strictly less, which is what the parked policy was missing."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    ramp = torch.clamp((env._bow_t - start_s) / max(end_s - start_s, 1e-6), 0.0, 1.0)
+    scale = max(stand_z - band - crouch_z, 1e-6)
+    shortfall = torch.clamp(((stand_z - band) - z) / scale, 0.0, 1.0)
+    return ramp * shortfall
 
 
 def bow_drift_penalty(

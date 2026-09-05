@@ -14,8 +14,11 @@ from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     BOW_Z,
     DIP_END_S,
     EPISODE_LENGTH_S,
+    FLICKER_S,
     HOLD_END_S,
+    NOT_RISEN_BAND,
     RISE_END_S,
+    RISEN_TOL,
     STAND_END_S,
     STAND_Z,
     MicroduckBowRlCfg,
@@ -61,14 +64,17 @@ def test_gait_terms_gone_and_bow_terms_signed():
                  "upright", "head_pose_bias"):
         assert gone not in cfg.rewards, gone
     for pos in ("bow_height", "bow_pitch", "bow_head", "bow_upright",
-                "stand_pose", "track_linear_velocity", "track_angular_velocity"):
+                "stand_pose", "risen", "track_linear_velocity",
+                "track_angular_velocity"):
         assert cfg.rewards[pos].weight > 0, pos
-    for cost in ("foot_lift", "drift", "foot_slip", "action_rate_l2",
-                 "dof_pos_limits", "self_collisions"):
+    for cost in ("foot_lift", "not_risen", "drift", "foot_slip",
+                 "action_rate_l2", "dof_pos_limits", "self_collisions"):
         assert cfg.rewards[cost].weight < 0, cost
-    # Feet planted is the hardest constraint of the trick.
+    # Feet planted is the hardest constraint of the trick — heavier than the
+    # slope that pushes the robot back up out of the crouch.
     assert cfg.rewards["foot_lift"].weight <= -3.0
     assert cfg.rewards["foot_lift"].weight < cfg.rewards["drift"].weight
+    assert cfg.rewards["foot_lift"].weight < cfg.rewards["not_risen"].weight
     # foot_slip must not stay command-gated at a pinned ~zero command.
     assert cfg.rewards["foot_slip"].params["command_threshold"] < 0.0
     # action_rate stays light: no ramp to -1.0 over a 4 s trick.
@@ -242,19 +248,184 @@ def test_head_target_goes_down_then_up():
     assert head() > 0.99, "head must be LIFTED by the stand phase"
 
 
-def test_foot_lift_cost_fires_on_contact_loss():
+def test_foot_lift_cost_fires_on_sustained_contact_loss():
     env = _FakeEnv()
     lift = lambda: float(microduck_mdp.bow_foot_lift_penalty(env)[0])
     env.tick(contacts=(0, 0))        # spawn drop, not yet landed: free
     assert lift() == 0.0
     env.tick(contacts=(1, 1))
     assert lift() == 0.0
-    env.tick(contacts=(0, 1))        # one foot up
+    env.tick(contacts=(0, 1))        # left up for 0.02 s — still a flicker
+    assert lift() == 0.0
+    env.tick(contacts=(0, 0))        # left has now been up 0.04 s; right 0.02 s
     assert lift() == 0.5
-    env.tick(contacts=(0, 0))        # both feet up
+    env.tick(contacts=(0, 0))        # both past the flicker window
     assert lift() == 1.0
     env.tick(contacts=(1, 1))
     assert lift() == 0.0
+
+
+def test_flicker_exemption_is_a_window_not_a_discount():
+    """A one-frame heel unweight during a rise is free; a hop is not.
+
+    This is (d) of the v2 fix: at weight -3.0 the old term charged the contact
+    flicker that every push-up out of a crouch produces, which is part of why
+    v1 decided the rise was not worth attempting."""
+    assert FLICKER_S == 0.04
+    # A single-step flicker, repeated, never costs anything.
+    env = _FakeEnv()
+    env.tick(contacts=(1, 1))
+    total = 0.0
+    for _ in range(10):
+        env.tick(contacts=(0, 1))    # one step in the air ...
+        total += float(microduck_mdp.bow_foot_lift_penalty(env)[0])
+        env.tick(contacts=(1, 1))    # ... then back down
+        total += float(microduck_mdp.bow_foot_lift_penalty(env)[0])
+    assert total == 0.0, "a 20 ms contact flicker must not read as a foot lift"
+    # A real hop is still charged on all but its first frames.
+    env = _FakeEnv()
+    env.tick(contacts=(1, 1))
+    charged = 0
+    for _ in range(10):
+        env.tick(contacts=(0, 0))
+        charged += float(microduck_mdp.bow_foot_lift_penalty(env)[0]) == 1.0
+    assert charged == 9, "only the first flicker step of a hop is exempt"
+
+
+def test_risen_bonus_is_one_shot_and_needs_an_actual_bow():
+    env = _FakeEnv()
+    fired = lambda: float(microduck_mdp.bow_risen_bonus(env)[0])
+    # Standing still the whole episode never earns it: no crouch was reached.
+    total = 0.0
+    for _ in range(int(STAND_END_S / env.step_dt)):
+        env.tick()
+        total += fired()
+    assert total == 0.0, "the one-shot must not pay a robot that never bowed"
+
+    # Bow, hold, then rise: exactly one payment, and not before the hold ends.
+    env = _FakeEnv()
+    env.tick()
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)                      # down in the crouch
+    assert bool(env._bow_dipped[0]) is True
+    assert fired() == 0.0
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, STAND_Z]])
+    env.tick()                                  # first step back up
+    assert fired() == 1.0
+    paid = 0.0
+    for _ in range(50):                         # ... and never again
+        env.tick()
+        paid += fired()
+    assert paid == 0.0, "a per-step 'you are up' reward would be a jackpot"
+    assert bool(env._bow_risen[0]) is True
+
+
+def test_risen_bonus_needs_both_feet_planted():
+    env = _FakeEnv()
+    env.tick()
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, STAND_Z]])
+    env.tick(contacts=(0, 1))                   # up, but hopping off one foot
+    assert float(microduck_mdp.bow_risen_bonus(env)[0]) == 0.0
+    env.tick(contacts=(1, 1))
+    assert float(microduck_mdp.bow_risen_bonus(env)[0]) == 1.0
+
+
+def test_risen_tolerance_is_one_centimetre():
+    env = _FakeEnv()
+    env.tick()
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    env._asset.data.root_link_pos_w = torch.tensor(
+        [[0.0, 0.0, STAND_Z - RISEN_TOL - 0.002]])
+    env.tick()
+    assert float(microduck_mdp.bow_risen_bonus(env)[0]) == 0.0, "1.2 cm short"
+    env._asset.data.root_link_pos_w = torch.tensor(
+        [[0.0, 0.0, STAND_Z - RISEN_TOL + 0.002]])
+    env.tick()
+    assert float(microduck_mdp.bow_risen_bonus(env)[0]) == 1.0
+
+
+def test_not_risen_cost_ramps_over_the_stand_phase():
+    """Bounded on both axes — a slope out of the crouch, not a cliff."""
+    env = _FakeEnv()
+    cost = lambda: float(microduck_mdp.bow_not_risen_penalty(
+        env, stand_z=STAND_Z, crouch_z=BOW_Z, band=NOT_RISEN_BAND,
+        start_s=RISE_END_S, end_s=STAND_END_S)[0])
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.tick()
+    assert cost() == 0.0, "must not tax the dip"
+    env.run_to(HOLD_END_S)
+    assert cost() == 0.0, "must not tax the hold"
+    env.run_to(RISE_END_S)
+    assert cost() == 0.0, "the ramp starts at zero where the stand phase does"
+    env.run_to(RISE_END_S + 0.5)
+    half = cost()
+    assert math.isclose(half, 0.5, abs_tol=1e-5)
+    env.run_to(STAND_END_S)
+    assert math.isclose(cost(), 1.0, abs_tol=1e-5)
+    # Monotone in height at a fixed time: every millimetre up pays less.
+    heights, costs = [BOW_Z, 0.088, 0.092, STAND_Z - NOT_RISEN_BAND, STAND_Z], []
+    for z in heights:
+        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+        costs.append(cost())
+    assert costs == sorted(costs, reverse=True)
+    assert math.isclose(costs[0], 1.0, abs_tol=1e-5), "saturates at the crouch"
+    assert math.isclose(costs[-1], 0.0, abs_tol=1e-5), "free at standing height"
+    # A cliff would have no intermediate values; this is a slope in z.
+    assert math.isclose(costs[1], 0.7, abs_tol=1e-5)   # the height v1 parked at
+    assert math.isclose(costs[2], 0.3, abs_tol=1e-5)
+
+
+def test_rising_beats_parking_in_the_crouch_per_step():
+    """The arithmetic (b) of the v2 fix, on the real cfg weights: in the stand
+    phase, a finished stand must pay CLEARLY more per step than the crouch
+    bow-v1 parked in (trunk 0.088 m, still nose-down, head still down)."""
+    cfg = make_microduck_bow_env_cfg()
+    legs = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
+
+    def stand_phase_pay(z, y_rot, head, leg_offsets):
+        # y_rot is the rotation about +y; nose_up = -y_rot (see
+        # test_measured_signs_are_not_flipped), so nose-DOWN is y_rot > 0.
+        env = _FakeEnv()
+        env.run_to(STAND_END_S)
+        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+        env._asset.data.root_link_quat_w = torch.tensor(
+            [[math.cos(y_rot / 2), 0.0, math.sin(y_rot / 2), 0.0]])
+        q = torch.zeros(1, 14)
+        q[0, 5], q[0, 6] = head
+        for i, v in leg_offsets.items():
+            q[0, i] = v
+        env._asset.data.joint_pos = q
+        env.tick()
+        w = lambda n: cfg.rewards[n].weight
+        return (
+            w("bow_height") * float(microduck_mdp.bow_height_reward(env)[0])
+            + w("bow_pitch") * float(microduck_mdp.bow_pitch_reward(env)[0])
+            + w("bow_head") * float(microduck_mdp.bow_head_reward(env)[0])
+            + w("bow_upright") * float(microduck_mdp.bow_upright_reward(env)[0])
+            + w("stand_pose") * float(
+                microduck_mdp.bow_stand_pose_reward(env, joint_indices=legs)[0])
+            + w("not_risen") * float(microduck_mdp.bow_not_risen_penalty(
+                env, stand_z=STAND_Z, crouch_z=BOW_Z, band=NOT_RISEN_BAND,
+                start_s=RISE_END_S, end_s=STAND_END_S)[0])
+        )
+
+    # A 3 cm crouch bends knee ≈ 0.5 rad and hip_pitch / ankle ≈ 0.25 rad.
+    crouched = {2: 0.25, 3: 0.5, 4: 0.25, 11: 0.25, 12: 0.5, 13: 0.25}
+    parked = stand_phase_pay(
+        0.088, BOW_PITCH_RAD, microduck_mdp.BOW_HEAD_DOWN, crouched)
+    risen = stand_phase_pay(STAND_Z, 0.0, microduck_mdp.BOW_HEAD_UP, {})
+
+    # Every factor is ≈ 1 at the finish, and `not_risen` is zero there.
+    assert math.isclose(risen, 15.0, rel_tol=1e-3)   # 4+2+2+2+5, track excluded
+    assert parked < 5.0
+    assert risen - parked > 10.0, (
+        f"rising must be the argmax by a margin (risen {risen:.2f} vs parked "
+        f"{parked:.2f}); v1's gap was 7.4/step and it parked anyway")
+    # The one-shot is a milestone on top, not the thing doing the work.
+    assert cfg.rewards["risen"].weight < risen - parked
 
 
 def test_drift_cost_grows_and_saturates():
@@ -272,15 +443,23 @@ def test_drift_cost_grows_and_saturates():
 def test_memory_rearms_on_fresh_episode():
     env = _FakeEnv()
     env.tick(contacts=(1, 1))
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, STAND_Z]])
     env.run_to(RISE_END_S)
     assert int(env._bow_phase[0]) == microduck_mdp.BOW_PHASE_STAND
     assert bool(env._bow_landed[0]) is True
+    assert bool(env._bow_dipped[0]) is True and bool(env._bow_risen[0]) is True
     env._asset.data.root_link_pos_w = torch.tensor([[0.3, -0.2, STAND_Z]])
     env.episode_length_buf[:] = 0            # reset
     env.tick(contacts=(0, 0))
     assert int(env._bow_phase[0]) == microduck_mdp.BOW_PHASE_DIP
     assert float(env._bow_blend[0]) < 0.05 and float(env._bow_rise[0]) == 0.0
     assert bool(env._bow_landed[0]) is False, "touchdown latch must re-arm"
+    assert bool(env._bow_dipped[0]) is False, "the dip latch must re-arm"
+    assert bool(env._bow_risen[0]) is False, "the rise latch must re-arm"
+    assert float(microduck_mdp.bow_risen_bonus(env)[0]) == 0.0
+    assert float(env._bow_air_t[0].max()) <= env.step_dt, "air clock must re-arm"
     assert torch.allclose(env._bow_home[0], torch.tensor([0.3, -0.2]))
     assert float(microduck_mdp.bow_drift_penalty(env)[0]) == 0.0
 
