@@ -226,9 +226,16 @@ def run_speed_stages(
     """
     ceiling = SPEED_CEILING if ceiling is None else ceiling
     scale = STAGE_SCALE if scale is None else scale
+    stages = list(RUN_SPEED_STAGES)
+    # Above the last fixed rung the ladder keeps climbing at the same pace,
+    # +0.1 m/s every 500 iterations, until it reaches the ceiling: a 1.5
+    # ceiling is a real experiment, not a 1.1 run with a different label.
+    while stages[-1][1] < ceiling - 1e-9:
+        it, v = stages[-1]
+        stages.append((it + 500, min(round(v + 0.1, 3), ceiling)))
     return [
         {"step": step, "ceiling": min(value, ceiling)}
-        for step, value in _scaled_stages(RUN_SPEED_STAGES, scale)
+        for step, value in _scaled_stages(tuple(stages), scale)
     ]
 
 

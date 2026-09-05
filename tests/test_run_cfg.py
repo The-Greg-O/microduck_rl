@@ -322,3 +322,14 @@ def test_runner_cfg():
     assert MicroduckRunRlCfg.critic.obs_normalization is True
     assert MicroduckRunRlCfg.max_iterations == 8_000
     assert MicroduckRunRlCfg.num_steps_per_env == NUM_STEPS_PER_ENV == 24
+
+
+def test_ladder_keeps_climbing_above_the_last_fixed_rung():
+    from mjlab_microduck.tasks.microduck_run_env_cfg import run_speed_stages, RUN_SPEED_STAGES
+    stages = run_speed_stages(ceiling=1.5, scale=1.0)
+    values = [s["ceiling"] for s in stages]
+    assert values[-1] == 1.5 and len(stages) == len(RUN_SPEED_STAGES) + 4
+    steps = [s["step"] for s in stages]
+    assert steps[-1] - steps[-2] == 500 * 24 or steps[-1] - steps[-2] == 500
+    # A lower ceiling still clips in place.
+    assert run_speed_stages(ceiling=0.8, scale=1.0)[-1]["ceiling"] == 0.8
