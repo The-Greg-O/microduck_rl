@@ -7805,3 +7805,527 @@ def bow_drift_penalty(
     root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
     d2 = torch.sum(torch.square(root_xy - env._bow_home), dim=1)
     return torch.clamp(d2 / 0.01, 0.0, max_cost)
+
+
+# --------------------------------------------------------------------------- #
+# PIVOT — one 360° turn about a single PLANTED foot, then stand                #
+# --------------------------------------------------------------------------- #
+# Episodic skill, walk model, built on the velocity recipe (tippy-taps /
+# happy-spin pattern). Per-env memory (which foot is the pin, where it started,
+# the accumulated yaw, the spin/settle latch) is updated ONCE per env step by
+# `_pv_update`, keyed on `common_step_counter`, so the reward terms below stay
+# order-independent and zero-weight-safe. Fresh episodes re-arm everything.
+#
+# WHAT MAKES IT A PIVOT AND NOT A SPIN. A happy spin is free to slide both feet;
+# a pivot has a PIN — one foot that stays exactly where it was, in contact, for
+# the whole turn — while the other paddles: lift, reach sideways, plant, push.
+# That distinction lives entirely in the pin terms (`pv_pin_reward` pays contact
+# × staying put, `pv_pin_displacement_penalty` / `pv_pin_slip_penalty` charge
+# moving) rather than in the progress term, which is the same potential-based
+# yaw integral happy spin uses. Weighted as in the cfg, a two-footed spin gives
+# up ~5 reward/step against a pivot: the pin pay collapses AND both pin costs
+# fire, while the paddle is worth only ~1.
+#
+# DIRECTION IS OBSERVED, NOT BAKED IN. The daemon does NOT zero the twist during
+# a skill window — it feeds the skill's CONFIGURED CONSTANT twist
+# (`robotd-params::SkillDef::command`, `robotd/src/control.rs`), which is zeros
+# for most one-shots but is explicitly meant to carry a policy's own encoding
+# ("the published flamingo reads [flag, side, 0]"). So the yaw slot — obs[50],
+# the third twist slot — can carry the turn direction as a ±1 FLAG, sampled per
+# env at reset by `PivotCommand` and latched into `_pv_dir` for the episode.
+# ONE network turns both ways; two skill entries (`pivot-left` with command
+# [0,0,+1], `pivot-right` with [0,0,-1]) install it twice.
+#
+# THE PIN IS THE INSIDE FOOT. Turning counter-clockwise (+z yaw, to its left)
+# the robot pivots on its LEFT foot; clockwise, on its right. So
+# `dir > 0 → pin = 0 (left)`, `dir < 0 → pin = 1 (right)`, matching both the
+# contact sensor's slot order (LEFT first) and the foot site order. The two feet
+# therefore have DIFFERENT ROLES and the mirror symmetry loss must stay OFF.
+
+PV_TARGET_YAW = 2.0 * math.pi   # one full turn about the pin
+PV_DIRECTION_CCW = 1.0          # +1 = counter-clockwise, pin = LEFT foot
+PV_DIRECTION_CW = -1.0          # -1 = clockwise, pin = RIGHT foot
+PV_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the pivot pays
+PV_RATE_CAP = 2.0 * math.pi     # progress pay saturates at 1 turn/s (rad/s)
+
+# Paddle stroke window. Longer than tippy-taps' 0.04–0.25 s tap: a paddle has to
+# lift, reach sideways, plant and push, not just touch. Beyond the max it is a
+# flamingo hold (one-legged balance), which is a different trick and pays zero.
+PV_MIN_AIR_S = 0.06
+PV_MAX_AIR_S = 0.35
+
+# Pin geometry, measured on robot_walk.xml at the STAND keyframe (feet flat):
+# the foot sites sit ±4.18 cm off the trunk centreline and the foot's collision
+# mesh is ~4.1 × 5.4 cm, so:
+#   PV_PIN_STD_M   1.5 cm — the pay falls off as the pin site leaves its own
+#                  footprint. A real pivot rotates the foot about a point inside
+#                  the sole, which moves the site by ≲1 cm; a STEP moves it 4+.
+#   PV_PIN_SAT_M   4 cm — one foot length: the cost is saturated, it stepped.
+PV_PIN_STD_M = 0.015
+PV_PIN_SAT_M = 0.04
+PV_PIN_SLIP_SAT = 0.10          # m/s of in-contact sliding = full slip cost
+PV_RADIUS_M = 0.042             # measured trunk↔foot xy at STAND: the orbit radius
+PV_RADIUS_TOL_M = 0.03          # free band around it (the trunk leans and sways)
+PV_RADIUS_SAT_M = 0.10          # excess past the band that saturates the cost
+PV_STAND_Z = 0.115              # measured standing trunk z (as standup / bow)
+
+PV_FEET_SITE_CFG = SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))
+
+
+def _pv_command_sign(
+    env: ManagerBasedRlEnv, command_name: str, n: int, device
+) -> torch.Tensor:
+    """(B,) ±1 read from the twist yaw slot (obs[50]) — the direction flag.
+
+    Exactly zero (a policy driven with an all-zero twist, e.g. an unconfigured
+    skill entry) reads as +1: counter-clockwise is the default turn.
+    """
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return torch.full((n,), PV_DIRECTION_CCW, device=device)
+    cmd = manager.get_command(command_name)
+    yaw = torch.nan_to_num(cmd[:, 2], nan=0.0)
+    return torch.where(yaw < 0.0, -torch.ones_like(yaw), torch.ones_like(yaw))
+
+
+def _pv_gather1(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """values (B, 2) → (B,) picking column `index` (B,) per row."""
+    return values.gather(1, index.view(-1, 1)).squeeze(1)
+
+
+def _pv_gather2(values: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """values (B, 2, 2) → (B, 2) picking foot `index` (B,) per row."""
+    n = values.shape[0]
+    return values.gather(1, index.view(n, 1, 1).expand(n, 1, 2)).squeeze(1)
+
+
+def _pv_update(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+) -> None:
+    """Tick the per-env pivot memory exactly once per env step.
+
+    Buffers:
+      ``_pv_dir``       ±1 turn direction, LATCHED at episode start from the
+                        twist yaw slot (or forced by ``direction``). Latched so
+                        observation noise on the command cannot flip the pin
+                        foot mid-turn.
+      ``_pv_pin``       0 = left, 1 = right: the planted foot, the INSIDE of
+                        the turn (dir > 0 → left).
+      ``_pv_pin_home``  the pin foot's xy at episode start — what "planted"
+                        is measured against for the whole episode.
+      ``_pv_pin_d``     current horizontal displacement of the pin from home.
+      ``_pv_pin_speed`` the pin's horizontal speed (finite difference), i.e.
+                        its slip while in contact.
+      ``_pv_raw``       raw signed yaw integral in the commanded direction.
+      ``_pv_yaw``       the PROGRESS POTENTIAL: running maximum of ``_pv_raw``
+                        clamped to [0, target_yaw]. Monotone, so a wobble
+                        cannot re-earn the same degrees and over-turning past
+                        the full turn pays nothing.
+      ``_pv_prev_yaw``  previous step's potential → the progress term pays Δ.
+      ``_pv_done``      latched at the full turn → the SETTLE phase.
+      ``_pv_just_done`` True only on the single step the latch flipped.
+      ``_pv_landed``    both feet have touched down since the spawn.
+    """
+    tick = int(env.common_step_counter)
+    if getattr(env, "_pv_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_pv_yaw"):
+        env._pv_dir = torch.full((n,), PV_DIRECTION_CCW, device=dev)
+        env._pv_pin = torch.zeros(n, dtype=torch.long, device=dev)
+        env._pv_pin_home = torch.zeros(n, 2, device=dev)
+        env._pv_pin_prev = torch.zeros(n, 2, device=dev)
+        env._pv_pin_d = torch.zeros(n, device=dev)
+        env._pv_pin_speed = torch.zeros(n, device=dev)
+        env._pv_raw = torch.zeros(n, device=dev)
+        env._pv_yaw = torch.zeros(n, device=dev)
+        env._pv_prev_yaw = torch.zeros(n, device=dev)
+        env._pv_done = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._pv_just_done = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._pv_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._pv_tick = tick
+
+    asset: Entity = env.scene[asset_cfg.name]
+    foot_xy = torch.nan_to_num(
+        asset.data.site_pos_w[:, feet_cfg.site_ids, :2], nan=0.0
+    )                                                   # (B, 2, 2) left, right
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0                # (B, 2) left, right
+
+    # ── Direction and pin foot: latched at episode start ────────────────────
+    fresh = env.episode_length_buf <= 1
+    if direction is None:
+        sign = _pv_command_sign(env, command_name, n, dev)
+    else:
+        sign = torch.full((n,), math.copysign(1.0, direction), device=dev)
+    env._pv_dir = torch.where(fresh, sign, env._pv_dir)
+    # dir > 0 (counter-clockwise) pivots on the LEFT foot (slot 0).
+    env._pv_pin = torch.where(
+        env._pv_dir > 0.0,
+        torch.zeros_like(env._pv_pin),
+        torch.ones_like(env._pv_pin),
+    )
+    pin_xy = _pv_gather2(foot_xy, env._pv_pin)
+
+    env._pv_pin_home = torch.where(fresh[:, None], pin_xy, env._pv_pin_home)
+    env._pv_raw = torch.where(fresh, torch.zeros_like(env._pv_raw), env._pv_raw)
+    env._pv_yaw = torch.where(fresh, torch.zeros_like(env._pv_yaw), env._pv_yaw)
+    env._pv_prev_yaw = torch.where(
+        fresh, torch.zeros_like(env._pv_prev_yaw), env._pv_prev_yaw
+    )
+    env._pv_done = env._pv_done & ~fresh
+    env._pv_just_done = env._pv_just_done & ~fresh
+    env._pv_landed = env._pv_landed & ~fresh
+    env._pv_pin_prev = torch.where(fresh[:, None], pin_xy, env._pv_pin_prev)
+
+    # ── Pin geometry ────────────────────────────────────────────────────────
+    env._pv_pin_d = torch.norm(pin_xy - env._pv_pin_home, dim=1)
+    step_move = torch.norm(pin_xy - env._pv_pin_prev, dim=1)
+    env._pv_pin_speed = torch.where(
+        fresh, torch.zeros_like(step_move), step_move / max(env.step_dt, 1e-6)
+    )
+    env._pv_pin_prev = pin_xy
+
+    # ── Yaw progress potential ──────────────────────────────────────────────
+    omega_z = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    env._pv_prev_yaw = env._pv_yaw.clone()
+    env._pv_raw = env._pv_raw + env._pv_dir * omega_z * env.step_dt
+    env._pv_yaw = torch.maximum(
+        env._pv_yaw, torch.clamp(env._pv_raw, 0.0, target_yaw)
+    )
+    reached = env._pv_yaw >= target_yaw
+    env._pv_just_done = reached & ~env._pv_done
+    env._pv_done = env._pv_done | reached
+
+    env._pv_landed = env._pv_landed | found.all(dim=1)
+
+
+def _pv_upright(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg, gate_tilt_above_deg: float
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    return 1.0 - _fallen_mask(env, asset, 0.0, gate_tilt_above_deg)
+
+
+def _pv_contacts(
+    env: ManagerBasedRlEnv, sensor_name: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(pin_contact, free_contact, free_air_time), each (B,)."""
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0
+    air = torch.nan_to_num(sensor.data.current_air_time[:, :2], nan=0.0)
+    pin = env._pv_pin
+    free = 1 - pin
+    return _pv_gather1(found, pin), _pv_gather1(found, free), _pv_gather1(air, free)
+
+
+def pv_progress_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    rate_cap: float = PV_RATE_CAP,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """The main dish, 0..1 per step: yaw progress toward the full turn.
+
+    Pays Δ(progress potential)/(rate_cap · dt) — potential-based, so holding
+    still pays zero, a back-and-forth wobble cannot re-earn the same degrees
+    (the potential is a running maximum) and turning on past 360° pays nothing.
+    Capped at 1.0/step so violence past ~1 turn/s buys nothing, and zeroed
+    while tilted past the upright gate.
+
+    Deliberately NOT gated on the pin being planted: the potential is a running
+    maximum, so a gate would permanently BURN any degrees turned during a
+    contact flicker. Pivot-vs-spin is the pin terms' job, where losing contact
+    costs pay for that step only and nothing is destroyed.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    delta = env._pv_yaw - env._pv_prev_yaw
+    rate = torch.clamp(delta / max(rate_cap * env.step_dt, 1e-6), 0.0, 1.0)
+    return rate * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_complete_bonus(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1, ONE step per episode: the full turn just completed, upright.
+
+    One-shot on purpose — a per-step "you are done" is the jackpot the playbook
+    warns about and would buy a ballistic whip. The incentive to be FAST comes
+    from the settle phase: finish sooner, collect settle pay longer.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    return env._pv_just_done.float() * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_pin_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    pin_std: float = PV_PIN_STD_M,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step: the PIN is planted — in contact AND still where it began.
+
+    THE term that makes this a pivot and not a spin. A product, not a sum:
+    contact × Gaussian(displacement from the episode-start position). Both
+    factors are what "planted" means, and a sum would let a foot that slid
+    30 cm keep half the pay for still touching the floor.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    pin_contact, _, _ = _pv_contacts(env, sensor_name)
+    stay = torch.exp(-((env._pv_pin_d / max(pin_std, 1e-6)) ** 2))
+    return pin_contact.float() * stay * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_pin_displacement_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    saturate_m: float = PV_PIN_SAT_M,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): the pin foot has MOVED.
+
+    The pin reward alone is not enough — it only fails to pay. This charges,
+    so a policy that gives up on the pin and spins on both feet is worse off
+    than one that never started, instead of merely no better off."""
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    d2 = torch.square(env._pv_pin_d)
+    return torch.clamp(d2 / max(saturate_m**2, 1e-9), 0.0, max_cost)
+
+
+def pv_pin_slip_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    saturate_mps: float = PV_PIN_SLIP_SAT,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): the pin foot SLIDING while in
+    contact.
+
+    Foot slip is deleted for this task as a whole — the paddle foot is
+    supposed to scuff, that is the push — but for the pin, slip is precisely
+    the failure mode: "planted" means the contact patch does not travel.
+    Charged only while the pin is actually on the floor (an airborne foot
+    moving is a swing, which the pin reward already refuses to pay), and only
+    once the spawn has touched down."""
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    pin_contact, _, _ = _pv_contacts(env, sensor_name)
+    speed = torch.clamp(env._pv_pin_speed / max(saturate_mps, 1e-6), 0.0, max_cost)
+    return speed * pin_contact.float() * env._pv_landed.float()
+
+
+def pv_paddle_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    min_air: float = PV_MIN_AIR_S,
+    max_air: float = PV_MAX_AIR_S,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1 per step: the FREE foot is mid-stroke while the pin stays planted.
+
+    The step cadence, tippy-taps' tap term with the roles split. Paid only
+    while the free foot's CURRENT air time is inside the stroke window, which
+    is what makes it alternation rather than a hold: air time resets on
+    contact, so each paid window has to be bought with a fresh plant, and a
+    foot parked in the air runs past ``max_air`` and stops paying (that is a
+    flamingo, a different trick).
+
+    Gated on the SPIN PHASE (``~_pv_done``) so paddling on after the turn is
+    finished cannot compete with settling, and on the pin being in contact so
+    the cadence is a pivot's and not a hop's.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    pin_contact, free_contact, free_air = _pv_contacts(env, sensor_name)
+    window = (free_air >= min_air) & (free_air <= max_air)
+    stroke = window & ~free_contact & pin_contact & ~env._pv_done & env._pv_landed
+    return stroke.float() * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_settle_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    rate_std: float = 1.0,
+    pose_std: float = 0.4,
+    joint_indices: Optional[list] = None,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step, settle phase only: BOTH feet down, stopped, STAND pose.
+
+    A PRODUCT of factors (yaw rate → 0, legs → HOME, both feet on the floor),
+    not a sum: an additive stack has a compromise basin where a still-turning
+    one-legged crouch keeps most of it, while the product collapses on any one
+    deficient factor. Both stds stay wide enough that the first policy to
+    complete a turn scores visibly — an invisible gradient changes nothing.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_name]
+    both_down = (sensor.data.found[:, :2] > 0).all(dim=1).float()
+    omega_z = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    still = torch.exp(-((omega_z / max(rate_std, 1e-6)) ** 2))
+    pose = pose_target_match(
+        env, target_overrides=None, asset_cfg=asset_cfg,
+        std=pose_std, joint_indices=joint_indices,
+    )
+    return (
+        still * pose * both_down * env._pv_done.float()
+        * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+    )
+
+
+def pv_radius_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    radius_m: float = PV_RADIUS_M,
+    tol_m: float = PV_RADIUS_TOL_M,
+    saturate_m: float = PV_RADIUS_SAT_M,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): the trunk has left the pin's orbit.
+
+    NOT a drift-from-spawn cost like happy spin's: the trunk of a pivoting
+    robot MUST travel — it orbits the pin at roughly the stance half-width
+    (4.2 cm measured at STAND), so anchoring it to its start position would
+    charge the maneuver itself. What is priced is leaving the CIRCLE: the
+    excess of |trunk − pin_home| beyond ``radius_m + tol_m``, which is a
+    robot walking away, not one turning about a point."""
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    trunk_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    r = torch.norm(trunk_xy - env._pv_pin_home, dim=1)
+    excess = torch.clamp(r - (radius_m + tol_m), min=0.0)
+    return torch.clamp(torch.square(excess) / max(saturate_m**2, 1e-9), 0.0, max_cost)
+
+
+def pv_tilt_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): 1 − cos(trunk tilt). A pivot wants
+    the yaw axis vertical; this prices the lean without touching yaw rate
+    (unlike `angular_momentum`, whose 3D norm fights the trick and is dropped
+    from this task)."""
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    quat = asset.data.root_link_quat_w
+    cos_tilt = torch.nan_to_num(
+        1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0
+    )
+    return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
+
+
+class PivotCommand(UniformVelocityCommand):
+    """Twist command for the pivot: ``[~0, ~0, ±1]`` — the yaw slot is a
+    DIRECTION FLAG, not a rate.
+
+    Sampled once per episode (the cfg's resampling range is ≥ the episode
+    length) and never touched again, so the sign the policy reads at obs[50] on
+    step 0 is the sign it reads at step 200. ``cfg.direction`` pins it for a
+    one-way task; ``None`` samples ±1 fifty-fifty and trains one network to
+    turn both ways.
+
+    The linear slots keep the cfg's tiny non-zero ranges rather than being
+    hard-zeroed: a command input that is never non-zero has dead weights
+    forever (AGENTS.md), and these slots are shared with the whole policy
+    family.
+
+    Deployment: the daemon feeds a skill its CONFIGURED CONSTANT twist
+    (`SkillDef::command`), so `pivot-left` installs with `[0, 0, 1]` and
+    `pivot-right` with `[0, 0, -1]` — the same encoding trick the published
+    flamingo uses for its side flag.
+    """
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        n = len(env_ids)
+        if n == 0:
+            return
+        ranges = self.cfg.ranges
+        self.vel_command_b[env_ids, 0] = torch.empty(n, device=self.device).uniform_(
+            *ranges.lin_vel_x
+        )
+        self.vel_command_b[env_ids, 1] = torch.empty(n, device=self.device).uniform_(
+            *ranges.lin_vel_y
+        )
+        fixed = getattr(self.cfg, "direction", None)
+        if fixed is None:
+            sign = torch.where(
+                torch.rand(n, device=self.device) < 0.5,
+                torch.full((n,), PV_DIRECTION_CW, device=self.device),
+                torch.full((n,), PV_DIRECTION_CCW, device=self.device),
+            )
+        else:
+            sign = torch.full(
+                (n,), math.copysign(1.0, float(fixed)), device=self.device
+            )
+        self.vel_command_b[env_ids, 2] = sign
+        self.is_standing_env[env_ids] = False
+        self.vel_command_w[env_ids] = self.vel_command_b[env_ids]
+
+    def _update_command(self) -> None:
+        pass  # No heading controller / standing-env machinery: it is a flag.
+
+    def _update_metrics(self) -> None:
+        pass  # Velocity-tracking metrics are meaningless for a flag.
+
+
+@_dataclass(kw_only=True)
+class PivotCommandCfg(VelocityCommandCommandOnlyCfg):
+    # None = sample ±1 per env at reset (one network, both directions).
+    # ±1 = pin the direction for a one-way task.
+    direction: float | None = None
+
+    def build(self, env: ManagerBasedRlEnv) -> "PivotCommand":
+        return PivotCommand(self, env)

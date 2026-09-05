@@ -91,6 +91,10 @@ from .microduck_bow_env_cfg import (
     make_microduck_bow_env_cfg,
     MicroduckBowRlCfg,
 )
+from .microduck_pivot_env_cfg import (
+    make_microduck_pivot_env_cfg,
+    MicroduckPivotRlCfg,
+)
 from .backlash import make_backlash_variant
 
 # Bow — the play bow: dip, hold, rise, stand, feet planted (go-ducks skill)
@@ -285,6 +289,20 @@ register_mjlab_task(
     env_cfg=make_microduck_happy_spin_env_cfg(),
     play_env_cfg=make_microduck_happy_spin_env_cfg(play=True),
     rl_cfg=MicroduckHappySpinRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# Pivot — one full 360° turn about a single PLANTED foot: the pin foot stays
+# put and in contact while the other paddles the trunk round it, then both feet
+# settle into STAND. The turn DIRECTION rides the twist yaw slot (obs[50]) as a
+# ±1 flag, so one network turns both ways and installs as two skill entries
+# (pivot-left [0,0,1], pivot-right [0,0,-1]) — the daemon feeds a skill its
+# configured constant twist, the same trick the published flamingo uses.
+register_mjlab_task(
+    task_id="Mjlab-Pivot-Flat-MicroDuck",
+    env_cfg=make_microduck_pivot_env_cfg(),
+    play_env_cfg=make_microduck_pivot_env_cfg(play=True),
+    rl_cfg=MicroduckPivotRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 
