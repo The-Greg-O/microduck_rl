@@ -83,7 +83,20 @@ from .microduck_run_env_cfg import (
     make_microduck_run_env_cfg,
     MicroduckRunRlCfg,
 )
+from .microduck_bow_env_cfg import (
+    make_microduck_bow_env_cfg,
+    MicroduckBowRlCfg,
+)
 from .backlash import make_backlash_variant
+
+# Bow — the play bow: dip, hold, rise, stand, feet planted (go-ducks skill)
+register_mjlab_task(
+    task_id="Mjlab-Bow-Flat-MicroDuck",
+    env_cfg=make_microduck_bow_env_cfg(),
+    play_env_cfg=make_microduck_bow_env_cfg(play=True),
+    rl_cfg=MicroduckBowRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Tippy taps — excited-dog alternating foot taps on the spot (go-ducks skill)
 register_mjlab_task(

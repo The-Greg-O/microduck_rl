@@ -7365,3 +7365,243 @@ def tt_drift_penalty(
     root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
     d2 = torch.sum(torch.square(root_xy - env._tt_home), dim=1)
     return torch.clamp(d2 / 0.01, 0.0, max_cost)   # saturates at 10 cm
+
+
+# --------------------------------------------------------------------------- #
+# Tâche BOW — the play bow: dip, hold, rise, stand                             #
+# --------------------------------------------------------------------------- #
+# A dog's invitation to play: from a stand, dip the trunk down and forward
+# (~3 cm crouch, trunk slightly nose-down), head lowered, hold ~1 s, then rise
+# back to the standing pose — all inside a 4 s episode, FEET PLANTED throughout.
+#
+# Structure mirrors the tippy-taps block above: a single per-env memory
+# (`_bow_update`) is refreshed ONCE per env step, keyed on `common_step_counter`,
+# and every reward term calls it first, so the terms stay order-independent and
+# zero-weight-safe. Fresh episodes (episode_length_buf <= 1) re-arm everything.
+#
+# The phase is driven by TIME, not by state: dip 0–1 s, hold 1–2 s, rise 2–3 s,
+# stand 3–4 s. Time is legitimate here (unlike the roulade waypoint disaster)
+# because the trunk targets are a SLEWED ramp, not a per-phase step: being ahead
+# of the ramp pays zero, so there is no "arrive early and farm it" jackpot
+# (AGENTS.md "No jackpots"). Two blends carry it:
+#   s (`_bow_blend`) 0→1 over the dip, 1 through the hold, 1→0 over the rise,
+#     0 in the stand — drives the trunk height and pitch targets.
+#   r (`_bow_rise`)  0 until the hold ends, 0→1 over the rise, 1 in the stand —
+#     gates the head LIFT so the head is at HOME at t=0, down at the hold, and
+#     lifted at the finish (head target = s·down + r·up).
+
+BOW_DIP_END_S = 1.0
+BOW_HOLD_END_S = 2.0
+BOW_RISE_END_S = 3.0
+BOW_STAND_END_S = 4.0
+
+BOW_PHASE_DIP, BOW_PHASE_HOLD, BOW_PHASE_RISE, BOW_PHASE_STAND = 0, 1, 2, 3
+
+# Measured on the walk model (see the cfg docstring): trunk z at HOME, the bow
+# crouch, and the nose-down trunk pitch of the bow.
+BOW_STAND_Z = 0.115
+BOW_CROUCH_Z = 0.085
+BOW_PITCH_RAD = 0.1745  # 10° nose-down
+
+# Head deltas from HOME on [neck_pitch, head_pitch] (servo indices 5, 6).
+# Signs verified by forward kinematics on robot_walk.xml: (-0.30, +0.35) drops
+# the mouth_tip site ~3.9 cm and moves it ~1.5 cm forward (head down + nose
+# forward); (+0.25, -0.25) lifts it ~1.8 cm. Do NOT flip these from intuition:
+# positive neck_pitch tucks the chin and raises the beak.
+BOW_HEAD_DOWN = (-0.30, 0.35)
+BOW_HEAD_UP = (0.25, -0.25)
+BOW_HEAD_JOINTS = (5, 6)
+
+
+def _bow_update(
+    env: ManagerBasedRlEnv, sensor_name: str, asset_cfg: SceneEntityCfg
+) -> None:
+    """Refresh the per-env bow memory once per env step (phase, blends, the
+    episode's home xy, and whether the spawn has touched down)."""
+    tick = int(env.common_step_counter)
+    if getattr(env, "_bow_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_bow_blend"):
+        env._bow_t = torch.zeros(n, device=dev)
+        env._bow_phase = torch.zeros(n, dtype=torch.long, device=dev)
+        env._bow_blend = torch.zeros(n, device=dev)
+        env._bow_rise = torch.zeros(n, device=dev)
+        env._bow_home = torch.zeros(n, 2, device=dev)
+        env._bow_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._bow_tick = tick
+
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+
+    fresh = env.episode_length_buf <= 1
+    env._bow_home[fresh] = root_xy[fresh]
+    env._bow_landed[fresh] = False
+
+    t = env.episode_length_buf.to(torch.float32) * env.step_dt
+    env._bow_t = t
+    bounds = torch.tensor(
+        [BOW_DIP_END_S, BOW_HOLD_END_S, BOW_RISE_END_S], device=dev
+    )
+    # right=True: boundaries[i-1] <= t < boundaries[i], so t == 1.0 s is HOLD.
+    env._bow_phase = torch.clamp(
+        torch.bucketize(t, bounds, right=True), max=BOW_PHASE_STAND
+    )
+    u_dip = torch.clamp(t / BOW_DIP_END_S, 0.0, 1.0)
+    u_rise = torch.clamp(
+        (t - BOW_HOLD_END_S) / max(BOW_RISE_END_S - BOW_HOLD_END_S, 1e-6), 0.0, 1.0
+    )
+    env._bow_blend = u_dip * (1.0 - u_rise)
+    env._bow_rise = u_rise
+
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0
+    env._bow_landed |= found.all(dim=1)
+
+
+def _bow_nose_up(asset: Entity) -> torch.Tensor:
+    """Trunk pitch in rad, POSITIVE nose-up, yaw-invariant.
+
+    sin(pitch) is the world-z component of the trunk's body-x (forward) axis,
+    i.e. R[2,0] = 2(qx·qz - qw·qy) for quat (w, x, y, z). A rotation about
+    world z leaves it unchanged, so a spun-around robot is not punished.
+    """
+    q = asset.data.root_link_quat_w
+    r20 = 2.0 * (q[:, 1] * q[:, 3] - q[:, 0] * q[:, 2])
+    return torch.asin(torch.clamp(torch.nan_to_num(r20, nan=0.0), -1.0, 1.0))
+
+
+def bow_height_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    stand_z: float = BOW_STAND_Z,
+    crouch_z: float = BOW_CROUCH_Z,
+    std: float = 0.02,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: Gaussian on trunk z against the SLEWED height ramp
+    stand → crouch → stand. Constant-rate, so diving early pays nothing."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - env.scene.terrain.env_origins[:, 2], nan=0.0
+    )
+    target = stand_z + env._bow_blend * (crouch_z - stand_z)
+    return torch.exp(-((z - target) / std) ** 2)
+
+
+def bow_pitch_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    pitch_rad: float = BOW_PITCH_RAD,
+    std: float = 0.12,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: Gaussian on trunk pitch against the SLEWED nose-down ramp
+    (0 → -pitch_rad → 0). Nose-down is what makes a crouch read as a bow."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    target = -pitch_rad * env._bow_blend
+    return torch.exp(-((_bow_nose_up(asset) - target) / std) ** 2)
+
+
+def bow_head_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    down_deltas: tuple[float, ...] = BOW_HEAD_DOWN,
+    up_deltas: tuple[float, ...] = BOW_HEAD_UP,
+    joint_indices: tuple[int, ...] = BOW_HEAD_JOINTS,
+    std: float = 0.30,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: per-joint Gaussian on [neck_pitch, head_pitch] against
+    HOME + s·down + r·up — head down through the dip and hold, lifted through
+    the rise and stand. Mean (not product) keeps gradient alive when one joint
+    is off, as in head_pose_tracking."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    idx = list(joint_indices)
+    pos = _servo_joint_pos(env, asset)[:, idx]
+    home = _servo_default_joint_pos(env, asset)[:, idx]
+    down = torch.tensor(down_deltas, device=env.device, dtype=pos.dtype)
+    up = torch.tensor(up_deltas, device=env.device, dtype=pos.dtype)
+    target = home + env._bow_blend[:, None] * down + env._bow_rise[:, None] * up
+    return torch.exp(-((pos - target) / std) ** 2).mean(dim=-1)
+
+
+def bow_upright_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    std: float = 0.15,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: LATERAL tilt only — Gaussian on the world-z component of the
+    trunk's body-y axis, R[2,1] = 2(qy·qz + qw·qx).
+
+    The stock `upright` term prices total tilt, which would fight the bow's
+    intended nose-down pitch. This prices roll (and, through it, any tumble
+    that is not a clean sagittal dip) while leaving the pitch to
+    `bow_pitch_reward`."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    q = asset.data.root_link_quat_w
+    r21 = torch.nan_to_num(
+        2.0 * (q[:, 2] * q[:, 3] + q[:, 0] * q[:, 1]), nan=0.0
+    )
+    return torch.exp(-(r21 / std) ** 2)
+
+
+def bow_stand_pose_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    joint_indices: Optional[list] = None,
+    std: float = 0.12,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: tight Gaussian pose-match to HOME, PAID ONLY IN THE STAND PHASE.
+
+    A time window, not a state gate — the policy cannot park in it early, and
+    it is what makes the episode end in a clean stand instead of leaving the
+    robot folded once the height ramp is satisfied."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    pos = _servo_joint_pos(env, asset)
+    target = _servo_default_joint_pos(env, asset)
+    if joint_indices is not None:
+        pos = pos[:, joint_indices]
+        target = target[:, joint_indices]
+    match = torch.exp(-((pos - target) / std) ** 2).mean(dim=-1)
+    return match * (env._bow_phase == BOW_PHASE_STAND).float()
+
+
+def bow_foot_lift_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 cost (negative weight): the FRACTION of feet off the floor, once
+    the spawn has touched down.
+
+    The anti-fall constraint that matters most for this trick — Microducks
+    fall while rising out of a crouch, and every one of those falls starts
+    with a foot leaving the ground. Charged per foot so a single lift already
+    costs, and both feet airborne costs double."""
+    _bow_update(env, sensor_name, asset_cfg)
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0
+    return (~found).float().mean(dim=1) * env._bow_landed.float()
+
+
+def bow_drift_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded cost (negative weight): squared xy distance from where the
+    episode started, saturating at 10 cm. A bow happens on the spot."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    d2 = torch.sum(torch.square(root_xy - env._bow_home), dim=1)
+    return torch.clamp(d2 / 0.01, 0.0, max_cost)
