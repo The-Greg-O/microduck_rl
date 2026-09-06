@@ -548,6 +548,38 @@ it live only after `jp_land` has actually fired, not merely after the flight
 ended. If the height does not move at all, the 20 mm landing tolerance is the
 next variable.
 
+v3 RESULT (jump-v3, a10g-small, 2000 iterations, ~$2), scored against the
+prediction above the same afternoon:
+
+  * training at 1999: `jp_rise` 0.086/step (predicted 0.10-0.15; it was 0.025
+    at 500, 0.040 at 1000, 0.100 at 1500 — still climbing when the run ended),
+    `jp_land` 0.149 (unchanged), `jp_flight` 2.44 (unchanged), `fell_over`
+    0.21/iteration (v2: 0.88), episode length 99.2. Four of five as predicted,
+    the fifth low and rising.
+  * lab, 8 episodes (4 seeds clean, 4 with noise + DR + delay): 0 falls of 8.
+    FINAL TRUNK 110.3-111.1 mm ON 8 OF 8 (predicted >= 6 of 8 within 8 mm of
+    115; v2 sat at 97-98 on 8 of 8). One hop per episode; clean flights 120-140
+    ms at trunk apex 121.6-129.4 mm (v2: 160-180 ms, 128-134 mm), noisy 180-200
+    ms at 140-150 mm. Two clean seeds cleared only 7 mm over 115, a millimetre
+    under the rule's 8 — the hop gave up ~5 mm of apex and ~40 ms of flight for
+    the last 13 mm of standing, and under noise it lost nothing.
+  * the contact sheet (seed 0): both feet off at 0.32 s, landing at 72 mm (v2
+    collapsed to 39), then 97 -> 104 -> 108 -> 110 mm by 1.10 s and held there
+    to 3.0 s, tilt 0, nothing but feet on the floor, 3 trunk_z reversals over
+    the whole 3 s. The head finishes pitched forward (head_z 0.187 against the
+    keyframe's 0.233); the trunk is 5 mm under the settled stand.
+  * the "40-100 ms" flight band in v1's verdict rule was the scripted hop's,
+    not the policy's: v2 and v3 both fly longer because they tuck the feet
+    through the landing. The band was wrong, the hop was not.
+
+Verdict: v3 works and is the published jump (the-greg-o/microduck-jump). The
+predicted failure mode — the park moving to ~107 — did not happen; the rise
+bought the height. What would come next, if anything, is the pre-hop contact
+chatter (a 20-40 ms both-feet-off flicker at 0.08 s in the lab during the
+load, which the training latch may or may not count as the first flight) and
+the forward head at the finish; neither is worth a run until the real IMU
+latency is measured (docket, "Sensor latency and the tricks").
+
 Open question carried from the design note: the head throw. 38% of the mass is
 in the head (`airflip._af_head_throw` exists for that reason), but a scripted
 +/-0.5 rad neck/head swing through the launch changed the apex by -2 to +1 mm —
