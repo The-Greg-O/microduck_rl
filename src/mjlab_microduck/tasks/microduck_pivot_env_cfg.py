@@ -104,6 +104,30 @@ On robot_walk.xml at the STAND keyframe, feet flat:
     loading, which yaws the trunk AGAINST the command: measured -21°/-17° on
     direction +1 and +28°/+33° on -1. The raw integral is now floored at zero
     and the wrong-way rate is charged per step, bounded.
+  * `pin_broken` (v3) is what stops the pin being FOR SALE. v2 turned — and
+    turned well — but as a two-footed shuffle-spin: contact fractions 0.91 and
+    0.85, 6–17 cm of trunk drift. Every v2 pin pressure was graded and bounded,
+    so trading ~2.0 of pin pay and ~2.5 of pin costs for ~4.0 of progress was
+    simply a good deal. The pin is now a REQUIREMENT: off the floor for more
+    than 40 ms or more than 3 cm from its anchor and it is broken, charged
+    every step until re-planted within 2 cm of that anchor — and, decisively,
+    THE PROGRESS POTENTIAL DOES NOT ADVANCE WHILE IT IS BROKEN. A shuffle earns
+    no progress past its first 3 cm, which drops it below standing still.
+    Gating the potential is safe now and was not in v1: the raw integral is
+    floored and the potential is a running maximum, so a gate cannot burn
+    banked degrees, only stop new ones accruing.
+  * `paddle_reach` (v3) makes the free foot REACH rather than tap. The air-time
+    window says the foot left the floor; the reach scores how far its contact
+    point travelled between consecutive plants — a plateau over 4–8 cm with a
+    Gaussian skirt, paid ONE SHOT on the plant so it cannot be farmed by
+    parking the foot out wide. The window floor also rises 0.06 → 0.08 s: the
+    v2 shuffle's alternating flicks cleared 0.06 s, so the paddle was paying
+    for a twitch.
+  * `two_feet_still` (v3) names the shuffle in one predicate: both feet in
+    contact while the trunk yaws past 0.5 rad/s. Two planted feet and a turning
+    trunk means the feet are sliding. It also charges a real pivot's
+    double-support push (a third of the cadence, -0.67/step), which is
+    deliberate — it pushes the cadence toward more air and shorter plants.
   * DISCOVERY IS MADE CHEAP. The pin reward's std starts at 4 cm (a whole
     footprint of slack) with the displacement cost at -0.5, and both tighten to
     1.5 cm / -2.0 by iteration 1500 on phase-aligned stages; the paddle opens
@@ -162,45 +186,69 @@ _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 # THE ARITHMETIC (dt = 0.02, 200 steps, rate cap = 1.5 turns/s so a 1 turn/s
 # pivot scores `rate` = 2π/3π = 0.667 on every rate-scaled term).
 #
-# Version 1 of this table was wrong in one decisive place: it gave "standing"
-# the full pin pay. It does not any more — `pv_pin_reward` is multiplied by
-# this step's progress — and that single change is what turns the ranking over.
-# Per step of the SPIN phase, PIVOT-SPECIFIC terms only (height 1.0 + upright
-# 2.0 + head tracking are common to every row and cancel). These are MEASURED,
-# not estimated — `test_the_arithmetic_pivoting_wins` runs all three strategies
-# through the real reward functions at these weights:
+# v1 was wrong because it gave "standing" the full pin pay; gating the pin on
+# progress fixed that and v2 duly TURNED. v2 was wrong in a subtler place: every
+# pin pressure was GRADED, so the pin was for sale. Checkpoint 2499 bought its
+# way out — it turned +421°/+362° (+1) and -365°/-303° (-1), 360° in 0.7–1.1 s,
+# no falls, correct direction, but as a TWO-FOOTED SHUFFLE-SPIN: per-foot
+# contact fractions 0.91 / 0.85 and 6–17 cm of trunk drift. Giving up ~2.0 of
+# pin pay and ~2.5 of bounded pin costs to keep ~4.0 of progress is a trade
+# worth taking, so it took it.
 #
-#                                  still   pivoting   two-footed spin
-#   progress  6.0 × rate             0      +4.00        +4.00
-#   pin       3.0 × stay × rate      0      +2.00        +0.29  (slid: stay→0)
-#   paddle    3.0, in-window         0      +1.10         0     (pin airborne)
-#   stall    -2.0                  -1.62     0            0
-#   counter  -1.0                    0*      0            0
-#   pin displacement (-0.5 → -2.0)   0       0           -1.44
-#   pin slip -0.5                    0       0           -0.49
-#                                 ───────  ────────    ────────
-#                                  -1.62    +7.10       +2.37
-#   *the wrong-way wiggle checkpoint 2499 actually settled into pays the stall
-#    cost AND the counter cost, and collects nothing at all: it is the WORST
-#    row on the board, where in v1 it was the best.
+# v3 makes the pin a REQUIREMENT rather than a price. Mean reward per step of
+# the SPIN phase, PIVOT-SPECIFIC terms only (height 1.0 + upright 2.0 + head
+# tracking are common to every row and cancel). These are MEASURED, not
+# estimated — `test_the_shuffle_loses_per_step_during_the_spin_phase` and
+# `test_the_arithmetic_pivoting_wins` run all three strategies through the real
+# reward functions at these weights and print exactly this table. The pivot row
+# is a 0.2 s up / 0.1 s down cadence at 1 turn/s with the free foot carrying its
+# contact point 6 cm per stroke; the shuffle row is WHAT v2 ACTUALLY LEARNED —
+# both feet down, both sliding (pin at 0.1 m/s), trunk yawing 1.5 rad/s:
 #
-# Settle phase (after the one-shot completion): progress / pin / paddle / stall
-# / pin displacement are all gated off by `_pv_done`, and settle 4.0 takes
-# over → +4.05/step.
+#                                    still   pivoting   two-footed shuffle
+#   progress      6.0 × rate          0.00     +4.00      +0.19   (→ 0 at 0.3 s)
+#   pin           3.0 × stay × rate   0.00     +2.00      +0.05   (→ 0)
+#   paddle        3.0, in-window      0.00     +0.92       0.00
+#   paddle_reach  3.0, one shot/plant 0.00     +0.18       0.00
+#   pin_broken   (-1.0 → -3.0)        0.00      0.00      -2.40
+#   pin displacement (-0.5 → -2.0)    0.00      0.00      -1.63
+#   two_feet_still   -2.0             0.00     -0.61      -0.80
+#   pin slip         -0.5             0.00      0.00      -0.49
+#   stall            -2.0            -0.99      0.00      -0.61
+#   counter_yaw      -1.0             0.00      0.00       0.00
+#                                   ───────   ───────    ────────
+#   mean/step over the spin phase    -0.99     +6.49      -5.70
+#   ...and once the pin is broken                         -7.98
 #
-# A whole 4 s episode, turning at 1 turn/s (49 steps of turn, 151 of settle):
-#   pivot   49 × 7.10 + 5.00 + 151 × 4.05 =  959
-#   spin    49 × 2.37 + 5.00 + 151 × 4.03 =  724
-#   still  200 × (-1.62)                  = -324
-# Pivoting beats standing by ~1283 and a two-footed spin by ~235, and finishing
-# early still wins because every step saved from the turn is a step of settle.
-# The ranking holds at BOTH ends of the pin curriculum (loose: 959 / 777 /
-# -324), which is what stops the loose early stage from teaching a spin.
+# The decisive line is `progress → 0`. The shuffle's pin passes 3 cm from its
+# anchor after ~0.3 s, `_pv_broken` latches, and from then on the potential does
+# not advance at all: no progress means no pin pay either (it is rate-scaled)
+# and the stall timer runs. The shuffle stops being SECOND BEST — which is what
+# it was under v2's weights, and precisely why checkpoint 2499 learned it — and
+# becomes the worst row on the board, below standing still.
+#
+# Settle phase (after the one-shot completion): progress / pin / paddle /
+# paddle_reach / stall / pin displacement / pin_broken / two_feet_still are all
+# gated off by `_pv_done`, and settle 4.0 takes over → +4.0/step.
+#
+# Whole 4 s episodes (200 steps), the same three strategies end to end:
+#   pivot     49 steps of turn + the completion bonus + 151 of settle   +929
+#   still     200 steps of a ramping stall                              -324
+#   shuffle   never completes; ~185 steps at -8                        -1465
+# Pivoting beats standing by ~1250 and the shuffle by ~2400, and finishing early
+# still wins because every step saved from the turn is a step of settle. The
+# ranking holds at BOTH ends of the pin curriculum (loose: +929 / -324 / -816),
+# which is what stops the loose early stage from teaching a shuffle — the pin
+# COSTS are made cheap for discovery, but the progress GATE never is.
 W_PROGRESS = 6.0
 W_COMPLETE = 5.0
 W_PIN = 3.0
 W_SETTLE = 4.0
 W_PADDLE = 3.0
+# The reach bonus matches the paddle's weight but fires ONCE per plant, so on a
+# 0.3 s cadence it is worth ~+0.2/step: a directional nudge toward strokes that
+# actually travel 4–8 cm, not a term that can out-shout progress.
+W_PADDLE_REACH = 3.0
 W_HEIGHT = 1.0
 # Opens loose (-0.5) so the first clumsy attempt at lifting the free foot is
 # affordable, tightened to -2.0 by iteration 1500 — phase-aligned with the pin
@@ -212,6 +260,18 @@ W_RADIUS = -1.5
 W_TILT = -0.5
 W_STALL = -2.0
 W_COUNTER_YAW = -1.0
+# The pin-broken cost. Its real teeth are the progress gate in `_pv_update`, not
+# this number, so the weight follows the same discovery-cheap ramp as the other
+# two pin pressures: a first clumsy attempt that scuffs the pin costs -1.0/step
+# while the turn is being discovered, -3.0/step once it exists. Phase-aligned
+# with `pin_std` and `pin_displacement_weight` — tightening one pin pressure
+# while the others are slack is just a tax on attempting.
+W_PIN_BROKEN_START = -1.0
+W_PIN_BROKEN = -3.0
+# Both feet planted while the trunk yaws hard: the shuffle-spin, charged
+# directly. Flat, not curriculum'd — it is the one pressure that must be present
+# from step one, because the shuffle basin is what the policy falls into FIRST.
+W_TWO_FEET_STILL = -2.0
 W_ACTION_RATE = -0.05
 
 # Curriculum boundary: the pin is loose until the turn exists, tight after.
@@ -320,6 +380,19 @@ def make_microduck_pivot_env_cfg(
             "max_air": microduck_mdp.PV_MAX_AIR_S,
         },
     )
+    # v3: air time says the foot LEFT the floor, not that it went anywhere. The
+    # v2 shuffle lifted a foot and set it back down where it was. This scores
+    # the contact point's travel between consecutive plants, one shot per plant.
+    cfg.rewards["paddle_reach"] = RewardTermCfg(
+        func=microduck_mdp.pv_paddle_reach_reward,
+        weight=W_PADDLE_REACH,
+        params={
+            **shared(),
+            "reach_min": microduck_mdp.PV_REACH_MIN_M,
+            "reach_max": microduck_mdp.PV_REACH_MAX_M,
+            "reach_std": microduck_mdp.PV_REACH_STD_M,
+        },
+    )
     cfg.rewards["settle"] = RewardTermCfg(
         func=microduck_mdp.pv_settle_reward,
         weight=W_SETTLE,
@@ -349,6 +422,29 @@ def make_microduck_pivot_env_cfg(
         func=microduck_mdp.pv_pin_displacement_penalty,
         weight=W_PIN_DISPLACEMENT_START,
         params={**shared(), "saturate_m": microduck_mdp.PV_PIN_SAT_M},
+    )
+    # v3: THE term that stops the pin being for sale. Broken = off the floor for
+    # more than 40 ms or more than 3 cm from its anchor; charged every step until
+    # re-planted within 2 cm of that anchor. Its real teeth are in `_pv_update`:
+    # while it is set the progress potential does not advance at all, so a turn
+    # taken off the pin earns nothing and the stall timer runs.
+    cfg.rewards["pin_broken"] = RewardTermCfg(
+        func=microduck_mdp.pv_pin_broken_penalty,
+        weight=W_PIN_BROKEN_START,
+        params=shared(),
+    )
+    # v3: the shuffle-spin named directly — both feet planted while the trunk
+    # yaws past 0.5 rad/s. Charges a genuine pivot's double-support push too
+    # (~a third of the cadence = -0.67/step), which is intended: it pushes the
+    # cadence toward more air and shorter plants.
+    cfg.rewards["two_feet_still"] = RewardTermCfg(
+        func=microduck_mdp.pv_two_feet_still_penalty,
+        weight=W_TWO_FEET_STILL,
+        params={
+            **shared(),
+            "yaw_gate": microduck_mdp.PV_TWOFOOT_YAW_GATE,
+            "yaw_cap": microduck_mdp.PV_TWOFOOT_YAW_CAP,
+        },
     )
     cfg.rewards["pin_slip"] = RewardTermCfg(
         func=microduck_mdp.pv_pin_slip_penalty,
@@ -420,6 +516,23 @@ def make_microduck_pivot_env_cfg(
                 {"step": 600 * 24, "weight": -1.0},
                 {"step": 1000 * 24, "weight": -1.5},
                 {"step": PIN_TIGHTEN_ITER * 24, "weight": W_PIN_DISPLACEMENT},
+            ],
+        },
+    )
+    # The third pin pressure, on the SAME iterations. The progress gate that
+    # goes with it is NOT curriculum'd — it is on from step one, because a
+    # policy that can earn progress off the pin will learn to earn progress off
+    # the pin. Only the cost of scuffing is made cheap while the turn is being
+    # discovered.
+    cfg.curriculum["pin_broken_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "pin_broken",
+            "weight_stages": [
+                {"step": 0, "weight": W_PIN_BROKEN_START},
+                {"step": 600 * 24, "weight": -1.5},
+                {"step": 1000 * 24, "weight": -2.0},
+                {"step": PIN_TIGHTEN_ITER * 24, "weight": W_PIN_BROKEN},
             ],
         },
     )

@@ -22,6 +22,8 @@ from mjlab_microduck.tasks.microduck_pivot_env_cfg import (
     PV_DIRECTION_CCW,
     PV_DIRECTION_CW,
     PV_TARGET_YAW,
+    W_PIN_BROKEN,
+    W_PIN_BROKEN_START,
     W_PIN_DISPLACEMENT,
     W_PIN_DISPLACEMENT_START,
     MicroduckPivotRlCfg,
@@ -119,10 +121,12 @@ def test_pivot_fighting_terms_are_gone():
 
 def test_reward_signs():
     cfg = make_microduck_pivot_env_cfg()
-    for pos in ("pivot_progress", "pivot_complete", "pin", "paddle", "settle",
+    for pos in ("pivot_progress", "pivot_complete", "pin", "paddle",
+                "paddle_reach", "settle",
                 "height_stand", "upright", "head_pose_tracking"):
         assert cfg.rewards[pos].weight > 0, pos
-    for cost in ("pin_displacement", "pin_slip", "pivot_radius", "tilt",
+    for cost in ("pin_displacement", "pin_slip", "pin_broken",
+                 "two_feet_still", "pivot_radius", "tilt",
                  "stall", "counter_yaw",
                  "body_ang_vel", "action_rate_l2", "dof_pos_limits",
                  "self_collisions"):
@@ -132,6 +136,38 @@ def test_reward_signs():
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
     assert [s["weight"] for s in stages] == [-0.05, -0.10, -0.20]
     assert stages[1]["step"] >= 1000 * 24
+
+
+def test_v3_terms_exist_with_the_stated_thresholds():
+    """The three v3 additions, wired with the measured numbers: the pin is a
+    hard requirement, the paddle has to reach, the shuffle is charged."""
+    cfg = make_microduck_pivot_env_cfg()
+
+    assert cfg.rewards["pin_broken"].func is microduck_mdp.pv_pin_broken_penalty
+    assert cfg.rewards["pin_broken"].weight == W_PIN_BROKEN_START == -1.0
+    assert W_PIN_BROKEN == -3.0
+    assert microduck_mdp.PV_PIN_BREAK_AIR_S == 0.04     # 40 ms off the floor
+    assert microduck_mdp.PV_PIN_BREAK_M == 0.03         # ...or 3 cm from anchor
+    assert microduck_mdp.PV_PIN_REPLANT_M == 0.02       # repaired within 2 cm
+    assert microduck_mdp.PV_PIN_REPLANT_M < microduck_mdp.PV_PIN_BREAK_M, (
+        "hysteresis: the repair band must be tighter than the break band"
+    )
+
+    reach = cfg.rewards["paddle_reach"]
+    assert reach.func is microduck_mdp.pv_paddle_reach_reward
+    assert reach.weight == 3.0
+    assert reach.params["reach_min"] == microduck_mdp.PV_REACH_MIN_M == 0.04
+    assert reach.params["reach_max"] == microduck_mdp.PV_REACH_MAX_M == 0.08
+    # the stroke window floor rose so a shuffle's twitch no longer clears it
+    assert microduck_mdp.PV_MIN_AIR_S == 0.08
+    assert cfg.rewards["paddle"].params["min_air"] == 0.08
+    assert cfg.rewards["paddle"].params["max_air"] == 0.35
+
+    two = cfg.rewards["two_feet_still"]
+    assert two.func is microduck_mdp.pv_two_feet_still_penalty
+    assert two.weight == -2.0
+    assert two.params["yaw_gate"] == microduck_mdp.PV_TWOFOOT_YAW_GATE == 0.5
+    assert two.params["yaw_cap"] > two.params["yaw_gate"]
 
 
 def test_a_spin_scores_clearly_less_than_a_pivot():
@@ -254,14 +290,18 @@ class _FakeEnv:
         if down:
             self.sensor.data.current_air_time[:, foot] = 0.0
 
-    def tick(self, omega_z=0.0, pin_dxy=(0.0, 0.0), trunk_dxy=(0.0, 0.0)):
-        """Advance one env step: trunk yaw rate, pin-foot drift, trunk drift."""
+    def tick(self, omega_z=0.0, pin_dxy=(0.0, 0.0), trunk_dxy=(0.0, 0.0),
+             free_dxy=(0.0, 0.0)):
+        """Advance one env step: trunk yaw rate, pin-foot drift, trunk drift,
+        and (v3) free-foot travel, which is what the paddle's reach scores."""
         self.common_step_counter += 1
         self.episode_length_buf += 1
         self._asset.data.root_link_ang_vel_b[:, 2] = omega_z
         pin = int(self._pin_index())
         self._asset.data.site_pos_w[:, pin, 0] += pin_dxy[0]
         self._asset.data.site_pos_w[:, pin, 1] += pin_dxy[1]
+        self._asset.data.site_pos_w[:, 1 - pin, 0] += free_dxy[0]
+        self._asset.data.site_pos_w[:, 1 - pin, 1] += free_dxy[1]
         self._asset.data.root_link_pos_w[:, 0] += trunk_dxy[0]
         self._asset.data.root_link_pos_w[:, 1] += trunk_dxy[1]
         # air time accrues for whichever foot is off the floor
@@ -388,15 +428,21 @@ def test_pin_term_fires_on_displacement():
 def test_pin_costs_stop_at_the_settle():
     """"Planted" is a constraint on the TURN. Charging the tightened -2.0 for
     every step of the ~150-step settle would swamp the settle pay and make
-    finishing the trick worse than never finishing it."""
+    finishing the trick worse than never finishing it.
+
+    The drag here stays under PV_PIN_BREAK_M: past 3 cm the v3 latch freezes the
+    potential and the turn can never finish at all, which is the subject of
+    `test_a_broken_pin_earns_no_progress`."""
     env = _FakeEnv()
-    _turn_for(env, _CAP, 0.5, pin_dxy=(0.002, 0.0))    # drag the pin 5 cm
-    assert float(env._pv_pin_d[0]) > microduck_mdp.PV_PIN_SAT_M
-    assert float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) == 1.0
+    _turn_for(env, _CAP, 0.24, pin_dxy=(0.002, 0.0))   # drag the pin 2.4 cm
+    assert 0.0 < float(env._pv_pin_d[0]) < microduck_mdp.PV_PIN_BREAK_M
+    assert bool(env._pv_broken[0]) is False
+    assert 0.0 < float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) < 1.0
     _turn_for(env, _CAP, 0.6)                          # ...and finish the turn
     assert bool(env._pv_done[0]) is True
-    assert float(env._pv_pin_d[0]) > microduck_mdp.PV_PIN_SAT_M, "still moved"
+    assert float(env._pv_pin_d[0]) > 0.0, "still moved"
     assert float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) == 0.0
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0
 
 
 def test_pin_pays_nothing_while_standing_still():
@@ -471,6 +517,226 @@ def test_paddle_pays_alternation_only():
         env.tick(2.0)
         again += float(microduck_mdp.pv_paddle_reward(env)[0])
     assert again > 0.0, "alternation re-arms the pay"
+
+
+# ── v3: the pin is a hard requirement ────────────────────────────────────────
+
+def test_pin_breaks_on_lost_contact_past_the_tolerance():
+    """40 ms of tolerance: a one-step contact flicker is free, two steps is a
+    broken pin."""
+    env = _FakeEnv()
+    env.tick(_CAP)
+    assert bool(env._pv_broken[0]) is False
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0
+
+    env.set_contact(_LEFT, False)
+    env.tick(_CAP)                        # 0.02 s in the air: inside tolerance
+    assert math.isclose(float(env._pv_pin_air_s[0]), 0.02, rel_tol=1e-5)
+    assert bool(env._pv_broken[0]) is False
+    env.tick(_CAP)                        # 0.04 s... still not PAST 0.04
+    assert bool(env._pv_broken[0]) is False
+    env.tick(_CAP)                        # 0.06 s: broken
+    assert bool(env._pv_broken[0]) is True
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 1.0
+
+    # putting it back down within 2 cm of the anchor repairs it, and only that
+    env.set_contact(_LEFT, True)
+    env.tick(_CAP)
+    assert bool(env._pv_broken[0]) is False
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0
+
+
+def test_pin_breaks_on_displacement_and_needs_a_replant_to_repair():
+    """Break at 3 cm, repair only at 2 cm — hysteresis, and measured against the
+    ORIGINAL anchor, so "recover" means stepping back rather than re-declaring
+    wherever the foot ended up to be the new pin."""
+    env = _FakeEnv()
+    _turn_for(env, _CAP, 0.28, pin_dxy=(0.001, 0.0))       # 1.4 cm out
+    assert bool(env._pv_broken[0]) is False
+    _turn_for(env, _CAP, 0.34, pin_dxy=(0.001, 0.0))       # ~3.1 cm out
+    assert float(env._pv_pin_d[0]) > microduck_mdp.PV_PIN_BREAK_M
+    assert bool(env._pv_broken[0]) is True
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 1.0
+
+    # walking back to 2.5 cm is NOT enough: still outside the repair band
+    _turn_for(env, _CAP, 0.12, pin_dxy=(-0.001, 0.0))      # ~1.9... check
+    assert bool(env._pv_broken[0]) == (
+        float(env._pv_pin_d[0]) > microduck_mdp.PV_PIN_REPLANT_M
+    )
+    # ...all the way back to the anchor and it is repaired
+    _turn_for(env, _CAP, 0.4, pin_dxy=(-0.001, 0.0))
+    env._asset.data.site_pos_w[:, _LEFT, :2] = env._pv_pin_home
+    env.tick(_CAP)
+    assert float(env._pv_pin_d[0]) < microduck_mdp.PV_PIN_REPLANT_M
+    assert bool(env._pv_broken[0]) is False
+
+
+def test_a_broken_pin_earns_no_progress():
+    """THE v3 GATE, and the reason a shuffle-spin stops being viable: while the
+    pin is broken the potential does not advance, so the turn simply does not
+    count. Nothing banked is destroyed — the potential is a running maximum —
+    it only stops accruing, and the stall timer starts running."""
+    env = _FakeEnv()
+    _turn_for(env, _CAP, 0.2)                    # 10 clean steps of turn
+    banked = float(env._pv_yaw[0])
+    assert banked > 0.0
+
+    env.set_contact(_LEFT, False)                # break the pin
+    _turn_for(env, _CAP, 0.5)
+    assert bool(env._pv_broken[0]) is True
+    assert float(env._pv_yaw[0]) == banked, "banked degrees survive, untouched"
+    assert float(microduck_mdp.pv_progress_reward(env)[0]) == 0.0
+    assert float(microduck_mdp.pv_pin_reward(env)[0]) == 0.0
+    assert float(env._pv_stall_s[0]) > 0.0, "a frozen potential IS a stall"
+
+    env.set_contact(_LEFT, True)                 # re-plant on the anchor
+    env.tick(_CAP)
+    assert bool(env._pv_broken[0]) is False
+    assert math.isclose(
+        float(microduck_mdp.pv_progress_reward(env)[0]), 1.0, rel_tol=1e-6
+    ), "progress resumes immediately, no hole to climb out of"
+
+
+def test_pin_broken_cost_is_bounded_and_spin_phase_only():
+    env = _FakeEnv()
+    _turn_for(env, _CAP, 1.1)                    # finish the turn cleanly
+    assert bool(env._pv_done[0]) is True
+    env.set_contact(_LEFT, False)                # lift the pin during the settle
+    _turn_for(env, 0.0, 0.5)
+    assert bool(env._pv_broken[0]) is True
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0, (
+        "the settle is where both feet come back under the robot"
+    )
+
+
+def test_pin_broken_is_free_before_the_spawn_has_landed():
+    """The spawn transient is not a broken pin."""
+    env = _FakeEnv()
+    env.set_contact(_LEFT, False)
+    env.set_contact(_RIGHT, False)
+    _turn_for(env, _CAP, 0.5)                    # airborne the whole time
+    assert bool(env._pv_landed[0]) is False
+    assert bool(env._pv_broken[0]) is False
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0
+
+
+# ── v3: the paddle has to REACH ──────────────────────────────────────────────
+
+def _stroke(env, seconds, free_dxy, omega=2.0):
+    """Lift the free foot, carry it `free_dxy` per step, plant it."""
+    env.set_contact(_RIGHT, False)
+    for _ in range(int(round(seconds / env.step_dt))):
+        env.tick(omega, free_dxy=free_dxy)
+    env.set_contact(_RIGHT, True)
+    env.tick(omega)
+    return float(microduck_mdp.pv_paddle_reach_reward(env)[0])
+
+
+def test_reach_pays_a_stroke_that_travels_and_not_a_tap():
+    env = _FakeEnv()
+    env.tick(2.0)
+    # 10 steps x 6 mm = 6 cm: squarely inside the 4-8 cm plateau
+    assert _stroke(env, 0.2, (0.0, 0.006)) > 0.99
+    # a tap in place: the foot lifted, but it went nowhere
+    tap = _stroke(env, 0.2, (0.0, 0.0))
+    assert 0.0 < tap < 0.25, tap
+    # a lunge way past the reach: bounded, and worth almost nothing
+    lunge = _stroke(env, 0.2, (0.0, 0.015))       # 15 cm
+    assert 0.0 <= lunge < 0.05, lunge
+    # the band edges themselves pay full
+    assert _stroke(env, 0.2, (0.0, 0.004)) > 0.99   # 4 cm
+    assert _stroke(env, 0.2, (0.0, 0.008)) > 0.99   # 8 cm
+
+
+def test_reach_is_one_shot_per_plant():
+    """A per-step reach pay is farmable by parking the free foot out wide."""
+    env = _FakeEnv()
+    env.tick(2.0)
+    assert _stroke(env, 0.2, (0.0, 0.006)) > 0.99
+    paid = 0.0
+    for _ in range(20):                           # stand on it for 0.4 s
+        env.tick(2.0)
+        paid += float(microduck_mdp.pv_paddle_reach_reward(env)[0])
+    assert paid == 0.0, "the plant pays once; the next one must be re-earned"
+    # and holding the foot out in the AIR pays nothing either
+    env.set_contact(_RIGHT, False)
+    held = 0.0
+    for _ in range(50):
+        env.tick(2.0)
+        held += float(microduck_mdp.pv_paddle_reach_reward(env)[0])
+    assert held == 0.0
+
+
+def test_reach_ignores_contact_chatter():
+    """A foot that never really leaves the floor has not taken a stroke: the
+    plant edge needs PV_MIN_AIR_S of air behind it."""
+    env = _FakeEnv()
+    env.tick(2.0)
+    paid = 0.0
+    for _ in range(20):
+        env.set_contact(_RIGHT, False)
+        env.tick(2.0, free_dxy=(0.0, 0.03))       # 3 cm per flicker, chattering
+        env.set_contact(_RIGHT, True)
+        env.tick(2.0)
+        paid += float(microduck_mdp.pv_paddle_reach_reward(env)[0])
+    assert paid == 0.0, "0.02 s of air is not a stroke"
+
+
+def test_reach_needs_the_pin_down_and_the_spin_phase():
+    env = _FakeEnv()
+    env.tick(2.0)
+    env.set_contact(_LEFT, False)                 # a HOP: the pin is airborne
+    assert _stroke(env, 0.2, (0.0, 0.006)) == 0.0
+    env.set_contact(_LEFT, True)
+
+    done = _FakeEnv()
+    _turn_for(done, 2 * math.pi, 1.1)
+    assert bool(done._pv_done[0]) is True
+    assert _stroke(done, 0.2, (0.0, 0.006), omega=0.0) == 0.0
+
+
+# ── v3: turning on two planted feet is the shuffle ───────────────────────────
+
+def test_two_feet_still_charges_the_shuffle_and_not_a_stance():
+    env = _FakeEnv()
+    env.tick(0.0)                                 # both feet down, not turning
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0
+    env.tick(0.4)                                 # under the 0.5 rad/s gate
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0
+
+    gate = microduck_mdp.PV_TWOFOOT_YAW_GATE
+    cap = microduck_mdp.PV_TWOFOOT_YAW_CAP
+    env.tick(gate + 0.5 * (cap - gate))           # halfway up the ramp
+    assert math.isclose(
+        float(microduck_mdp.pv_two_feet_still_penalty(env)[0]), 0.5, rel_tol=1e-6
+    )
+    env.tick(1.5)                                 # the v2 shuffle's actual rate
+    assert math.isclose(
+        float(microduck_mdp.pv_two_feet_still_penalty(env)[0]),
+        (1.5 - gate) / (cap - gate), rel_tol=1e-6,
+    )
+    env.tick(50.0)                                # bounded: no jackpot
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 1.0
+    # unsigned: turning the WRONG way on two feet is the same failure
+    env.tick(-50.0)
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 1.0
+
+
+def test_two_feet_still_needs_both_feet_and_the_spin_phase():
+    env = _FakeEnv()
+    env.tick(50.0)
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 1.0
+    env.set_contact(_RIGHT, False)                # one foot up: this is a pivot
+    env.tick(50.0)
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0
+
+    env.set_contact(_RIGHT, True)
+    _turn_for(env, _CAP, 1.1)
+    assert bool(env._pv_done[0]) is True
+    env.tick(50.0)                                # decelerating out of the turn
+    assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0, (
+        "stopping with both feet down is the settle's goal, not a shuffle"
+    )
 
 
 def test_paddle_pays_neither_the_pin_nor_a_hop():
@@ -557,7 +823,10 @@ def test_tilt_cost_is_bounded_and_nonnegative():
 
 def test_memory_rearms_on_fresh_episode():
     env = _FakeEnv()
-    _turn_for(env, 2 * math.pi, 1.2, pin_dxy=(0.001, 0.0))
+    # 0.2 mm/step for 1.2 s = 1.2 cm of pin creep: under PV_PIN_BREAK_M, so the
+    # turn still completes (a broken pin freezes the potential — see
+    # `test_a_broken_pin_earns_no_progress`).
+    _turn_for(env, 2 * math.pi, 1.2, pin_dxy=(0.0002, 0.0))
     assert bool(env._pv_done[0]) is True and float(env._pv_yaw[0]) > 0.0
     assert float(env._pv_pin_d[0]) > 0.0
     home_before = env._pv_pin_home[0].clone()
@@ -567,10 +836,15 @@ def test_memory_rearms_on_fresh_episode():
     assert float(env._pv_raw[0]) == 0.0
     assert bool(env._pv_done[0]) is False
     assert bool(env._pv_just_done[0]) is False
+    assert bool(env._pv_broken[0]) is False
+    assert float(env._pv_pin_air_s[0]) == 0.0
+    assert float(env._pv_reach[0]) == 0.0
+    assert bool(env._pv_planted[0]) is False
     assert float(env._pv_pin_d[0]) == 0.0, "the pin re-anchors where it now is"
     assert not torch.allclose(env._pv_pin_home[0], home_before)
     assert float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) == 0.0
     assert float(microduck_mdp.pv_pin_slip_penalty(env)[0]) == 0.0
+    assert float(microduck_mdp.pv_pin_broken_penalty(env)[0]) == 0.0
 
 
 def test_direction_is_re_read_on_a_fresh_episode():
@@ -753,6 +1027,23 @@ def test_pin_curriculum_stages_parse():
     assert cfg.rewards["pin"].params["pin_std"] == std_stages[0]["std"]
     assert cfg.rewards["pin_displacement"].weight == w_stages[0]["weight"]
 
+    # v3: the third pin pressure rides the SAME iterations. Tightening one pin
+    # cost while the others are slack is just a tax on attempting.
+    b_stages = cfg.curriculum["pin_broken_weight"].params["weight_stages"]
+    assert cfg.curriculum["pin_broken_weight"].func is microduck_mdp.reward_weight
+    assert cfg.curriculum["pin_broken_weight"].params["reward_name"] == "pin_broken"
+    assert b_stages[0]["weight"] == W_PIN_BROKEN_START == -1.0
+    assert b_stages[-1]["weight"] == W_PIN_BROKEN == -3.0
+    assert [s["weight"] for s in b_stages] == sorted(
+        (s["weight"] for s in b_stages), reverse=True
+    )
+    assert [s["step"] for s in b_stages] == [s["step"] for s in std_stages]
+    assert cfg.rewards["pin_broken"].weight == b_stages[0]["weight"]
+    # ...but the PROGRESS GATE that gives the term its teeth is never relaxed:
+    # it lives in `_pv_update`, not in a weight, and there is no stage list for
+    # it anywhere.
+    assert "progress_gate" not in cfg.curriculum
+
 
 def test_pin_curriculum_applies_through_the_manager():
     """AGENTS.md: mutate term cfgs via the managers — writes to env.cfg are
@@ -773,8 +1064,9 @@ def test_pin_curriculum_applies_through_the_manager():
 # ── the arithmetic, run rather than asserted in prose ────────────────────────
 
 _PIVOT_TERMS = (
-    "pivot_progress", "pivot_complete", "pin", "paddle", "settle",
-    "pin_displacement", "pin_slip", "stall", "counter_yaw",
+    "pivot_progress", "pivot_complete", "pin", "paddle", "paddle_reach",
+    "settle", "pin_displacement", "pin_slip", "pin_broken", "two_feet_still",
+    "stall", "counter_yaw",
 )
 
 
@@ -790,9 +1082,12 @@ def _score(env, weights):
         "pivot_complete": microduck_mdp.pv_complete_bonus,
         "pin": microduck_mdp.pv_pin_reward,
         "paddle": microduck_mdp.pv_paddle_reward,
+        "paddle_reach": microduck_mdp.pv_paddle_reach_reward,
         "settle": microduck_mdp.pv_settle_reward,
         "pin_displacement": microduck_mdp.pv_pin_displacement_penalty,
         "pin_slip": microduck_mdp.pv_pin_slip_penalty,
+        "pin_broken": microduck_mdp.pv_pin_broken_penalty,
+        "two_feet_still": microduck_mdp.pv_two_feet_still_penalty,
         "stall": microduck_mdp.pv_stall_penalty,
         "counter_yaw": microduck_mdp.pv_counter_yaw_penalty,
     }
@@ -800,10 +1095,21 @@ def _score(env, weights):
 
 
 def _episode(strategy, weights, steps=200):
-    """Run one 4 s episode of `strategy` and return the total pivot reward."""
+    """Run one 4 s episode of `strategy` and return the total pivot reward.
+
+    `pivot`   — 1 turn/s, pin planted and motionless, free foot on a 0.2 s up /
+                0.1 s down cadence, carrying its contact point 6 cm per stroke.
+    `shuffle` — WHAT v2 ACTUALLY LEARNED: both feet on the floor the whole time,
+                both sliding (the pin travels at 0.1 m/s), trunk yawing at
+                1.5 rad/s. Contact fractions 1.0 / 1.0 is the limit of the
+                measured 0.91 / 0.85, and 0.1 m/s of pin travel reproduces the
+                6-17 cm of trunk drift over a 4 s episode.
+    `still`   — the v1 argmax: nothing moves.
+    """
     env = _FakeEnv()
     total = 0.0
     turn_rate = 2 * math.pi                       # 1 turn/s
+    shuffle_rate = 1.5                            # rad/s, as measured on v2
     for k in range(steps):
         done = bool(env._pv_done[0]) if hasattr(env, "_pv_done") else False
         if strategy == "still":
@@ -813,35 +1119,48 @@ def _episode(strategy, weights, steps=200):
                 env.set_contact(_RIGHT, True)
                 env.tick(0.0)
             else:
-                # the free foot alternates: 0.2 s up, 0.1 s down, pin planted
-                env.set_contact(_RIGHT, (k % 15) >= 10)
-                env.tick(turn_rate)
-        elif strategy == "spin":
-            # both feet on the floor, both sliding: the pin travels
-            env.tick(0.0 if done else turn_rate,
+                # the free foot alternates: 0.2 s up, 0.1 s down, pin planted,
+                # and it TRAVELS while it is up — 10 steps x 6 mm = 6 cm per
+                # stroke, in the middle of the 4-8 cm reach plateau.
+                up = (k % 15) < 10
+                env.set_contact(_RIGHT, not up)
+                env.tick(turn_rate, free_dxy=(0.0, 0.006) if up else (0.0, 0.0))
+        elif strategy == "shuffle":
+            env.tick(0.0 if done else shuffle_rate,
                      pin_dxy=(0.0, 0.0) if done else (0.002, 0.0))
         total += _score(env, weights)
     return total
 
 
 def test_the_arithmetic_pivoting_wins():
-    """still vs pivoting vs a two-footed spin, priced with the live weights on
-    the fake env — the per-step table in the cfg docstring, executed."""
+    """still vs pivoting vs the two-footed shuffle-spin, priced with the live
+    weights on the fake env — the per-step table in the cfg docstring, executed.
+
+    The v3 ranking is not v2's. In v2 the shuffle came SECOND (it collected the
+    progress and merely gave up the pin), which is exactly why checkpoint 2499
+    learned it. Here it comes LAST, below standing still: its pin passes 3 cm
+    after ~0.3 s, `_pv_broken` latches, the potential stops advancing, and from
+    then on it collects nothing while paying pin_broken + displacement + slip +
+    two_feet_still + stall.
+    """
     cfg = make_microduck_pivot_env_cfg()
     weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}
-    weights["pin_displacement"] = W_PIN_DISPLACEMENT   # the tightened value
+    weights["pin_displacement"] = W_PIN_DISPLACEMENT       # the tightened values
+    weights["pin_broken"] = W_PIN_BROKEN
 
     still = _episode("still", weights)
     pivot = _episode("pivot", weights)
-    spin = _episode("spin", weights)
+    shuffle = _episode("shuffle", weights)
 
     assert still < 0.0, f"standing still must LOSE outright, scored {still}"
-    assert pivot > spin > still, (pivot, spin, still)
+    assert pivot > still > shuffle, (pivot, still, shuffle)
     assert pivot - still > 1000.0, "turning must beat standing by a landslide"
-    assert pivot - spin > 200.0, "a pivot must beat a two-footed spin clearly"
+    assert still - shuffle > 200.0, (
+        "the shuffle-spin must score BELOW standing still, not just below a "
+        "pivot — v2 ranked it second and duly learned it"
+    )
 
-    # the wrong-way wiggle checkpoint 2499 actually settled into: it collects
-    # nothing, and now pays for both the stalling and the direction.
+    # the wrong-way wiggle v1 settled into: it still collects nothing at all.
     env = _FakeEnv()
     wrong = 0.0
     for _ in range(200):
@@ -850,12 +1169,52 @@ def test_the_arithmetic_pivoting_wins():
     assert wrong < still, (wrong, still)
 
 
-def test_the_loose_curriculum_still_prefers_a_pivot():
-    """At iteration 0 the pin costs are at their loose settings — a spin is
-    cheapest there, so check the ranking holds at BOTH ends of the ramp."""
+def test_the_shuffle_loses_per_step_during_the_spin_phase():
+    """The episode totals are dominated by the settle a pivot reaches and a
+    shuffle never does, so check the SPIN-PHASE per-step rate directly: at the
+    moment the policy is choosing between the two, the shuffle must already be
+    losing to doing nothing."""
     cfg = make_microduck_pivot_env_cfg()
-    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}   # loose (-0.5)
+    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}
+    weights["pin_displacement"] = W_PIN_DISPLACEMENT
+    weights["pin_broken"] = W_PIN_BROKEN
+
+    rates = {}
+    for strategy in ("still", "pivot", "shuffle"):
+        env = _FakeEnv()
+        total, counted = 0.0, 0
+        turn_rate, shuffle_rate = 2 * math.pi, 1.5
+        for k in range(75):                       # 1.5 s, spin phase throughout
+            if strategy == "still":
+                env.tick(0.0)
+            elif strategy == "pivot":
+                up = (k % 15) < 10
+                env.set_contact(_RIGHT, not up)
+                env.tick(turn_rate, free_dxy=(0.0, 0.006) if up else (0.0, 0.0))
+            else:
+                env.tick(shuffle_rate, pin_dxy=(0.002, 0.0))
+            if bool(env._pv_done[0]):
+                break                             # only price the SPIN phase
+            total += _score(env, weights)
+            counted += 1
+        rates[strategy] = total / counted
+
+    assert rates["pivot"] > 6.0, rates
+    assert rates["shuffle"] < rates["still"] < 0.0, rates
+    assert rates["still"] - rates["shuffle"] > 3.0, rates
+
+
+def test_the_loose_curriculum_still_prefers_a_pivot():
+    """At iteration 0 the pin costs are at their loose settings (-0.5 / -1.0) —
+    a shuffle is cheapest there, so check the ranking holds at BOTH ends of the
+    ramp. The progress GATE is not curriculum'd, which is what carries the
+    ranking through the loose stage: a policy that could earn progress off the
+    pin while the costs were cheap would learn to earn progress off the pin."""
+    cfg = make_microduck_pivot_env_cfg()
+    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}   # loose
     assert weights["pin_displacement"] == W_PIN_DISPLACEMENT_START
-    assert _episode("pivot", weights) > _episode("spin", weights) > _episode(
-        "still", weights
-    )
+    assert weights["pin_broken"] == W_PIN_BROKEN_START
+    pivot = _episode("pivot", weights)
+    still = _episode("still", weights)
+    shuffle = _episode("shuffle", weights)
+    assert pivot > still > shuffle, (pivot, still, shuffle)

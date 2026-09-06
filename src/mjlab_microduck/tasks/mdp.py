@@ -8267,6 +8267,29 @@ def bow_drift_penalty(
 # on phase-aligned curricula (4 cm / -0.5 → 1.5 cm / -2.0 by iteration 1500) and
 # the paddle opens at +3.0, so lifting the free foot pays from step one.
 #
+# WHY v2 SHUFFLE-SPUN (checkpoint 2499, lab sim, BAM, noise + DR, twist (0,0,±1)
+# for 4 s). All three v2 fixes worked: the turn exists (+421°/+362° on +1,
+# -365°/-303° on -1), 360° is reached in 0.7–1.1 s, no falls, direction correct.
+# But it is a TWO-FOOTED SHUFFLE-SPIN, not a pivot: per-foot contact fractions
+# 0.91 / 0.85 — both feet on the floor nearly all the time with brief
+# alternating lifts — and 6–17 cm of trunk drift, i.e. the pin walks. A real
+# pivot has the pin at ~1.0 contact with its position fixed to a centimetre and
+# the paddle lifting and planting in a cadence (contact ~0.5–0.7).
+# The cause is that every v2 pin pressure was GRADED and therefore FOR SALE: the
+# pin reward faded smoothly, the displacement and slip costs saturated at 1.0,
+# so giving up ~2.0 of pin pay and ~2.5 of pin costs to keep ~4.0 of progress is
+# a trade the policy will take all day. v3 stops selling the pin:
+#   a. `pv_pin_broken_penalty` + the `_pv_broken` latch: off the floor > 40 ms
+#      or > 3 cm from the anchor and the pin is BROKEN — charged every step
+#      until re-planted within 2 cm of that anchor, and, decisively, the
+#      progress potential does not advance at all while it is set. A shuffle
+#      earns no progress past its first 3 cm.
+#   b. `pv_paddle_reach_reward` + a 0.08 s window floor: the free foot has to
+#      REACH (4–8 cm between consecutive plants), not tap in place, and a
+#      twitch no longer clears the air-time window.
+#   c. `pv_two_feet_still_penalty`: both feet planted while the trunk yaws hard
+#      is the shuffle, named and charged directly.
+#
 # DIRECTION IS OBSERVED, NOT BAKED IN. The daemon does NOT zero the twist during
 # a skill window — it feeds the skill's CONFIGURED CONSTANT twist
 # (`robotd-params::SkillDef::command`, `robotd/src/control.rs`), which is zeros
@@ -8308,8 +8331,52 @@ PV_STALL_RAMP_S = 0.5
 # Paddle stroke window. Longer than tippy-taps' 0.04–0.25 s tap: a paddle has to
 # lift, reach sideways, plant and push, not just touch. Beyond the max it is a
 # flamingo hold (one-legged balance), which is a different trick and pays zero.
-PV_MIN_AIR_S = 0.06
+# v3 raises the floor from 0.06 to 0.08 s: at 0.06 the brief alternating flicks
+# of the v2 shuffle-spin (per-foot contact fractions 0.91 / 0.85) were already
+# long enough to collect the paddle, so the term paid for a twitch. 0.08 s is
+# four control steps of genuine air.
+PV_MIN_AIR_S = 0.08
 PV_MAX_AIR_S = 0.35
+
+# ── v3: the pin is a HARD REQUIREMENT, not a graded preference ───────────────
+# v2 (checkpoint 2499) turned — +421°/+362° on +1, -365°/-303° on -1, 360°
+# reached in 0.7–1.1 s, no falls, direction correct — but as a TWO-FOOTED
+# SHUFFLE-SPIN: per-foot contact fractions 0.91 / 0.85 (both feet on the floor
+# nearly all the time, brief alternating lifts) and 6–17 cm of trunk drift,
+# i.e. the "pin" walked. Every v2 pin pressure was GRADED — the pin reward
+# faded smoothly with displacement, the displacement and slip costs were
+# bounded at 1.0 — so the policy simply bought its way out: give up ~2.0 of pin
+# pay and ~2.5 of pin costs, keep the ~4.0 of progress, and shuffle.
+#
+# The fix is to stop selling the pin. While the pin is BROKEN the turn does not
+# count at all: `_pv_broken` freezes the progress potential (nothing is burned —
+# the potential is a running maximum and the raw integral is floored, so banked
+# degrees survive; they simply stop accruing) and `pv_pin_broken_penalty`
+# charges every step until the foot is back down near its anchor. A shuffle
+# therefore earns NO progress after its first 3 cm, which is what turns it from
+# "second best" into the worst row on the board.
+PV_PIN_BREAK_AIR_S = 0.04   # 2 control steps off the floor = broken
+PV_PIN_BREAK_M = 0.03       # ...or 3 cm from the anchor, whichever comes first
+PV_PIN_REPLANT_M = 0.02     # re-planted within 2 cm of the anchor = repaired
+
+# ── v3: the paddle has to REACH, not tap in place ───────────────────────────
+# Air time alone pays a foot that lifts and sets back down where it was, which
+# is half of what the v2 shuffle did. A stroke is scored on the distance the
+# free foot's contact point travels BETWEEN CONSECUTIVE PLANTS: a plateau over
+# 4–8 cm (the foot is ~4.1 x 5.4 cm, so 4 cm is a real step and 8 cm is about
+# as far as a 25 cm robot can reach around a planted foot) with a Gaussian
+# skirt, paid ONE SHOT on the plant. One-shot on purpose: a per-step reach pay
+# is farmable by parking the foot out wide.
+PV_REACH_MIN_M = 0.04
+PV_REACH_MAX_M = 0.08
+PV_REACH_STD_M = 0.03
+
+# ── v3: turning on two planted feet is the shuffle, and it is now charged ───
+# The signature of the v2 failure in one predicate: both feet in contact AND
+# the trunk yawing hard. Below the gate it is a stance adjustment; above it the
+# feet are sliding on the floor. Ramps from 0 at the gate to full at the cap.
+PV_TWOFOOT_YAW_GATE = 0.5   # rad/s: below this, both feet down is just standing
+PV_TWOFOOT_YAW_CAP = 3.0    # rad/s: fully charged
 
 # Pin geometry, measured on robot_walk.xml at the STAND keyframe (feet flat):
 # the foot sites sit ±4.18 cm off the trunk centreline and the foot's collision
@@ -8367,6 +8434,10 @@ def _pv_update(
     command_name: str = "twist",
     direction: Optional[float] = None,
     target_yaw: float = PV_TARGET_YAW,
+    break_air_s: float = PV_PIN_BREAK_AIR_S,
+    break_disp_m: float = PV_PIN_BREAK_M,
+    replant_m: float = PV_PIN_REPLANT_M,
+    min_air: float = PV_MIN_AIR_S,
 ) -> None:
     """Tick the per-env pivot memory exactly once per env step.
 
@@ -8382,12 +8453,27 @@ def _pv_update(
       ``_pv_pin_d``     current horizontal displacement of the pin from home.
       ``_pv_pin_speed`` the pin's horizontal speed (finite difference), i.e.
                         its slip while in contact.
+      ``_pv_pin_air_s`` how long the pin has been off the floor (resets on
+                        contact) — the 40 ms tolerance for a contact flicker.
+      ``_pv_broken``    v3: the pin requirement is VIOLATED — it has been in
+                        the air past ``break_air_s`` or has left its anchor by
+                        more than ``break_disp_m``. Latched until the foot is
+                        back in contact within ``replant_m`` of the anchor.
+                        While it is set the progress potential does not
+                        advance, so a turn taken off the pin is worth nothing.
       ``_pv_raw``       raw signed yaw integral in the commanded direction.
       ``_pv_yaw``       the PROGRESS POTENTIAL: running maximum of ``_pv_raw``
                         clamped to [0, target_yaw]. Monotone, so a wobble
                         cannot re-earn the same degrees and over-turning past
                         the full turn pays nothing.
       ``_pv_prev_yaw``  previous step's potential → the progress term pays Δ.
+      ``_pv_free_air_s`` the FREE foot's air time, tracked here rather than
+                        read off the sensor so the plant edge is exact.
+      ``_pv_free_home`` the free foot's xy at its last qualifying plant — the
+                        reference the paddle's reach is measured from.
+      ``_pv_planted``   True only on the step the free foot completes a stroke
+                        (lands after ≥ ``min_air`` of air).
+      ``_pv_reach``     that stroke's contact-point displacement, in metres.
       ``_pv_done``      latched at the full turn → the SETTLE phase.
       ``_pv_just_done`` True only on the single step the latch flipped.
       ``_pv_landed``    both feet have touched down since the spawn.
@@ -8403,6 +8489,12 @@ def _pv_update(
         env._pv_pin_prev = torch.zeros(n, 2, device=dev)
         env._pv_pin_d = torch.zeros(n, device=dev)
         env._pv_pin_speed = torch.zeros(n, device=dev)
+        env._pv_pin_air_s = torch.zeros(n, device=dev)
+        env._pv_broken = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._pv_free_air_s = torch.zeros(n, device=dev)
+        env._pv_free_home = torch.zeros(n, 2, device=dev)
+        env._pv_planted = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._pv_reach = torch.zeros(n, device=dev)
         env._pv_raw = torch.zeros(n, device=dev)
         env._pv_yaw = torch.zeros(n, device=dev)
         env._pv_prev_yaw = torch.zeros(n, device=dev)
@@ -8435,8 +8527,22 @@ def _pv_update(
         torch.ones_like(env._pv_pin),
     )
     pin_xy = _pv_gather2(foot_xy, env._pv_pin)
+    free_idx = 1 - env._pv_pin
+    free_xy = _pv_gather2(foot_xy, free_idx)
+    pin_contact = _pv_gather1(found, env._pv_pin)
+    free_contact = _pv_gather1(found, free_idx)
 
     env._pv_pin_home = torch.where(fresh[:, None], pin_xy, env._pv_pin_home)
+    env._pv_free_home = torch.where(fresh[:, None], free_xy, env._pv_free_home)
+    env._pv_pin_air_s = torch.where(
+        fresh, torch.zeros_like(env._pv_pin_air_s), env._pv_pin_air_s
+    )
+    env._pv_free_air_s = torch.where(
+        fresh, torch.zeros_like(env._pv_free_air_s), env._pv_free_air_s
+    )
+    env._pv_reach = torch.where(fresh, torch.zeros_like(env._pv_reach), env._pv_reach)
+    env._pv_planted = env._pv_planted & ~fresh
+    env._pv_broken = env._pv_broken & ~fresh
     env._pv_raw = torch.where(fresh, torch.zeros_like(env._pv_raw), env._pv_raw)
     env._pv_yaw = torch.where(fresh, torch.zeros_like(env._pv_yaw), env._pv_yaw)
     env._pv_prev_yaw = torch.where(
@@ -8459,6 +8565,51 @@ def _pv_update(
     )
     env._pv_pin_prev = pin_xy
 
+    # Both feet have touched down since the spawn: the spawn transient is not a
+    # stall, not a broken pin and not a stroke. Updated HERE, before the latches
+    # that read it.
+    env._pv_landed = env._pv_landed | found.all(dim=1)
+
+    # ── v3: the pin requirement, as a latch ─────────────────────────────────
+    # BREAK on either failure mode — off the floor for more than `break_air_s`
+    # (a 40 ms tolerance, so a single-step contact flicker is free) or more
+    # than `break_disp_m` from the anchor. REPAIR only by putting the foot back
+    # down within `replant_m` of that same anchor: the anchor never moves, so
+    # "recover" means stepping back, not re-declaring wherever the foot ended
+    # up to be the new pin. The two conditions are mutually exclusive by
+    # construction (a break by air implies no contact this step; a break by
+    # displacement implies d > 3 cm > 2 cm), so the order of the update below
+    # does not matter.
+    env._pv_pin_air_s = torch.where(
+        pin_contact,
+        torch.zeros_like(env._pv_pin_air_s),
+        env._pv_pin_air_s + env.step_dt,
+    )
+    broke = (env._pv_pin_air_s > break_air_s) | (env._pv_pin_d > break_disp_m)
+    repaired = pin_contact & (env._pv_pin_d <= replant_m)
+    env._pv_broken = (env._pv_broken | broke) & ~repaired & env._pv_landed
+
+    # ── v3: the free foot's stroke, plant to plant ──────────────────────────
+    # `prev_air` is the air accumulated BEFORE this step, so on the landing
+    # step it still reads the length of the stroke just finished — that is what
+    # makes `_pv_planted` an exact rising edge and stops contact chatter (a
+    # foot that never really left) from counting as a stroke.
+    prev_air = env._pv_free_air_s.clone()
+    env._pv_free_air_s = torch.where(
+        free_contact,
+        torch.zeros_like(env._pv_free_air_s),
+        env._pv_free_air_s + env.step_dt,
+    )
+    env._pv_planted = free_contact & (prev_air >= min_air) & ~fresh
+    env._pv_reach = torch.where(
+        env._pv_planted,
+        torch.norm(free_xy - env._pv_free_home, dim=1),
+        torch.zeros_like(env._pv_reach),
+    )
+    env._pv_free_home = torch.where(
+        env._pv_planted[:, None], free_xy, env._pv_free_home
+    )
+
     # ── Yaw progress potential ──────────────────────────────────────────────
     # `_pv_omega` is the yaw rate SIGNED BY THE COMMAND: positive = turning the
     # way the flag asked, negative = turning against it. Every direction-aware
@@ -8472,8 +8623,19 @@ def _pv_update(
     # so the cheapest response to an accidental counter-rotation was to stop
     # trying. Counter-rotation is priced by `pv_counter_yaw_penalty` instead:
     # per step, bounded, and it cannot destroy banked progress.
+    #
+    # v3: GATED ON THE PIN. The integral only advances while the pin foot is on
+    # the floor and not in the broken state, so degrees turned as a two-footed
+    # shuffle — or on a foot that has walked off its anchor — are not progress
+    # and are never paid for. This is safe now in a way it was not in v1: the
+    # potential is a running MAXIMUM and the raw integral is FLOORED at zero, so
+    # gating cannot burn banked degrees, it can only stop new ones accruing.
+    # (v2's docstring argued against a gate on exactly the burn grounds; the
+    # burn was the un-floored integral, and that is gone.) The pressure to
+    # repair is automatic: while the potential is frozen the stall timer runs.
+    counts = pin_contact & ~env._pv_broken
     env._pv_raw = torch.clamp(
-        env._pv_raw + env._pv_omega * env.step_dt, min=0.0
+        env._pv_raw + env._pv_omega * env.step_dt * counts.float(), min=0.0
     )
     env._pv_yaw = torch.maximum(
         env._pv_yaw, torch.clamp(env._pv_raw, 0.0, target_yaw)
@@ -8482,8 +8644,6 @@ def _pv_update(
     reached = env._pv_yaw >= target_yaw
     env._pv_just_done = reached & ~env._pv_done
     env._pv_done = env._pv_done | reached
-
-    env._pv_landed = env._pv_landed | found.all(dim=1)
 
     # ── Stall timer: how long the potential has been flat during the SPIN ────
     env._pv_stall_s = torch.where(
@@ -8543,10 +8703,17 @@ def pv_progress_reward(
     Capped at 1.0/step so violence past ~1.5 turns/s buys nothing, and zeroed
     while tilted past the upright gate.
 
-    Deliberately NOT gated on the pin being planted: the potential is a running
-    maximum, so a gate would permanently BURN any degrees turned during a
-    contact flicker. Pivot-vs-spin is the pin terms' job, where losing contact
-    costs pay for that step only and nothing is destroyed.
+    v3 GATES THE POTENTIAL ON THE PIN (in ``_pv_update``): the integral only
+    advances while the pin foot is in contact and not in the broken state, so
+    degrees turned as a two-footed shuffle are not progress. v2 deliberately did
+    NOT gate, on the grounds that a gate would BURN degrees turned during a
+    contact flicker — but that burn was the un-floored raw integral, which the
+    v2 sign fix removed. With the integral floored at zero and the potential a
+    running maximum, a gate can only stop new degrees accruing; nothing banked
+    is lost, and a 40 ms contact flicker is inside the pin's break tolerance
+    anyway. What checkpoint 2499 showed is that WITHOUT the gate the graded pin
+    terms are simply a price the policy is happy to pay: it turned +421° / -365°
+    as a shuffle-spin with both feet down ~0.9 of the time.
     """
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     return _pv_rate(env, rate_cap) * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
@@ -8691,12 +8858,133 @@ def pv_paddle_reward(
     Gated on the SPIN PHASE (``~_pv_done``) so paddling on after the turn is
     finished cannot compete with settling, and on the pin being in contact so
     the cadence is a pivot's and not a hop's.
+
+    v3 raises the window floor to 0.08 s. The v2 shuffle-spin's alternating
+    flicks (per-foot contact 0.91 / 0.85) cleared a 0.06 s floor, so the term
+    was paying for a twitch; four control steps of air is a stroke.
     """
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     pin_contact, free_contact, free_air = _pv_contacts(env, sensor_name)
     window = (free_air >= min_air) & (free_air <= max_air)
     stroke = window & ~free_contact & pin_contact & ~env._pv_done & env._pv_landed
     return stroke.float() * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_paddle_reach_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    reach_min: float = PV_REACH_MIN_M,
+    reach_max: float = PV_REACH_MAX_M,
+    reach_std: float = PV_REACH_STD_M,
+    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1, ONE SHOT per completed stroke: the paddle foot actually TRAVELLED.
+
+    Air time says the foot left the floor; it does not say the foot went
+    anywhere. The v2 shuffle-spin lifted a foot and set it back down roughly
+    where it was — a tap, not a push — so the reach is scored explicitly: the
+    contact point's displacement between consecutive plants, as a plateau over
+    ``[reach_min, reach_max]`` (4–8 cm: 4 cm is longer than the foot is wide,
+    8 cm is about as far as a 25 cm robot reaches around a planted foot) with a
+    Gaussian skirt of ``reach_std`` outside it. A tap in place scores ~0.17, a
+    lunge that overshoots to 15 cm scores ~0.005.
+
+    Paid on the PLANT step only. A per-step reach pay is farmable by parking the
+    free foot out wide and holding it there; a one-shot has to be re-earned with
+    a fresh lift-and-plant, which is the cadence this term exists to buy. Gated
+    on the spin phase, on the pin being down (a plant while the pin is airborne
+    is a hop) and on the upright gate, exactly as the paddle is.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    pin_contact, _, _ = _pv_contacts(env, sensor_name)
+    excess = (
+        torch.clamp(env._pv_reach - reach_max, min=0.0)
+        + torch.clamp(reach_min - env._pv_reach, min=0.0)
+    )
+    score = torch.exp(-((excess / max(reach_std, 1e-6)) ** 2))
+    fired = env._pv_planted & pin_contact & ~env._pv_done & env._pv_landed
+    return score * fired.float() * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
+def pv_pin_broken_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0/1 cost (negative weight): the pin requirement is VIOLATED.
+
+    THE v3 TERM. Everything v2 asked of the pin was GRADED — the pin reward
+    faded smoothly with displacement, the displacement and slip costs saturated
+    at 1.0 — so the pin was for sale: checkpoint 2499 gave up ~2.0 of pin pay
+    and ~2.5 of pin costs, kept the ~4.0 of progress, and shuffle-spun on two
+    feet (contact fractions 0.91 / 0.85, trunk drift 6–17 cm). This makes the
+    pin a REQUIREMENT instead: broken means off the floor for more than 40 ms or
+    more than 3 cm from the anchor, and it stays broken — charged every step —
+    until the foot is back down within 2 cm of that anchor.
+
+    Its real teeth are not the weight but the companion gate in ``_pv_update``:
+    while ``_pv_broken`` is set the progress potential does not advance, so a
+    turn taken off the pin earns nothing at all AND the stall timer runs. The
+    cost is a flat 0/1 (bounded, one step at a time, no jackpot either way) and
+    is charged during the SPIN phase only — the settle is where the robot is
+    supposed to bring both feet back under itself, which necessarily moves the
+    pin — and only once the spawn has touched down.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    return (env._pv_broken & ~env._pv_done & env._pv_landed).float()
+
+
+def pv_two_feet_still_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    yaw_gate: float = PV_TWOFOOT_YAW_GATE,
+    yaw_cap: float = PV_TWOFOOT_YAW_CAP,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): BOTH feet planted while the trunk
+    yaws hard — the shuffle-spin, named directly.
+
+    A robot cannot turn on two feet that are both stuck to the floor: if both
+    contacts are live and the trunk is going round, the feet are sliding. Below
+    ``yaw_gate`` (0.5 rad/s) that is a stance adjustment and is free; the cost
+    ramps to full at ``yaw_cap``.
+
+    It does charge the double-support instant of a genuine pivot — the push —
+    and that is intended and priced: a pivot with a 0.2 s / 0.1 s cadence is in
+    double support a third of the time, so it pays a third of the weight
+    (-0.67/step at -2.0) against the +6.9/step it collects, while a shuffle
+    pays all of it, all the time, on top of a frozen potential. The term
+    therefore also pushes the cadence toward more air and shorter plants, which
+    is the difference between a paddle and a shuffle.
+
+    Uses the raw trunk yaw RATE, unsigned: turning the wrong way on two feet is
+    the same failure (and is additionally charged by ``pv_counter_yaw_penalty``).
+    Spin phase only — stopping with both feet down is the settle's goal.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    asset: Entity = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_name]
+    both_down = (sensor.data.found[:, :2] > 0).all(dim=1)
+    omega_z = torch.abs(
+        torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    )
+    over = torch.clamp(omega_z - yaw_gate, min=0.0)
+    cost = torch.clamp(over / max(yaw_cap - yaw_gate, 1e-6), 0.0, max_cost)
+    return cost * both_down.float() * (~env._pv_done).float() * env._pv_landed.float()
 
 
 def pv_settle_reward(
