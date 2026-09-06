@@ -64,16 +64,30 @@ On robot_walk.xml at the STAND keyframe, feet flat:
   * measured standing trunk z is 0.115 m (as standup / bow / happy-spin).
 
 ── Reward design, in the playbook's terms ───────────────────────────────────
+  * `alive` (v5) is a CONSTANT +3.0 paid every step the episode is alive with
+    the trunk within 15° of vertical. It is the term that makes this version
+    different in kind rather than in degree: 200 alive steps = 600, larger than
+    the whole progress budget of a perfect turn (400), so BY CONSTRUCTION no
+    turn can pay for the episode it ends. It has no shape, no optimum and
+    nothing to farm — which is exactly why it can be this large: it changes the
+    value of surviving, not the ranking of anything done while alive. v4 made
+    the same argument from `upright` + `height_stand` = 3.0/step and lost it on
+    the numbers, against a progress term paying up to 6.0/step.
   * `pivot_progress` pays Δ(accumulated yaw) — potential-based, so holding
     still pays zero and nothing can be farmed; capped per step (no pay for
-    violence past 0.75 turns/s — v4, halved from 1.5) and capped in total at one
-    turn. v4 also gates the POTENTIAL on being within 15° of vertical, so
-    degrees turned on the way to the floor are not progress.
+    violence past 0.5 turns/s — v5, halved again from v4's 0.75, which the
+    policy read as a target) and capped in total at one turn. The potential only
+    advances within 15° of vertical, so degrees turned on the way to the floor
+    are not progress.
   * `pivot_complete` is ONE step, not a per-step "you are done" — that would be
     the jackpot the playbook warns about and would buy a ballistic whip. Speed
     is bought by the SETTLE phase instead: finish early and more of the 4 s is
     spent collecting settle pay, which only pays while upright, stopped, on
-    both feet and back in the STAND pose.
+    both feet and back in the STAND pose. v5 raises both (+5 → +15 and
+    +4 → +6) and re-gates both from the 40° fallen line to 15°: the money moves
+    from turning FAST to FINISHING UPRIGHT, which is the substitution the v4
+    log demanded (at iteration 3999 `pivot_complete` was 0.0014 and `settle`
+    0.0009 — the policy had stopped finishing anything at all).
   * `pin` is what makes this a PIVOT and not a spin, and it is weighted to say
     so — but it pays ONLY WHILE THE POTENTIAL IS RISING (it is multiplied by
     the step's progress rate). Version 1 paid it unconditionally, which made
@@ -130,15 +144,20 @@ On robot_walk.xml at the STAND keyframe, feet flat:
     trunk means the feet are sliding. It also charges a real pivot's
     double-support push (a third of the cadence, -0.67/step), which is
     deliberate — it pushes the cadence toward more air and shorter plants.
-  * `terminated` (v4) charges the fall itself, one shot, at the bow v4 weight.
+  * `terminated` (v4, re-sized in v5 to -100) charges the fall itself, one shot.
     v3 pivoted — the foot roles were finally right — and then fell over in every
     single episode (mean length 43 of 200, `fell_over` the only termination that
     ever fired). Nothing in v3 priced that: a fall ends the episode, and ending
     the episode also ends the stall bill a standing robot pays for the full 4 s,
-    so dying at 0.6 s was worth ~+300 against standing still. It now costs ~244.
-    Most of that swing is the FORFEITED income, not this penalty — see the
-    arithmetic below — but a terminal state that merely stops the meter is an
-    exit, and v3 proved the policy will take it.
+    so dying at 0.6 s was worth ~+300 against standing still. Most of the swing
+    is the FORFEITED income, not this penalty — see the arithmetic below — but a
+    terminal state that merely stops the meter is an exit, and v3 proved the
+    policy will take it. v4 set this at -20 and the arithmetic said that was
+    enough; the log said otherwise (-0.09/step averaged, against progress at
+    +0.90/step, while falls per iteration went 1.6 → 18 → 58). v5 raises it to
+    -100 AND raises the income it forfeits (`alive`), because the mechanism was
+    always right and only the sizing was wrong. It is still a tenth of the real
+    price and still one step in 200 — a marker, not a spike.
   * `PV_PROGRESS_TILT_DEG` (v4) is the term that actually removes the faller's
     money. The potential only advances within 15° of vertical; the 40° gate the
     other terms use is the FALLEN gate, and by 40° the fall is already lost. v3
@@ -151,11 +170,16 @@ On robot_walk.xml at the STAND keyframe, feet flat:
     one. `1 - cos(tilt)` is gentle near vertical (0.03 at 15°), so -2.0 is still
     under -0.07/step for a working lean and only bites once the robot is going
     over. Neither touches the yaw axis, which is the trick.
-  * DISCOVERY IS MADE CHEAP. The pin reward's std starts at 4 cm (a whole
-    footprint of slack) with the displacement cost at -0.5, and both tighten to
-    1.5 cm / -2.0 by iteration 1500 on phase-aligned stages; the paddle opens
-    at +3.0 so lifting the free foot pays from step one, instead of only
-    risking the pin, tilt and radius costs.
+  * DISCOVERY IS MADE CHEAP AND THE CURRICULUM STOPS EARLY (v5). The pin
+    reward's std starts at 4 cm (a whole footprint of slack) with the
+    displacement cost at -0.5, and both tighten on phase-aligned stages to
+    2.5 cm / -1.5 by iteration 1600 — and then HOLD for the remaining 2400
+    iterations. v4 ran the same ramp to 1.5 cm / -2.0 at iteration 2400, and
+    that window is exactly where its falls went 1.6 → 18 → 58 per iteration
+    while episode length went 191 → 133 → 74. A curriculum is meant to
+    consolidate a skill the policy has; that one was squeezing a policy that
+    could barely hold a pivot into a tolerance it could not hold at all. The
+    paddle still opens at +3.0 so lifting the free foot pays from step one.
   * `foot_slip` is DELETED as a global term and re-added for the PIN ONLY. The
     paddle foot is supposed to scuff — that is the push. For the pin, slip is
     exactly what "planted" forbids.
@@ -206,9 +230,10 @@ PV_DIRECTION_CW = microduck_mdp.PV_DIRECTION_CW    # -1 = cw,  pin = RIGHT foot
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
 # ── Reward weights ───────────────────────────────────────────────────────────
-# THE ARITHMETIC (dt = 0.02, 200 steps, v4 rate cap = 0.75 turns/s, so a
-# 0.75 turns/s pivot scores `rate` = 1.0 on every rate-scaled term and completes
-# the turn in 1.33 s).
+# THE ARITHMETIC (dt = 0.02, 200 steps, v5 rate cap = 0.5 turns/s, so a
+# 0.5 turns/s pivot scores `rate` = 1.0 on every rate-scaled term and completes
+# the turn in 2.0 s — exactly half the episode, leaving the other half to
+# settle).
 #
 # The lesson arc, one defect per version:
 #   v1  gave "standing" the full pin pay → it stood there. Gating the pin on
@@ -216,112 +241,188 @@ _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 #   v2  priced the pin GRADEDLY, so the pin was for sale: +421°/-365°, no falls,
 #       but a TWO-FOOTED SHUFFLE-SPIN (contact 0.91 / 0.85, 6–17 cm of drift).
 #       v3 made the pin a REQUIREMENT — `_pv_broken` freezes the potential.
-#   v3  got the FOOT ROLES RIGHT (checkpoint 2499: pin contact 0.74 / 0.95 /
-#       0.81 / 0.97, free-foot contact 0.24 / 0.21 / 0.14 / 0.18, pin
-#       displacement 2.4–3.5 cm, trunk yaw +298° / +182° / -273° / -557°) and
-#       FELL OVER IN 4 EPISODES OUT OF 4 — the clean render at 0.54 s, the log
-#       at mean episode length 43 of 200 with `fell_over` the only termination
-#       that ever fired. v3's arithmetic made the shuffle lose and made standing
-#       still lose; it never priced FALLING.
+#   v3  got the FOOT ROLES RIGHT and FELL OVER IN 4 EPISODES OUT OF 4 (mean
+#       episode length 43 of 200, `fell_over` the only termination that ever
+#       fired). It never priced FALLING at all.
+#   v4  priced falling — and priced it too cheaply. THE CURVE WENT THE WRONG
+#       WAY, monotonically, and the log is unambiguous about the direction:
 #
-# v4 prices staying up. Two tables, both MEASURED — `test_the_arithmetic_
-# pivoting_wins` and `test_the_shuffle_loses_per_step_during_the_spin_phase`
-# run all FOUR strategies through the real reward functions at these weights and
-# produce exactly these numbers.
+#         iter 1000  length 191 of 200, falls 1.6/iter, progress 0.59/step
+#         iter 2000  length 133,        falls  18/iter
+#         iter 3000  length  74,        falls  58/iter, progress 0.82
+#         iter 3999  length  77,        falls  47/iter, progress 0.90,
+#                    `terminated` -0.09/step, `pivot_complete` 0.0014,
+#                    `settle` 0.0009
 #
-#   pivot     — the textbook: 0.75 turns/s (full pay), pin planted, free foot on
-#               a 0.24 s up / 0.12 s down cadence carrying its contact point
-#               6 cm per stroke, trunk upright.
+#       Progress ROSE the whole way while episode length collapsed: the policy
+#       was not failing to learn, it was learning that a turn which falls at
+#       ~0.9 s out-earns a careful one. The lab eval says the SKILL is there
+#       (BAM, noise + DR, 3 seeds per direction: 2 of 6 episodes complete a full
+#       turn on one foot without falling; pin contact 0.76–0.97, free foot
+#       0.31–0.49, pin drift 2–6 cm) and that the REWARD makes falling
+#       profitable past ~iteration 1500.
+#
+#       v4's own diagnosis was right in kind and wrong in size. It said a fall
+#       is paid for mostly in FORFEITED INCOME rather than in its one-shot
+#       penalty — true — and then made that income `upright` 2.0 +
+#       `height_stand` 1.0 = 3.0/step, HALF the 6.0/step the progress term paid
+#       the thing it was supposed to outweigh. -20 averaged to -0.09/step
+#       against progress at 0.90/step. Two of v4's own terms were also actively
+#       pushing: a 0.75 turns/s pay cap the policy read as a target, and a pin
+#       curriculum still tightening toward 1.5 cm / -2.0 across iterations
+#       1600–2400 — precisely the window where falls went 1.6 → 18 → 58.
+#
+# v5 MAKES STAYING UP WORTH MORE THAN ANY TURN, BY CONSTRUCTION:
+#   a. `alive` +3.0/step, a CONSTANT paid every step the episode is alive with
+#      the trunk within 15° of vertical. 200 alive steps = 600 > 400, the entire
+#      progress budget of a perfect turn (4.0 × 100 steps). Nothing to farm — no
+#      shaping, no pose to seek — so it can be this large without distorting the
+#      ranking of anything the policy does WHILE alive; it changes only the
+#      value of still being alive to do it.
+#   b. `terminated` -100 (was -20), sized against the term it competes with.
+#      The fall's real price is still the forfeit (see below) — this is a marker
+#      that is now visible rather than one that averages to noise.
+#   c. rate cap 0.75 → 0.5 turns/s and progress 6.0 → 4.0: a 2 s pivot, not a
+#      1.3 s one, and a progress budget that cannot out-earn survival.
+#   d. the pin curriculum stops at 2.5 cm / -1.5 and gets there by iteration
+#      1600, then HOLDS for the remaining 2400 iterations.
+#   e. the money moves to the FINISH: `pivot_complete` +5 → +15 and `settle`
+#      +4 → +6, both re-gated from the 40° fallen line to 15°, so finishing
+#      upright is the jackpot rather than turning fast.
+#   f. everything else is v4's: upright-gated progress, tilt -2.0, body_ang_vel
+#      -0.2, counter-yaw, stall, two_feet_still, the paddle terms.
+#
+# Both tables below are MEASURED — `test_the_arithmetic_pivoting_wins` and
+# `test_the_shuffle_loses_per_step_during_the_spin_phase` run all FOUR
+# strategies through the real reward functions at these weights and produce
+# exactly these numbers.
+#
+#   pivot     — the textbook, SLOW: 0.5 turns/s (full pay), a 2 s turn, pin
+#               planted, free foot on a 0.24 s up / 0.12 s down cadence carrying
+#               its contact point 6 cm per stroke, trunk upright — then ~2 s of
+#               settle.
 #   still     — the v1 argmax: nothing moves.
 #   shuffle   — WHAT v2 LEARNED: both feet down and sliding, trunk at 1.5 rad/s.
-#   fastfall  — WHAT v3 LEARNED, given every benefit of the doubt: a 2 turns/s
+#   fastfall  — WHAT v4 LEARNED, given every benefit of the doubt: a 2 turns/s
 #               whip with the pin held perfectly planted and a textbook paddle
-#               cadence, the trunk tipping to 90° over 0.6 s, `fell_over` firing
-#               there. The episode ENDS at the fall.
+#               cadence, the trunk tipping to 90° over 0.9 s and `fell_over`
+#               firing there. 0.9 s is v4's OWN measured mean episode length at
+#               iteration 3999 (77 steps of 200), not a strawman. The episode
+#               ENDS at the fall.
 #
 # (1) Per step of the SPIN phase (or, for the faller, up to the fall):
 #
 #                                    still   pivot   shuffle  fastfall
-#   progress      6.0 × rate          0.00   +6.00    +0.14    +1.00
-#   pin           3.0 × stay × rate   0.00   +3.00    +0.03    +0.50
-#   paddle        3.0, in-window      0.00   +1.23     0.00     0.00
-#   paddle_reach  3.0, one shot/plant 0.00   +0.14     0.00    +0.10
-#   pin_displacement (-0.5 → -2.0)    0.00    0.00    -1.86     0.00
+#   progress      4.0 × rate          0.00   +4.00    +0.14    +0.62
+#   pivot_complete 15.0, one shot     0.00   +0.15     0.00     0.00
+#   pin           3.0 × stay × rate   0.00   +3.00    +0.07    +0.47
+#   paddle        3.0, in-window      0.00   +1.26     0.00     0.00
+#   paddle_reach  3.0, one shot/plant 0.00   +0.15     0.00    +0.07
+#   alive         3.0, upright ≤ 15°  +3.00  +3.00    +3.00    +0.47
+#   pin_displacement (-0.5 → -1.5)    0.00    0.00    -1.40     0.00
 #   pin_slip         -0.5             0.00    0.00    -0.50     0.00
 #   pin_broken       (-1.0 → -3.0)    0.00    0.00    -2.77     0.00
-#   two_feet_still   -2.0             0.00   -0.55    -0.80    -0.40
-#   stall            -2.0            -1.62    0.00    -1.48     0.00
+#   two_feet_still   -2.0             0.00   -0.60    -0.80    -0.53
+#   stall            -2.0            -1.62    0.00    -1.48    -0.06
 #   counter_yaw      -1.0             0.00    0.00     0.00     0.00
-#   tilt             -2.0             0.00    0.00     0.00    -0.76
-#   terminated      -20.0, one shot   0.00    0.00     0.00    -0.67
-#   common (upright 2.0 + height 1.0) +3.00  +3.00    +3.00    +1.30
+#   tilt             -2.0             0.00    0.00     0.00    -0.75
+#   terminated      -100.0, one shot  0.00    0.00     0.00    -2.22
+#   common (upright 2.0 + height 1.0) +3.00  +3.00    +3.00    +1.33
 #                                   ──────  ──────   ───────  ────────
-#   mean/step                        +1.38  +12.82    -4.24    +1.07
-#   steps it lasts                     200      66      200       30
+#   mean/step                        +4.38  +13.96    -0.73    -0.61
+#   steps it lasts                     200     100      200        45
+#
+# Note the still column. v4 wanted standing still to be NEGATIVE and got its
+# wish (-1.38/step at the equivalent row), which is exactly the shape that makes
+# ending the episode an ESCAPE — the stall bill stops the moment the episode
+# does. Under v5 standing still is in profit at +4.38/step and pivoting is still
+# worth three times that.
 #
 # (2) Whole 4 s episodes, end to end — and THIS is where the fall loses:
 #
 #                     pivot     still    fastfall    shuffle
-#   progress         +400.0       0.0       +30.0      +28.6
-#   pin              +200.0       0.0       +15.0       +6.8
-#   paddle            +81.0       0.0         0.0        0.0
-#   paddle_reach       +9.0       0.0        +3.0        0.0
-#   pivot_complete     +5.0       0.0         0.0        0.0
-#   settle           +532.0       0.0         0.0        0.0
-#   pin_displacement     0.0      0.0         0.0     -372.4
+#   progress         +400.0       0.0       +28.0      +28.6
+#   pin              +300.0       0.0       +21.0      +15.0
+#   paddle           +126.0       0.0         0.0        0.0
+#   paddle_reach      +15.0       0.0        +3.0        0.0
+#   pivot_complete    +15.0       0.0         0.0        0.0
+#   settle           +600.0       0.0         0.0        0.0
+#   alive            +600.0    +600.0       +21.0     +600.0
+#   pin_displacement     0.0      0.0         0.0     -279.3
 #   pin_slip             0.0      0.0         0.0      -99.5
 #   pin_broken           0.0      0.0         0.0     -555.0
-#   two_feet_still     -36.0      0.0       -12.0     -160.0
-#   stall                0.0   -324.0         0.0     -296.0
-#   tilt                 0.0      0.0       -22.8        0.0
-#   terminated           0.0      0.0       -20.0        0.0
-#   common            +600.0   +600.0       +39.0     +600.0
+#   two_feet_still     -60.0      0.0       -24.0     -160.0
+#   stall                0.0   -324.0        -2.9     -296.0
+#   tilt                 0.0      0.0       -33.7        0.0
+#   terminated           0.0      0.0      -100.0        0.0
+#   common            +600.0   +600.0       +60.0     +600.0
 #                    ───────  ───────    ────────   ────────
-#   TOTAL             +1791     +276        +32       -847
+#   TOTAL             +2596     +876       -27.6     -146.1
+#   steps                200      200          45        200
 #
-# THE DECISIVE LINE IS `common`. v3's table dropped the upright/height stack as
-# "common to every row and cancels" — it cancels only between rows that SURVIVE
-# THE EPISODE. A strategy that terminates at 0.6 s collects 30 steps of it
-# instead of 200, forfeiting +510; the -20 termination penalty is a marker on
-# top of that, not the mechanism. (v3's own log confirms the arithmetic: mean
-# episode return 4.29 over 43.46 steps is 4.29/(43.46 × 0.02) ≈ 4.9 of stack per
-# step — essentially the common income and nothing else, which is exactly what a
-# policy that pivots and falls at 0.87 s takes home.) Note too that under v3
-# falling was not merely unpunished but PROFITABLE against standing still: the
-# stall bill a standing robot pays for the full 4 s stops the moment the episode
-# does, so dying at 0.6 s SAVED ~300. Now it costs ~244.
+#   ORDER: pivot > still > fastfall > shuffle, and still − fastfall = +904 —
+#   the margin the fix asks for (≥ 500) and nine times the -100 termination
+#   marker, so the ranking cannot be flipped back by tuning that penalty alone.
 #
-# What removes the faller's income is the 15° gate on the progress potential
-# (`PV_PROGRESS_TILT_DEG`): the whip banks 5 steps of progress before it passes
-# 15° of lean and then nothing, so it never completes and never reaches the
-# settle. Under v3's 40° gate the same trajectory collected ~0.88 of the
-# per-step cap all the way down — which is what `Episode_Reward/pivot_progress`
-# = 0.755 on a 43-step episode actually was.
+# THE DECISIVE LINE IS `alive`. v4 correctly identified that a fall is paid for
+# in forfeited income and then under-funded the income: its whole forfeitable
+# stack was the +3.0/step `common` row, so a 0.9 s fall gave up ~465 against a
+# progress term paying up to 6.0/step, and the trade was worth taking. v5's
+# faller gives up 579 of `alive` on top of that — 984 in total, against the 28
+# of progress and 21 of pin it banks before the 15° gate closes. The -100 marker
+# is a tenth of the price, deliberately: a -900 spike on one terminal step is
+# the jackpot AGENTS.md warns about, in reverse.
+#
+# What removes the faller's income at the top of the stack is still v4's 15°
+# gate on the progress potential (`PV_PROGRESS_TILT_DEG`): the whip banks 7
+# steps of progress before it passes 15° of lean and then nothing, so it never
+# completes and never reaches the settle. v5 extends the same 15° cone to
+# `alive`, `pivot_complete` and `settle`, so every large positive in the stack
+# now means the same thing by "upright".
 #
 # Settle phase (after the one-shot completion): progress / pin / paddle /
 # paddle_reach / stall / pin displacement / pin_broken / two_feet_still are all
-# gated off by `_pv_done`, and settle 4.0 takes over → +4.0/step. Finishing
-# early still wins: every step saved from the turn is a step of settle.
+# gated off by `_pv_done`, and settle 6.0 takes over → +6.0/step on top of the
+# +3.0 alive and +3.0 common. Finishing early still wins: every step saved from
+# the turn is a step of settle.
 #
-# The ranking holds at BOTH ends of the pin curriculum (loose: +1791 / +276 /
-# +32 / -198), which is what stops the loose early stage from teaching a
-# shuffle — the pin COSTS are made cheap for discovery, but the progress GATES
-# (pin and upright) never are.
-W_PROGRESS = 6.0
-W_COMPLETE = 5.0
+# The ranking holds at BOTH ends of the pin curriculum (loose, iteration 0:
+# +2596 / +876 / -27.6 / +410) — the pin COSTS are made cheap for discovery, but
+# the progress GATES (pin and upright) never are, and `alive` is never
+# curriculum'd at all.
+
+W_PROGRESS = 4.0
+# v5: +5 -> +15, and re-gated from the 40 deg fallen line to 15 deg. The whole
+# v5 substitution in one line: what the stack pays for is FINISHING UPRIGHT, not
+# turning fast. A completion bonus paid at 39 deg of lean is a bonus for
+# arriving in a state the robot is about to fall out of.
+W_COMPLETE = 15.0
 W_PIN = 3.0
-W_SETTLE = 4.0
+# v5: +4 -> +6, same 15 deg re-gate. The settle is where a finished pivot lives
+# for the back half of the episode, so this is the term a 2 s turn is actually
+# buying: 100 steps of it at +6 is +600.
+W_SETTLE = 6.0
 W_PADDLE = 3.0
+# THE v5 TERM. A constant paid every step the episode is alive with the trunk
+# within 15 deg of vertical — no shaping, no pose to seek, nothing to farm.
+# Sized so that surviving the episode (200 x 3.0 = 600) is worth more than the
+# ENTIRE progress budget of a perfect turn (4.0 x 100 = 400): by construction,
+# no turn can pay for the episode it ends. v4 made this same argument from
+# `upright` + `height_stand` = 3.0/step and lost it on the numbers — that stack
+# was half the size of the progress term it was competing with.
+W_ALIVE = 3.0
 # The reach bonus matches the paddle's weight but fires ONCE per plant, so on a
 # 0.3 s cadence it is worth ~+0.2/step: a directional nudge toward strokes that
 # actually travel 4–8 cm, not a term that can out-shout progress.
 W_PADDLE_REACH = 3.0
 W_HEIGHT = 1.0
 # Opens loose (-0.5) so the first clumsy attempt at lifting the free foot is
-# affordable, tightened to -2.0 by iteration 1500 — phase-aligned with the pin
-# std curriculum below.
+# affordable, tightened to -1.5 by iteration 1600 and then held — phase-aligned
+# with the pin std curriculum below.
 W_PIN_DISPLACEMENT_START = -0.5
-W_PIN_DISPLACEMENT = -2.0
+# v5: the ramp STOPS at -1.5 (never -2.0) and gets there by iteration 1600, then
+# holds for the remaining 60% of the run. See PIN_TIGHTEN_ITER.
+W_PIN_DISPLACEMENT = -1.5
 W_PIN_SLIP = -0.5
 W_RADIUS = -1.5
 # v4: -0.5 → -2.0. `1 - cos(tilt)` is a gentle curve near vertical (0.03 at 15°,
@@ -337,7 +438,14 @@ W_COUNTER_YAW = -1.0
 # to stop paying. The forfeited income is the larger half of the price (see the
 # arithmetic above), but forfeiting is not being charged, and v3 proved a
 # terminal state that merely stops the meter is an exit the policy will take.
-W_TERMINATED = -20.0
+# v5: -20 -> -100. v4's reasoning ("the forfeited income is the real price, this
+# is only a marker") was right about the mechanism and wrong about the size: at
+# iteration 3999 the v4 log reports `terminated` averaging -0.09/step against
+# `pivot_progress` at +0.90/step, and the policy priced that correctly — falls
+# per iteration 1.6 -> 18 -> 58 while progress ROSE. -100 is one step in 200 and
+# is still the smaller half of the price next to the ~570 of alive + common
+# income a 0.9 s fall throws away; it is simply visible now.
+W_TERMINATED = -100.0
 # v4: rocking on x/y is the precursor to the fall. The velocity recipe leaves
 # this at -0.05, which for a task with a ~+10/step positive stack is noise; -0.2
 # is still an order of magnitude below the task terms (AGENTS.md: motion-
@@ -358,12 +466,20 @@ W_PIN_BROKEN = -3.0
 W_TWO_FEET_STILL = -2.0
 W_ACTION_RATE = -0.05
 
-# Curriculum boundary: the pin is loose until the turn exists, tight after.
-# v4 stretches it 1500 → 2400 in step with max_iterations 2500 → 4000 (x1.6):
-# the schedule is expressed in fractions of the run, and v3's pin pressures
-# landing at 60% of the run is what is being preserved, not the absolute
-# iteration number.
-PIN_TIGHTEN_ITER = 2400
+# Curriculum boundary: the pin is loose until the turn exists, tighter after —
+# and, from v5, IT STOPS THERE.
+#
+# v4 ran this ramp to iteration 2400 (60% of the run) and to the measured
+# 1.5 cm / -2.0. The log says what that bought: falls per iteration 1.6 (iter
+# 1000) -> 18 (2000) -> 58 (3000) and mean episode length 191 -> 133 -> 74,
+# i.e. the collapse happened inside the tightening window and tracked it. A
+# curriculum is supposed to consolidate a skill the policy already has; this one
+# was pushing a policy that could just barely hold a pivot into a pin tolerance
+# it could not hold at all, at the same time as the 0.75 turns/s pay cap was
+# pulling it faster. v5 lands the pressures EARLIER (1600, 40% of the run) and
+# LOWER (2.5 cm / -1.5), then holds them flat for the remaining 2400 iterations
+# so the back half of the run is spent consolidating rather than chasing.
+PIN_TIGHTEN_ITER = 1600
 
 
 def make_microduck_pivot_env_cfg(
@@ -445,10 +561,14 @@ def make_microduck_pivot_env_cfg(
         weight=W_PROGRESS,
         params=shared(),
     )
+    # v5: the jackpot moved here from the rate cap. +15 (was +5), and paid only
+    # for a turn finished with the trunk within 15 deg of vertical — the same
+    # cone the progress potential advances in, not the 40 deg fallen line.
     cfg.rewards["pivot_complete"] = RewardTermCfg(
         func=microduck_mdp.pv_complete_bonus,
         weight=W_COMPLETE,
-        params=shared(),
+        params={**shared(),
+                "gate_tilt_above_deg": microduck_mdp.PV_FINISH_TILT_DEG},
     )
     cfg.rewards["pin"] = RewardTermCfg(
         func=microduck_mdp.pv_pin_reward,
@@ -494,6 +614,10 @@ def make_microduck_pivot_env_cfg(
             # from a pivot is a big transient and must stay affordable.
             "pose_std": 0.4,
             "joint_indices": _LEG_JOINTS,
+            # v5: 15 deg, as for the completion bonus. Settling is a state the
+            # robot has to be OVER ITS FEET in; paid at 39 deg of lean it would
+            # be paying a crouch that is on its way down.
+            "gate_tilt_above_deg": microduck_mdp.PV_FINISH_TILT_DEG,
         },
     )
     # Trunk at standing height throughout: a pivot, not a squat-and-shuffle.
@@ -589,6 +713,21 @@ def make_microduck_pivot_env_cfg(
         weight=W_TERMINATED,
         params={"term_names": ("fell_over",)},
     )
+    # THE v5 TERM, and the other half of the same fix. v4 charged the fall and
+    # argued the real price was the FORFEITED income — correctly — but the
+    # income it forfeited (upright 2.0 + height 1.0) was half the size of the
+    # progress term the fall was buying. This is the forfeitable income, made
+    # big enough to decide the question: +3.0 every step the episode is alive
+    # and the trunk is within 15 deg of vertical, so 200 alive steps = 600 >
+    # 400, the entire progress budget of a perfect turn. It is a CONSTANT — no
+    # shaping, no pose to seek, nothing to farm — which is why it can be this
+    # large without distorting anything: it changes the value of SURVIVING, not
+    # the ranking of anything the policy does while alive.
+    cfg.rewards["alive"] = RewardTermCfg(
+        func=microduck_mdp.pv_alive_reward,
+        weight=W_ALIVE,
+        params={"gate_tilt_above_deg": microduck_mdp.PV_ALIVE_TILT_DEG},
+    )
     # v4: rocking on roll/pitch is what a fall starts as. The velocity recipe's
     # -0.05 is noise against this task's ~+10/step positive stack; -0.2 is felt
     # and is still far below the task terms. x/y only — the yaw axis IS the
@@ -607,9 +746,12 @@ def make_microduck_pivot_env_cfg(
             "reward_name": "pin",
             "std_stages": [
                 {"step": 0, "std": microduck_mdp.PV_PIN_STD_START_M},   # 4.0 cm
-                {"step": 960 * 24, "std": 0.030},
-                {"step": 1600 * 24, "std": 0.022},
-                {"step": PIN_TIGHTEN_ITER * 24, "std": microduck_mdp.PV_PIN_STD_M},
+                {"step": 800 * 24, "std": 0.032},
+                # v5 FLOOR: 2.5 cm, not the measured 1.5 cm, and reached at
+                # iteration 1600 rather than 2400. Still well under a foot
+                # width, so it is still a pin and not a step.
+                {"step": PIN_TIGHTEN_ITER * 24,
+                 "std": microduck_mdp.PV_PIN_STD_FLOOR_M},
             ],
         },
     )
@@ -619,8 +761,7 @@ def make_microduck_pivot_env_cfg(
             "reward_name": "pin_displacement",
             "weight_stages": [
                 {"step": 0, "weight": W_PIN_DISPLACEMENT_START},
-                {"step": 960 * 24, "weight": -1.0},
-                {"step": 1600 * 24, "weight": -1.5},
+                {"step": 800 * 24, "weight": -1.0},
                 {"step": PIN_TIGHTEN_ITER * 24, "weight": W_PIN_DISPLACEMENT},
             ],
         },
@@ -630,14 +771,25 @@ def make_microduck_pivot_env_cfg(
     # policy that can earn progress off the pin will learn to earn progress off
     # the pin. Only the cost of scuffing is made cheap while the turn is being
     # discovered.
+    #
+    # v5 relaxes the two GRADED pin pressures (std, displacement) and does NOT
+    # relax this one: it still ends at -3.0, just 800 iterations earlier. The
+    # distinction is what each one charges. `pin_std` and `pin_displacement` are
+    # continuous, and a genuine pivot pays them EVERY STEP for the few
+    # millimetres a real planted foot inevitably travels — that is the pressure
+    # that was squeezing a working policy, and it is the one that comes off.
+    # `pin_broken` is a binary requirement (off the floor > 40 ms, or > 3 cm
+    # from the anchor) that a correct pivot never trips at all; the only
+    # strategy it charges is the two-footed shuffle. Relaxing it would buy the
+    # shuffle back for nothing, and the arithmetic below says so directly — the
+    # shuffle is the row that needs it to stay last.
     cfg.curriculum["pin_broken_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
             "reward_name": "pin_broken",
             "weight_stages": [
                 {"step": 0, "weight": W_PIN_BROKEN_START},
-                {"step": 960 * 24, "weight": -1.5},
-                {"step": 1600 * 24, "weight": -2.0},
+                {"step": 800 * 24, "weight": -2.0},
                 {"step": PIN_TIGHTEN_ITER * 24, "weight": W_PIN_BROKEN},
             ],
         },
