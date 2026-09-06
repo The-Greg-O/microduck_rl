@@ -959,7 +959,7 @@ def test_the_thrashing_head_now_loses():
     #    was the only thing pricing the swing before — which is why -0.05 of
     #    smoothness never came close to stopping it.
     gap = (sum(book.values()) - sum(thrash.values())) / int(STAND_END_S / 0.02)
-    assert gap > 2.0, gap
+    assert gap > 0.5 * W_HEAD_STILL, gap
     assert gap > 10 * abs(_CFG.rewards["action_rate_l2"].weight)
 
     # 4. But the bow-with-a-bad-head still beats not bowing: it is a worse bow,
