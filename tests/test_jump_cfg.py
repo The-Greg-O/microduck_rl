@@ -34,6 +34,8 @@ from mjlab_microduck.tasks.microduck_jump_env_cfg import (
     LOAD_CAP_POINTS,
     LOAD_DEPTH_M,
     LOAD_WINDOW_S,
+    RISE_LO_M,
+    RISE_SPAN_M,
     STAND_Z,
     W_ACTION_RATE,
     W_ALIVE,
@@ -42,6 +44,7 @@ from mjlab_microduck.tasks.microduck_jump_env_cfg import (
     W_FLIGHT,
     W_LAND,
     W_LOAD,
+    W_RISE,
     W_STAGGER,
     W_TERMINATED,
     MicroduckJumpRlCfg,
@@ -104,8 +107,8 @@ def test_gait_terms_gone_and_every_weight_is_signed_the_right_way():
     for gone in ("air_time", "foot_clearance", "foot_swing_height", "pose",
                  "head_pose_bias"):
         assert gone not in cfg.rewards, gone
-    for pos in ("jp_flight", "jp_apex", "jp_land", "jp_load", "alive",
-                "upright", "head_still", "track_linear_velocity",
+    for pos in ("jp_flight", "jp_apex", "jp_land", "jp_rise", "jp_load",
+                "alive", "upright", "head_still", "track_linear_velocity",
                 "track_angular_velocity"):
         assert cfg.rewards[pos].weight > 0, pos
     for cost in ("jp_stagger", "jp_drift", "terminated", "head_joint_vel",
@@ -127,6 +130,10 @@ def test_gait_terms_gone_and_every_weight_is_signed_the_right_way():
     assert cfg.rewards["jp_flight"].weight == W_FLIGHT == 25.0
     assert cfg.rewards["jp_apex"].weight == W_APEX == 15.0
     assert cfg.rewards["jp_land"].weight == W_LAND == 15.0
+    # v3: the rise is worth exactly as much as the bonus it completes. v2
+    # collected `jp_land` at the band's edge (0.097) and parked, so arriving
+    # must not out-earn the last 2 cm of getting there.
+    assert cfg.rewards["jp_rise"].weight == W_RISE == 15.0 == W_LAND
     assert cfg.rewards["jp_load"].weight == W_LOAD == 0.5
     assert cfg.rewards["jp_stagger"].weight == W_STAGGER == -2.0
     assert cfg.rewards["jp_drift"].weight == W_DRIFT == -1.0
@@ -199,6 +206,11 @@ def test_the_constants_are_the_measured_ones():
     assert LAND_TILT_DEG == 15.0      # ...but the FINISH is judged at 15
     assert LAND_SETTLE_S == 0.30
     assert FLIGHT_MIN_S == 0.04       # two control steps: chatter is not flight
+    # v3's band IS `jp_land`'s band: the rise potential runs from the cheapest
+    # pose that still collects the landing bonus up to standing height.
+    assert RISE_LO_M == 0.095 and RISE_SPAN_M == 0.020
+    assert math.isclose(RISE_LO_M + RISE_SPAN_M, STAND_Z)
+    assert math.isclose(RISE_SPAN_M, microduck_mdp.JP_LAND_Z_TOL_M)
     assert DRIFT_SAT_M == 0.05        # a hop travels less than a bow does
     # The head is bow v7's, verbatim.
     assert HEAD_STILL_JOINTS == (7, 8) and HEAD_STILL_STD == 0.5
@@ -239,7 +251,7 @@ def test_the_foot_sites_are_the_sole_on_the_real_model():
     # ...and a FRESH SceneEntityCfg per term (the managers resolve these in
     # place; a shared instance would bind to whichever scene got there first).
     seen = [id(_CFG.rewards[n].params["feet_cfg"])
-            for n in ("jp_flight", "jp_apex", "jp_land", "jp_load",
+            for n in ("jp_flight", "jp_apex", "jp_land", "jp_rise", "jp_load",
                       "jp_stagger", "jp_drift")]
     assert len(set(seen)) == len(seen)
 
@@ -389,6 +401,10 @@ def _apex(env):
 
 def _land(env):
     return float(microduck_mdp.jp_land_bonus(env)[0])
+
+
+def _rise(env):
+    return float(microduck_mdp.jp_rise_reward(env, **_params("jp_rise"))[0])
 
 
 def _load(env):
@@ -681,6 +697,150 @@ def test_land_is_gated_on_tilt_height_and_stillness():
     assert paid == 0.0, "|vz| 0.6 m/s is a bounce, not a landing"
 
 
+# ── the rise potential (v3) ──────────────────────────────────────────────────
+
+def _hop_then(env, land_z=RISE_LO_M, steps=4):
+    """A clean 4-step flight, then a touchdown at `land_z`. Returns the total
+    rise credit banked up to and including the touchdown, which must be ZERO:
+    the term is dark for the whole hop and the step the flight ends only sets
+    the potential's origin."""
+    banked = 0.0
+    env.tick(contacts=(1, 1), z=STAND_Z)
+    banked += _rise(env)
+    for _ in range(steps):
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+        banked += _rise(env)
+    env.tick(contacts=(1, 1), z=land_z)          # the flight ends HERE
+    banked += _rise(env)
+    return banked
+
+
+def test_rise_pays_nothing_until_the_first_flight_has_ended():
+    """The term is dark for the whole manoeuvre — the spawn drop, the crouch,
+    the push, the flight and the apex are all unpriced by it — and the step the
+    flight ends pays nothing either, because that Δ would be the drop from the
+    hop's own apex back to the floor.
+
+    A duck that never leaves the floor can never collect a point of it, however
+    tall it stands: that is what stops this becoming the `height_stand` this
+    recipe deliberately does not have."""
+    env = _FakeEnv()
+    never_flew = 0.0
+    for k in range(_STEPS):                       # crouch, then rise, no hop
+        z = STAND_Z - 0.030 + 0.030 * min(k / 40.0, 1.0)
+        env.tick(contacts=(1, 1), z=z)
+        never_flew += _rise(env)
+    assert never_flew == 0.0, never_flew
+
+    # The spawn drop is not a flight either, so it cannot arm the potential.
+    env = _FakeEnv()
+    spawn = 0.0
+    for _ in range(4):
+        env.tick(contacts=(0, 0), z=0.1270, feet_z=(0.0135, 0.0135))
+        spawn += _rise(env)
+    assert spawn == 0.0
+
+    # And the hop itself pays nothing, apex included.
+    env = _FakeEnv()
+    assert _hop_then(env, land_z=RISE_LO_M) == 0.0
+    assert bool(env._jp_flight_used[0]) is True, "...but the latch is now closed"
+
+
+def test_rise_is_a_potential_worth_fifteen_points_from_the_bands_edge():
+    """`jp_land` pays anywhere within 20 mm of standing, so 0.095 m collects
+    it. v2 rose to exactly 0.097-0.098 m and PARKED for 1.7 s, because past the
+    landing nothing paid for the last 2 cm and rising costs action rate. This
+    prices that band: the whole 0.095 -> 0.115 climb is worth 1.0 credit, i.e.
+    15 points, however it is walked up."""
+    env = _FakeEnv()
+    assert _hop_then(env, land_z=RISE_LO_M) == 0.0
+    banked, z = 0.0, RISE_LO_M
+    for _ in range(10):                           # 2 mm a step, 0.095 -> 0.115
+        z += 0.002
+        env.tick(contacts=(1, 1), z=z)
+        banked += _rise(env)
+    assert math.isclose(banked, 1.0, rel_tol=1e-4), banked
+    assert math.isclose(banked * W_RISE, 15.0, rel_tol=1e-4)
+
+    # HOLDING PAYS ZERO — the whole difference between a potential and the
+    # per-step height income the recipe refuses to carry.
+    for _ in range(30):
+        env.tick(contacts=(1, 1), z=STAND_Z)
+        assert abs(_rise(env)) < 1e-6
+    # ...and standing TALLER than standing pays nothing: the potential clips, so
+    # an episode can never earn more than its 15 points.
+    env.tick(contacts=(1, 1), z=STAND_Z + 0.03)
+    assert _rise(env) < 1e-5
+
+
+def test_rise_is_given_back_if_the_duck_folds_again():
+    """Not clamped at zero, unlike `jp_apex`. A one-shot bonus with a band is a
+    band the policy sits on the edge of; a potential you can bank and then sag
+    out of is a band the policy VISITS. Rise-then-drop must net zero, or "rise,
+    collect, fold" is the same farm in a third costume."""
+    env = _FakeEnv()
+    _hop_then(env, land_z=RISE_LO_M)
+    net, z = 0.0, RISE_LO_M
+    for _ in range(10):                           # up to standing
+        z += 0.002
+        env.tick(contacts=(1, 1), z=z)
+        net += _rise(env)
+    assert math.isclose(net, 1.0, rel_tol=1e-4)
+    for _ in range(10):                           # ...and back down again
+        z -= 0.002
+        env.tick(contacts=(1, 1), z=z)
+        net += _rise(env)
+    assert abs(net) < 1e-4, net
+    assert math.isclose(z, RISE_LO_M, abs_tol=1e-6)
+    # Sagging on its own is a straight cost.
+    env.tick(contacts=(1, 1), z=RISE_LO_M - 0.02)
+    assert abs(_rise(env)) < 1e-5, (
+        "already at the floor of the band: the potential is bounded below")
+
+
+def test_rise_prices_exactly_the_two_centimetres_v2_would_not_climb():
+    """The v2 finding, priced. A landing on folded legs that rises to the band's
+    edge and parks collects the SAME `jp_land` as one that stands all the way
+    up — that is why v2 stopped at 0.097 — and now differs by the full 15."""
+    parked, stood = [], []
+    for out, top in ((parked, 0.097), (stood, STAND_Z)):
+        env = _FakeEnv()
+        _hop_then(env, land_z=0.039)              # v2's measured landing pose
+        z, total = 0.039, 0.0
+        for _ in range(40):
+            z = min(top, z + 0.002)
+            env.tick(contacts=(1, 1), z=z)
+            total += _rise(env)
+        out.append(total)
+    assert math.isclose(parked[0] * W_RISE, 1.5, abs_tol=0.05), parked
+    assert math.isclose(stood[0] * W_RISE, 15.0, abs_tol=0.05), stood
+    assert (stood[0] - parked[0]) * W_RISE > 13.0
+
+
+def test_rise_rearms_on_a_fresh_episode():
+    """Mirrors `_jp_apex`: without the re-arm, every episode after the first
+    would either start mid-potential or pay its first Δ against a stale one."""
+    env = _FakeEnv()
+    _hop_then(env, land_z=RISE_LO_M)
+    for _ in range(10):
+        env.tick(contacts=(1, 1), z=STAND_Z)
+    assert bool(env._jp_rise_live[0]) is True
+    assert math.isclose(float(env._jp_rise[0]), 1.0, rel_tol=1e-5)
+
+    env.episode_length_buf[:] = 0                 # reset
+    env.tick(contacts=(1, 1), z=STAND_Z)
+    assert bool(env._jp_rise_live[0]) is False, (
+        "a fresh episode has not flown yet, so the rise must be dark again")
+    assert _rise(env) == 0.0
+    assert float(env._jp_rise_gain[0]) == 0.0
+    # ...and it stays dark until the new episode's own flight has ended.
+    quiet = 0.0
+    for _ in range(20):
+        env.tick(contacts=(1, 1), z=STAND_Z - 0.02)
+        quiet += _rise(env)
+    assert quiet == 0.0
+
+
 # ── the load rung ────────────────────────────────────────────────────────────
 
 def test_load_is_capped_by_its_window_and_dies_at_the_first_flight():
@@ -872,6 +1032,10 @@ def test_memory_rearms_on_a_fresh_episode():
     assert bool(env._jp_landed[0]) is False
     assert float(env._jp_stagger[0]) == 0.0
     assert float(env._jp_apex[0]) == 0.0, "the apex potential must re-arm"
+    assert bool(env._jp_rise_live[0]) is False, (
+        "...and so must the rise potential, or a fresh episode would pay its "
+        "first delta against last episode's landing")
+    assert float(env._jp_rise_gain[0]) == 0.0
     assert float(env._jp_flight_end_t[0]) > 1e8
     assert float(env._jp_vz[0]) == 0.0, "no spawn-teleport velocity spike"
     assert torch.allclose(env._jp_home[0], torch.tensor([0.2, -0.1]))
@@ -896,13 +1060,14 @@ def test_update_runs_once_per_step():
 # sanity check on the ORDERING. Every strategy is a step-by-step world state
 # (contacts, trunk z, foot clearance, tilt), never a hand-summed table.
 
-_TERMS = ("jp_flight", "jp_apex", "jp_land", "jp_load", "jp_stagger",
-          "jp_drift", "alive", "terminated")
+_TERMS = ("jp_flight", "jp_apex", "jp_land", "jp_rise", "jp_load",
+          "jp_stagger", "jp_drift", "alive", "terminated")
 
 _FNS = {
     "jp_flight": microduck_mdp.jp_flight_reward,
     "jp_apex": microduck_mdp.jp_apex_reward,
     "jp_land": microduck_mdp.jp_land_bonus,
+    "jp_rise": microduck_mdp.jp_rise_reward,
     "jp_load": microduck_mdp.jp_load_reward,
     "jp_stagger": microduck_mdp.jp_stagger_penalty,
     "jp_drift": microduck_mdp.jp_drift_penalty,
@@ -940,11 +1105,16 @@ def _flat(z=STAND_Z, tilt=0.0):
     return dict(contacts=(1, 1), z=z, tilt_deg=tilt)
 
 
-def _textbook_hop():
+def _textbook_hop(park_z=STAND_Z):
     """The design note's best scripted schedule, the one that lands and stays
     up: 0.20 s of load to a 27 mm crouch, a 3-step push, 4 control steps with
     both feet off at 21 mm of foot clearance, apex 0.1284 m (+13.4 mm), a
-    landing transient that peaks at 32.4 deg of tilt, then standing."""
+    landing transient that peaks at 32.4 deg of tilt, then standing.
+
+    `park_z` is where it settles. The default IS standing. 0.097 is jump-v2's
+    measured park: the lowest trunk height that still collects `jp_land`, whose
+    band is 20 mm wide — everything else about the two trajectories is
+    identical, which is exactly why v2 chose the low one."""
     steps = []
     for k in range(1, 13):                                   # load, 0.24 s
         steps.append(_flat(z=STAND_Z - 0.027 * min(k / 10.0, 1.0)))
@@ -957,7 +1127,7 @@ def _textbook_hop():
     for tilt in (20.0, 14.0, 8.0, 4.0):
         steps.append(_flat(z=0.1080, tilt=tilt))
     while len(steps) < _STEPS:                               # settled, standing
-        steps.append(_flat())
+        steps.append(_flat(z=park_z))
     return steps[:_STEPS]
 
 
@@ -1124,10 +1294,13 @@ def test_the_pogo_now_loses_to_one_hop():
     assert tot(hop) > tot(pogo) > tot(bounce)
     assert tot(hop) - tot(pogo) > 40.0, (tot(hop), tot(pogo))
 
-    # 3. The only thing separating the two pogos is the landing bonus — which
-    #    is the term that pays for STOPPING, and the term v1 logged at 0.0003.
-    assert math.isclose(tot(pogo) - tot(bounce), W_LAND, abs_tol=1e-6)
+    # 3. What separates the two pogos is the pair of terms that pay for
+    #    STOPPING: the landing bonus (which v1 logged at 0.0003) and, since v3,
+    #    the rise that finishes it. Both go to the pogo that settles, and the
+    #    gap can only be wider than the bonus alone.
+    assert tot(pogo) - tot(bounce) >= W_LAND - 1e-6, (tot(pogo), tot(bounce))
     assert pogo["jp_land"] == W_LAND and bounce["jp_land"] == 0.0
+    assert pogo["jp_rise"] >= bounce["jp_rise"]
 
     # 4. Both pogos still beat the parks, and that is CORRECT: a pogo did leave
     #    the floor once, and a policy walking back from six hops to one must
@@ -1172,6 +1345,8 @@ def test_the_arithmetic_hopping_wins():
         assert other["jp_flight"] == 0.0
         assert other["jp_apex"] == 0.0
         assert other["jp_land"] == 0.0
+        assert other["jp_rise"] == 0.0, (
+            "the rise is conditioned on a flight too: it is not a height term")
     # The design note's row, reproduced by the real functions.
     assert math.isclose(hop["jp_flight"], 100.0, abs_tol=1e-6)
     assert math.isclose(hop["jp_apex"], 13.4, abs_tol=0.1)
@@ -1225,6 +1400,52 @@ def test_the_arithmetic_hopping_wins():
         assert tot(survivor) > 0.0
         billed = sum(v for v in survivor.values() if v < 0.0)
         assert billed > -3.0 * _STEPS, billed
+
+
+def test_parking_on_the_edge_of_the_landing_band_now_loses():
+    """THE v2 FINDING, and v3's fix, in one test.
+
+    jump-v2 hopped: 8 lab episodes, 0 falls, one flight per episode of
+    160-180 ms, trunk apex +13 mm. And then it landed on FOLDED LEGS (trunk
+    0.039 m at 0.32 s), rose to 0.097-0.098 m and PARKED THERE for the rest of
+    the 2 s episode — standing is 0.115-0.120 — tilt 1 deg, no cycling.
+
+    Read off the stack, the reason is arithmetic and not physics: `jp_land`
+    pays its one shot anywhere within `JP_LAND_Z_TOL_M` (20 mm) of standing, so
+    0.095 m qualifies. The policy rose to exactly the band's edge, collected,
+    and stopped — because nothing after the landing paid for the last 2 cm and
+    rising costs action rate. Bow v2's compromise pose, one term later.
+
+    So the two trajectories below are IDENTICAL up to the park height, and both
+    still collect the landing bonus in full. Under v2 they scored the same;
+    under v3 the low one loses the whole rise."""
+    stood = _episode(_textbook_hop())                 # settles at 0.115
+    parked = _episode(_textbook_hop(park_z=0.097))    # settles at the band edge
+    tot = lambda d: sum(d.values())
+
+    # 1. Both are hops, and BOTH STILL COLLECT `jp_land` — which is the finding:
+    #    the bonus alone cannot tell them apart.
+    for d in (stood, parked):
+        assert math.isclose(d["jp_flight"], 100.0, abs_tol=1e-6)
+        assert math.isclose(d["jp_apex"], 13.4, abs_tol=0.1)
+        assert d["jp_land"] == W_LAND == 15.0
+    # ...and every other term is identical too: the park height is the ONLY
+    # variable between them.
+    for name in _TERMS:
+        if name != "jp_rise":
+            assert math.isclose(stood[name], parked[name], abs_tol=1e-6), name
+
+    # 2. UNDER v3 THE PARK LOSES, and by more than the 10 points asked for.
+    assert tot(stood) - tot(parked) >= 10.0, (tot(stood), tot(parked))
+    assert stood["jp_rise"] > 0.0 > parked["jp_rise"], (
+        "standing up banks the climb; sagging to the band's edge gives it back")
+    assert stood["jp_rise"] - parked["jp_rise"] >= 10.0
+
+    # 3. The credit is bounded: an episode can never earn more than the 15
+    #    points the whole 0.095 -> 0.115 band is worth, so this cannot become a
+    #    per-step height income that competes with the hop itself.
+    assert stood["jp_rise"] <= W_RISE + 1e-6
+    assert tot(stood) > tot(_episode(_stand_still()))
 
 
 def test_removing_the_flight_gate_hands_the_task_to_the_runner():
