@@ -9,6 +9,7 @@ import torch
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_bow_env_cfg import (
+    W_HEAD_STILL,
     BOW_COLLAPSE_Z,
     BOW_DIP_M,
     BOW_PITCH_RAD,
@@ -947,7 +948,7 @@ def test_the_thrashing_head_now_loses():
     # 2. …and the two v5 terms separate them, from both sides: the still head
     #    collects the position reward the thrashing one forfeits, and the
     #    thrashing one pays a speed cost the still one does not.
-    assert book["bow_head_still"] > 0.99 * 2.0 * int(STAND_END_S / 0.02)
+    assert book["bow_head_still"] > 0.99 * W_HEAD_STILL * int(STAND_END_S / 0.02)
     # (not zero: a swinging head passes through centre twice a cycle and is
     #  paid for the instants it is there — the term is a Gaussian, not a latch)
     assert thrash["bow_head_still"] < 0.10 * book["bow_head_still"]

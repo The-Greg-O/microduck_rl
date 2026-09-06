@@ -441,7 +441,11 @@ _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 W_HEIGHT = 3.0        # the shape of the bow — and the ramp back UP  (v1)
 W_PITCH = 2.0         # nose-down: what makes the crouch read as a bow  (v1)
 W_HEAD = 2.0          # head down, then lifted  (v1)
-W_HEAD_STILL = 2.0    # THE v5 TERM. head_yaw and head_roll pinned to HOME for
+# v6 (2026-09-06): v5 pinned the head (yaw/roll within a degree) but the bow
+# regressed to a half-crouch (dip 0.094 m, final 0.099): the always-on
+# head-still income diluted the rise. Weights only: rise progress 6 -> 12,
+# risen 5 -> 10, stand pose 3 -> 4, head still 2 -> 1.
+W_HEAD_STILL = 1.0    # THE v5 TERM. head_yaw and head_roll pinned to HOME for
                       # the whole episode. v4 bowed correctly and swung its head
                       # around violently while doing it — those two joints were
                       # priced by nothing at all, so the policy used the heaviest
@@ -457,18 +461,18 @@ W_HEAD_VEL = -0.5     # bounded, saturating at HEAD_VEL_CAP. Prices the SPEED of
                       # that made quitting cheap in v3.
 W_UPRIGHT = 2.0       # lateral tilt only — the pitch is intended  (v1)
 W_TRACK = 0.5         # zero twist = don't travel, don't turn  (v1)
-W_STAND_POSE = 3.0    # the finish, stand phase only. v1's 2.0 was too cheap to
+W_STAND_POSE = 4.0    # the finish, stand phase only. v1's 2.0 was too cheap to
                       # outbid the crouch; v2's 5.0 was raised without a path to
                       # the pose it pays for, so nothing collected it. 3.0 plus
                       # a gradient up (below) is the version that has both.
-W_RISE_PROGRESS = 6.0  # THE v4 TERM. Potential-based Δ of a running-max trunk
+W_RISE_PROGRESS = 12.0 # THE v4 TERM. Potential-based Δ of a running-max trunk
                        # height over the rise window, rate-capped: the full 3 cm
                        # is worth 25 credits = 150 points however it is climbed,
                        # and a partial rise is worth exactly its fraction. Every
                        # earlier version priced where the trunk IS, so a policy
                        # one centimetre up an unfinished rise collected nothing
                        # for that centimetre and the crouch was a flat optimum.
-W_RISEN = 5.0         # ONE step per episode: back up, feet planted. Same size
+W_RISEN = 10.0        # ONE step per episode: back up, feet planted. Same size
                       # and same one-shot shape as happy-spin's completion.
 W_TERMINATED = -20.0  # v3 DIVERGED by learning to fall over: its parked-pose
                       # costs meant an episode that ENDS stops paying them
