@@ -456,3 +456,10 @@ def test_stopping_on_the_mark_beats_crossing_fast_and_drifting():
     assert v1_415 < -150 and v1_457 < -250  # over-rotation is no longer free
     assert stop_on_the_mark - v1_415 > 400
     assert stop_on_the_mark - v1_457 > 900
+
+
+def test_obs_delay_is_a_knob(monkeypatch):
+    from mjlab_microduck.tasks.microduck_happy_spin_env_cfg import make_microduck_happy_spin_env_cfg
+    assert make_microduck_happy_spin_env_cfg().observations["actor"].terms["base_ang_vel"].delay_max_lag == 1
+    monkeypatch.setenv("MICRODUCK_HS_OBS_DELAY_MAX", "6")
+    assert make_microduck_happy_spin_env_cfg().observations["actor"].terms["base_ang_vel"].delay_max_lag == 6

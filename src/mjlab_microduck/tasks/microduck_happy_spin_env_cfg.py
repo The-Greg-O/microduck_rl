@@ -1,3 +1,4 @@
+import os
 """Microduck HAPPY SPIN task — the excited-dog twirl.
 
 Episodic skill: from a standing start, ONE fast full turn (360°) on the spot,
@@ -267,6 +268,17 @@ def make_microduck_happy_spin_env_cfg(
             ],
         },
     )
+    # Sensor-latency robustness. The spin's stopping point is timing: trained
+    # on the velocity template's 0-1 step IMU delay it brakes late under the
+    # lab's 3-6 step delay (465 degrees) and early with none (292). Widen the
+    # observation delay range so the policy brakes on what it feels.
+    # MICRODUCK_HS_OBS_DELAY_MAX (control steps, default 1 = the template's).
+    delay_max = int(os.environ.get("MICRODUCK_HS_OBS_DELAY_MAX", "1"))
+    for term_name in ("base_ang_vel", "projected_gravity", "raw_accelerometer"):
+        term = cfg.observations["actor"].terms.get(term_name)
+        if term is not None and hasattr(term, "delay_max_lag"):
+            term.delay_min_lag = 0
+            term.delay_max_lag = delay_max
     return cfg
 
 
