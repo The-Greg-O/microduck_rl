@@ -57,6 +57,10 @@ Forward kinematics on robot_walk.xml, feet flat:
     in a clean stand instead of leaving the robot folded.
   * upright prices LATERAL tilt only. The stock `upright` term prices total
     tilt and would fight the intended nose-down pitch, so it is dropped.
+  * bow_head_still / head_joint_vel cover the OTHER two head joints. Between
+    the four terms every neck/head servo is now priced by position, by speed,
+    or by both — v4 priced two of the four and the policy spent the other two
+    (see the v4 history below).
   * foot_lift is the anti-fall constraint that matters most: Microducks fall
     while RISING out of a crouch, and every one of those falls starts with a
     foot leaving the floor. Charged per foot, so a single lift already costs —
@@ -71,7 +75,7 @@ Forward kinematics on robot_walk.xml, feet flat:
     from a heap on the floor.
 
 ════════════════════════════════════════════════════════════════════════════
-THE HISTORY. Three trained runs, three different failures, one lesson each.
+THE HISTORY. Four trained runs, four different failures, one lesson each.
 ════════════════════════════════════════════════════════════════════════════
 
 ── v1 PARKED IN THE CROUCH ─────────────────────────────────────────────────
@@ -183,27 +187,113 @@ and survival income back at v1's level.
   (f) `foot_lift` -3.0 with v2's 40 ms flicker exemption, so the heel unweight
       of a legitimate push-up is not priced as a hop.
 
-THE ARITHMETIC (`tests/test_bow_cfg.py::test_the_four_strategies`, real reward
-functions, all 200 steps, sums of weighted values before mjlab's ×dt — divide
-by 200 for wandb's `Episode_Reward` units):
+── v4 BOWED — AND NEARLY BROKE ITS OWN NECK ────────────────────────────────
+v4 worked. The rendered rollout dips, holds, rises and finishes standing with
+both feet planted — the trunk trajectory this file has been chasing since v1.
+And the whole time, the HEAD ROTATES WILDLY: it swings through the dip, through
+the hold and through the rise, hard enough to look like it is going to break
+its own neck.
 
-                     textbook   park@0.101   park@0.088   collapse@1.5 s
-      bow_height        600.0        431.9        400.1          222.6
-      bow_pitch         400.0        288.8        269.7          150.0
-      bow_head          400.0        227.8        247.7          150.0
-      bow_upright       400.0        400.0        400.0          150.0
-      stand_pose        153.0         85.7         62.0            0.0
-      rise_progress     150.0          0.0          0.0            0.0
-      risen               5.0          0.0          0.0            0.0
-      terminated          0.0          0.0          0.0          -20.0
-      track             200.0        200.0        200.0           75.0
-      ----------------------------------------------------------------------
-      TOTAL            2308.0       1634.2       1579.5          727.6
-      per phase  dip     490.0        436.6        490.0          490.0
-                 hold    500.0        307.0        500.0          237.6
-                 rise    652.0        434.5        343.3            0.0
-                 stand   666.0        456.1        246.1            0.0
-      per step           11.54         8.17         7.90           3.64
+That is not a training accident, it is the reward stack. `bow_head` prices
+servo joints (5, 6) — neck_pitch and head_pitch, the sagittal pair that carries
+the head down and back up. Joints 7 and 8, head_yaw and head_roll, are named by
+NOTHING in the v4 stack. head_yaw has ±2.97 rad of travel on robot_walk.xml and
+head_roll ±0.44, on a head that is 38% of the body mass, and the only thing
+charging any of that motion was `action_rate_l2` at -0.05.
+
+An unpriced heavy joint is a free counterweight. Swinging the head shifts the
+CoM, which buys exactly what `bow_upright` (+2.0), `bow_height` (+3.0) and
+`rise_progress` (+6.0) are paying for, at a smoothness cost of a few hundredths
+per step. PPO found the trade, and it should have: the stack asked for it.
+LESSON: a joint you do not price is a joint the policy will spend. Enumerate
+the whole actuator set when designing a pose reward, not only the joints that
+carry the motion you had in mind.
+
+── v5: NAME THE OTHER TWO JOINTS ───────────────────────────────────────────
+v4 VERBATIM — every weight, every tolerance, every gate — plus two terms that
+between them cover all four neck/head joints. Nothing else moves.
+
+  (a) `bow_head_still` (+2.0), the whole episode: a tight Gaussian (std 0.08
+      rad ≈ 4.6°) holding head_yaw and head_roll at HOME. HOME is 0.0 for both
+      (microduck_constants.py), so this is literally "hold them at zero". No
+      phase gate — there is no moment in a bow when the head is meant to be
+      pointing sideways.
+
+      Why a 0.08 std is legitimate here when v3's tight tolerances were the
+      thing that broke it: v3 narrowed Gaussians below the tracking error a
+      policy still learning the motion could hold, which deletes the gradient
+      (AGENTS.md: price the ESCAPABLE part of an error). These two joints have
+      no trajectory to track and no servo lag to fight. The target is the pose
+      the robot already starts in and never has to leave, so ALL of the error
+      is escapable and the std is simply the wobble worth tolerating.
+
+      Weighted level with `bow_head` on purpose: where the head POINTS is worth
+      as much as how low it is held.
+
+  (b) `head_joint_vel` (-0.5), bounded, saturating at 4.0 rad/s: the mean of
+      clamp((joint_vel / cap)², 0, 1) over ALL FOUR head joints. This is the
+      half (a) cannot do — neck_pitch and head_pitch MUST move, they track the
+      down/up ramp, so no position term can settle them. Pricing SPEED lets the
+      ramp through and charges everything faster.
+
+      The numbers: the ramp's steepest ask is the 0.60 rad of down→up travel
+      across the 1 s rise, 0.6 rad/s — (0.6/4)² = 0.023 of the term on one
+      joint, about 0.003/step after the weight and the mean over four joints. A
+      head snapping at the cap costs 0.5/step, 150× more. Quadratic below the
+      cap and FLAT above it, so it is a smoothness prior on the intended motion
+      and a wall on the thrash.
+
+      Bounded, and that is not decoration. An l2 on joint velocity has no
+      ceiling and its worst case is set by the sim; a cost like that driving
+      the per-step total toward zero is precisely the shape that taught v3 to
+      fall over (lesson (i)). Here the whole term is worth at most 0.5/step
+      against a still head's +2.0/step, so the v5 pair is NET POSITIVE income
+      for a head that behaves and can never make quitting look good.
+
+THE ARITHMETIC (`tests/test_bow_cfg.py::test_the_four_strategies` and
+`::test_the_thrashing_head_now_loses`, real reward functions, all 200 steps,
+sums of weighted values before mjlab's ×dt — divide by 200 for wandb's
+`Episode_Reward` units). `thrash` is what v4 rendered: a textbook bow with the
+head also swinging at 2 Hz through ±1.5 rad of yaw and ±0.4 of roll.
+
+                   textbook     thrash  park@0.101  park@0.088  collapse@1.5s
+      bow_height      600.0      600.0       431.9       400.1        222.6
+      bow_pitch       400.0      400.0       288.8       269.7        150.0
+      bow_head        400.0      400.0       227.8       247.7        150.0
+      bow_head_still  400.0       30.9       400.0       400.0        150.0
+      head_joint_vel   -0.3      -38.9         0.0        -0.1         -0.1
+      bow_upright     400.0      400.0       400.0       400.0        150.0
+      stand_pose      153.0      153.0        85.7        62.0          0.0
+      rise_progress   150.0      150.0         0.0         0.0          0.0
+      risen             5.0        5.0         0.0         0.0          0.0
+      terminated        0.0        0.0         0.0         0.0        -20.0
+      track           200.0      200.0       200.0       200.0         75.0
+      ---------------------------------------------------------------------
+      TOTAL          2707.7     2300.0      2034.2      1979.4        877.5
+      per phase dip   587.9      486.2       534.6       587.9        587.9
+               hold   600.0      498.1       407.0       600.0        289.6
+               rise   751.7      649.8       534.5       443.3          0.0
+               stand  768.0      665.8       558.1       348.1          0.0
+      per step        13.54      11.50       10.17        9.90         4.39
+
+Read the `thrash` column top to bottom: it is IDENTICAL to the textbook bow in
+every v4 term, line for line. That is the bug, printed. The two v5 rows are the
+only place the stack can tell them apart, and they are worth 2.04/step of
+separation — 40× what `action_rate_l2` was charging the swing.
+
+The v4 ordering survives untouched: textbook > park@0.101 > park@0.088 >
+collapse, with collapse still under half the next-worst. Two things to note
+about the numbers rather than the order:
+
+  * `bow_head_still` pays every well-behaved strategy the same +400, parked
+    ones included, so the RATIO of park to textbook rises (0.68 → 0.73) while
+    the MARGIN is unchanged at 728 points / 3.64 per step. The margin is what
+    a policy optimizes; the test asserts both, and says why.
+  * The thrashing bow still beats parking (2300 > 1979). That is deliberate,
+    and it is lesson (i) again — a bow with a bad head is a WORSE BOW, not a
+    failure, and pricing it below "never bowed at all" would be exactly the
+    inversion that made v3 quit. It loses 407 points to the clean bow, which is
+    more than half the gap between a clean bow and one that never rises.
 
 park@0.101 is v2's learned trajectory, park@0.088 is v1's (a textbook dip and
 hold, then frozen in the crouch — credited in full for the half of the bow it
@@ -240,11 +330,21 @@ WATCH FOR, in this order:
   4. `Episode_Reward/foot_lift` climbing while `rise_progress` climbs: that is
      the hop shortcut being attempted. The planted gate should already make it
      unprofitable; if not, the gate is the thing to check, not the weight.
+  5. `Episode_Reward/bow_head_still`, the v5 tripwire. A well-behaved head sits
+     at ~2.0 (its weight); the thrashing v4 policy would log ~0.15. Anything
+     under ~1.5 while the trunk terms are healthy means the head is being spent
+     as a counterweight again — raise W_HEAD_STILL before touching W_HEAD_VEL,
+     since the position term is the one that says where the head should BE.
+  6. `Episode_Reward/head_joint_vel` should idle near -0.003 (the head ramp's
+     own cost) and never approach -0.5. If it parks near that floor the head is
+     saturating the cap every step, and the thing to check is whether some
+     other term is paying MORE for the swing than this one charges.
 
 Reward MASS check (AGENTS.md: compare mass, not weights, when regularizers are
-shared): the episode-average positive stack for a textbook bow is 11.5, in
-line with the velocity recipe's ~11 that the inherited regularizers were tuned
-against — with action_rate_l2 deliberately 4× below that scaling.
+shared): the episode-average positive stack for a textbook bow is 13.5 (v4's
+11.5 plus the +2.0 of `bow_head_still`), still the same order as the velocity
+recipe's ~11 that the inherited regularizers were tuned against — with
+action_rate_l2 deliberately well below that scaling.
 """
 
 import math
@@ -306,6 +406,27 @@ PITCH_STD = 0.12            # rad, ~7°, comfortably under the 10° target
 HEAD_STD = 0.30             # rad, the head lags; price the escapable part only
 STAND_POSE_STD = 0.12       # rad, leg joints at HOME
 
+# ── v5: the head joints v4 left free ────────────────────────────────────────
+# Servo indices in the canonical 14-joint order (AGENTS.md / README / the map
+# in tasks/symmetry.py): 5 neck_pitch, 6 head_pitch, 7 head_yaw, 8 head_roll.
+# Ranges on robot_walk.xml: neck_pitch [-1.571, 1.047], head_pitch [-1.571,
+# 1.571], head_yaw [-2.967, 2.967], head_roll [-0.436, 0.436]; HOME (from
+# microduck_constants.py) is neck_pitch 0.3491, head_pitch 0.3491, head_yaw
+# 0.0, head_roll 0.0 — so "hold yaw and roll at 0 rad" IS "hold them at HOME".
+# head_yaw alone has +/-170 deg of travel and v4 priced none of it.
+HEAD_STILL_JOINTS = microduck_mdp.BOW_HEAD_STILL_JOINTS  # (7, 8) yaw, roll
+HEAD_STILL_STD = microduck_mdp.BOW_HEAD_STILL_STD        # 0.08 rad ~ 4.6 deg
+HEAD_VEL_JOINTS = microduck_mdp.BOW_HEAD_ALL_JOINTS      # (5, 6, 7, 8)
+HEAD_VEL_CAP = microduck_mdp.BOW_HEAD_VEL_CAP            # 4.0 rad/s, saturating
+# The steepest thing the head ramp ever asks for: down -> up across the 1 s
+# rise, |BOW_HEAD_UP - BOW_HEAD_DOWN| on the pitch pair. The cap must sit well
+# above it or the velocity cost would tax the motion it is meant to smooth.
+HEAD_RAMP_RATE = max(
+    abs(u - d)
+    for u, d in zip(microduck_mdp.BOW_HEAD_UP, microduck_mdp.BOW_HEAD_DOWN)
+) / (RISE_END_S - HOLD_END_S)
+assert HEAD_VEL_CAP > 5.0 * HEAD_RAMP_RATE
+
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
 # ── Reward weights ──────────────────────────────────────────────────────────
@@ -320,6 +441,20 @@ _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 W_HEIGHT = 3.0        # the shape of the bow — and the ramp back UP  (v1)
 W_PITCH = 2.0         # nose-down: what makes the crouch read as a bow  (v1)
 W_HEAD = 2.0          # head down, then lifted  (v1)
+W_HEAD_STILL = 2.0    # THE v5 TERM. head_yaw and head_roll pinned to HOME for
+                      # the whole episode. v4 bowed correctly and swung its head
+                      # around violently while doing it — those two joints were
+                      # priced by nothing at all, so the policy used the heaviest
+                      # link on the robot as a free counterweight. Sized to match
+                      # W_HEAD: the direction the head POINTS is worth as much as
+                      # the height it is held at.
+W_HEAD_VEL = -0.5     # bounded, saturating at HEAD_VEL_CAP. Prices the SPEED of
+                      # all four head joints, which is the only way to reach
+                      # neck_pitch and head_pitch — they have to move, so no
+                      # position term can settle them. At the ramp's own rate it
+                      # costs ~0.01/step; at the cap, 0.5/step. Bounded on
+                      # purpose: an unbounded velocity cost is exactly the shape
+                      # that made quitting cheap in v3.
 W_UPRIGHT = 2.0       # lateral tilt only — the pitch is intended  (v1)
 W_TRACK = 0.5         # zero twist = don't travel, don't turn  (v1)
 W_STAND_POSE = 3.0    # the finish, stand phase only. v1's 2.0 was too cheap to
@@ -454,6 +589,26 @@ def make_microduck_bow_env_cfg(
             "down_deltas": microduck_mdp.BOW_HEAD_DOWN,
             "up_deltas": microduck_mdp.BOW_HEAD_UP,
             "std": HEAD_STD,
+        },
+    )
+    # THE v5 TERMS. bow_head above prices neck_pitch and head_pitch only; these
+    # two close the gap that let the v4 policy thrash its head through the bow.
+    cfg.rewards["bow_head_still"] = RewardTermCfg(
+        func=microduck_mdp.bow_head_still_reward,
+        weight=W_HEAD_STILL,
+        params={
+            "sensor_name": sensor_name,
+            "joint_indices": HEAD_STILL_JOINTS,  # (7, 8) = head_yaw, head_roll
+            "std": HEAD_STILL_STD,               # HOME is 0.0 for both
+        },
+    )
+    cfg.rewards["head_joint_vel"] = RewardTermCfg(
+        func=microduck_mdp.bow_head_vel_penalty,
+        weight=W_HEAD_VEL,
+        params={
+            "sensor_name": sensor_name,
+            "joint_indices": HEAD_VEL_JOINTS,    # all four neck/head joints
+            "vel_cap": HEAD_VEL_CAP,
         },
     )
     cfg.rewards["bow_upright"] = RewardTermCfg(

@@ -7708,6 +7708,13 @@ def hs_tilt_penalty(
 # progress term pays Δ of a running-max potential, which means a partial rise is
 # worth exactly its fraction of the whole — a gradient the policy can follow all
 # the way from the crouch to the stand.
+#
+# v5 adds `bow_head_still_reward` and `bow_head_vel_penalty`. v4 finally bowed —
+# and rotated its head wildly while doing it, because `bow_head_reward` prices
+# joints (5, 6) only and left head_yaw (7) and head_roll (8) completely
+# unpriced. An unpriced joint on a head this heavy is a free counterweight. The
+# two new terms hold yaw and roll at HOME and cap how fast ANY of the four head
+# joints may move; nothing else about v4 changes.
 
 BOW_DIP_END_S = 1.0
 BOW_HOLD_END_S = 2.0
@@ -7730,6 +7737,41 @@ BOW_PITCH_RAD = 0.1745  # 10° nose-down
 BOW_HEAD_DOWN = (-0.30, 0.35)
 BOW_HEAD_UP = (0.25, -0.25)
 BOW_HEAD_JOINTS = (5, 6)
+
+# ── v5: the two head joints v1-v4 left FREE ─────────────────────────────────
+# The bow-v4 rollout got the trunk right and the HEAD WRONG: it rotated wildly
+# through the dip and the rise, "like it's going to break its own neck".
+# The cause is in the line above. `bow_head_reward` prices joints (5, 6) —
+# neck_pitch and head_pitch — and NOTHING in the whole v4 stack mentions
+# head_yaw (index 7, range +/-2.97 rad on robot_walk.xml) or head_roll
+# (index 8, +/-0.44 rad). A free joint on a head that is 38% of the body mass
+# is a free counterweight: swinging it costs only `action_rate_l2` at -0.05 and
+# buys trunk stability that `bow_upright` and `bow_height` pay for. PPO found
+# that trade, and it is not a bow — it is a bow with a seizure.
+#
+# Two terms close it, and both are about the JOINTS, not the trunk:
+#   * `bow_head_still_reward` pays a TIGHT Gaussian (0.08 rad ~ 4.6 deg) on
+#     head_yaw and head_roll against HOME, for the WHOLE episode. Both are 0.0
+#     at HOME (microduck_constants.py), so this is literally "hold them at
+#     zero". Tight is correct here where it was wrong for the trunk (v3's
+#     lesson): these joints have no trajectory to track and no lag to fight —
+#     the target is where they already are at t=0, so the std is not smaller
+#     than an error the policy must work to remove, it is the size of the
+#     wobble worth allowing.
+#   * `bow_head_vel_penalty` is a BOUNDED cost on all four head joints'
+#     velocities, saturating at BOW_HEAD_VEL_CAP. It prices the SPEED rather
+#     than the position, which is what makes it cover neck_pitch and head_pitch
+#     too: those two must move (they track the down/up ramp), so a position
+#     term cannot hold them, but the ramp only asks for ~0.6 rad/s at its
+#     steepest (0.55 rad of down->up travel across the 1 s rise) — a seventh of
+#     the cap, costing (0.6/4)^2 = 0.02 of the term. A head snapping around at
+#     the cap costs 50x that. Quadratic below the cap and flat above, so it is
+#     a smoothness prior on the ramp and a wall on the thrash, and it can never
+#     run away far enough to make terminating attractive (v3's lesson (i)).
+BOW_HEAD_STILL_JOINTS = (7, 8)      # head_yaw, head_roll — held at HOME (= 0)
+BOW_HEAD_STILL_STD = 0.08           # rad, ~4.6 deg of allowed wobble
+BOW_HEAD_ALL_JOINTS = (5, 6, 7, 8)  # neck_pitch, head_pitch, head_yaw, head_roll
+BOW_HEAD_VEL_CAP = 4.0              # rad/s; the cost saturates here
 
 # ── Rising out of the crouch ────────────────────────────────────────────────
 # Checkpoint 1999 of bow-v1 dipped correctly (trunk 0.127 spawn → 0.088 m by
@@ -8038,6 +8080,75 @@ def bow_head_reward(
     up = torch.tensor(up_deltas, device=env.device, dtype=pos.dtype)
     target = home + env._bow_blend[:, None] * down + env._bow_rise[:, None] * up
     return torch.exp(-((pos - target) / std) ** 2).mean(dim=-1)
+
+
+def bow_head_still_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    joint_indices: tuple[int, ...] = BOW_HEAD_STILL_JOINTS,
+    std: float = BOW_HEAD_STILL_STD,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1, THE WHOLE EPISODE: hold head_yaw and head_roll at HOME (= 0 rad).
+
+    The v5 term. `bow_head_reward` prices only neck_pitch and head_pitch, so
+    through v1-v4 the yaw and roll of the head were unpriced — and the bow-v4
+    rollout swung them hard through the dip and the rise, using the head as a
+    free counterweight while the trunk terms collected. Off-axis head motion is
+    not part of a play bow; a bow is a SAGITTAL motion, and the head should lead
+    it pointing straight ahead.
+
+    Per-joint Gaussian against HOME (mean, not product, so one joint drifting
+    does not delete the other's gradient), no phase gate: yaw and roll have no
+    trajectory in this trick, they simply stay put from t=0 to t=4 s.
+
+    Why 0.08 rad is legitimately tight where v3's tolerances were not: v3
+    narrowed Gaussians BELOW the tracking error a policy still learning the
+    motion could hold, which deletes the gradient (AGENTS.md: price the
+    ESCAPABLE part of an error). Here the target is the pose the robot already
+    starts in and never has to leave, so the whole error is escapable — the std
+    is the size of the wobble worth tolerating, not a demand for precision the
+    servos cannot deliver."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    idx = list(joint_indices)
+    pos = _servo_joint_pos(env, asset)[:, idx]
+    home = _servo_default_joint_pos(env, asset)[:, idx]
+    return torch.exp(-((pos - home) / std) ** 2).mean(dim=-1)
+
+
+def bow_head_vel_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    joint_indices: tuple[int, ...] = BOW_HEAD_ALL_JOINTS,
+    vel_cap: float = BOW_HEAD_VEL_CAP,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 BOUNDED cost (negative weight): how fast the head is moving.
+
+    Mean over all four neck/head joints of ``clamp((vel / vel_cap)**2, 0, 1)``.
+    Quadratic under the cap and FLAT above it: a smoothness prior on the head's
+    intended ramp, a wall on thrash, and — because it saturates — a cost that
+    can never grow large enough to make ending the episode the cheap way out
+    (bow-v3 diverged doing exactly that).
+
+    This is the half of the v5 fix that `bow_head_still_reward` cannot do.
+    neck_pitch and head_pitch MUST move: they track the down/up ramp, so no
+    position term can hold them still. Pricing their SPEED instead lets the ramp
+    through free while charging anything faster. The ramp's steepest ask is the
+    0.55 rad of down->up travel across the 1 s rise, ~0.6 rad/s, which at a 4
+    rad/s cap costs (0.6/4)**2 = 0.023 of this term — about a fiftieth of what a
+    head snapping at the cap costs, and a five-hundredth of a single step of a
+    textbook bow's income.
+
+    Bounded and unbounded costs are not interchangeable here; see AGENTS.md and
+    the v3 history in the cfg docstring. An l2 on joint velocity is unbounded
+    and its worst case is set by the sim, not by the designer."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    idx = list(joint_indices)
+    vel = torch.nan_to_num(_servo_joint_vel(env, asset)[:, idx], nan=0.0)
+    return torch.clamp((vel / max(vel_cap, 1e-6)) ** 2, 0.0, 1.0).mean(dim=-1)
 
 
 def bow_upright_reward(

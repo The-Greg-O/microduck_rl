@@ -16,7 +16,12 @@ from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     DIP_END_S,
     EPISODE_LENGTH_S,
     FLICKER_S,
+    HEAD_RAMP_RATE,
     HEAD_STD,
+    HEAD_STILL_JOINTS,
+    HEAD_STILL_STD,
+    HEAD_VEL_CAP,
+    HEAD_VEL_JOINTS,
     HEIGHT_STD,
     HOLD_END_S,
     PITCH_STD,
@@ -75,12 +80,13 @@ def test_gait_terms_gone_and_bow_terms_signed():
     for gone in ("air_time", "foot_clearance", "foot_swing_height", "pose",
                  "upright", "head_pose_bias"):
         assert gone not in cfg.rewards, gone
-    for pos in ("bow_height", "bow_pitch", "bow_head", "bow_upright",
-                "stand_pose", "rise_progress", "risen",
+    for pos in ("bow_height", "bow_pitch", "bow_head", "bow_head_still",
+                "bow_upright", "stand_pose", "rise_progress", "risen",
                 "track_linear_velocity", "track_angular_velocity"):
         assert cfg.rewards[pos].weight > 0, pos
     for cost in ("foot_lift", "terminated", "drift", "foot_slip",
-                 "action_rate_l2", "dof_pos_limits", "self_collisions"):
+                 "head_joint_vel", "action_rate_l2", "dof_pos_limits",
+                 "self_collisions"):
         assert cfg.rewards[cost].weight < 0, cost
     # v3's corridor credit and its two off-ramp costs are GONE: costs that make
     # a parked pose expensive also make TERMINATING cheap, and the v3 run took
@@ -133,6 +139,52 @@ def test_rise_progress_is_wired_and_normalised():
     # that is still finishing at 3.0 s is paid for finishing.
     assert RISE_PAY_START_S == HOLD_END_S == 2.0
     assert RISE_END_S < RISE_PAY_END_S < STAND_END_S
+
+
+def test_head_still_and_head_vel_are_wired_to_the_right_joints():
+    """v5. The bow-v4 rollout bowed correctly and rotated its head wildly doing
+    it: `bow_head` prices servo joints (5, 6) — neck_pitch, head_pitch — and
+    NOTHING in the v4 stack mentioned head_yaw (7) or head_roll (8), so the
+    policy swung the heaviest link on the robot as a free counterweight.
+
+    Joint indices are the canonical 14-servo order (AGENTS.md, README, and the
+    map in tasks/symmetry.py): 0-4 left leg, 5 neck_pitch, 6 head_pitch,
+    7 head_yaw, 8 head_roll, 9-13 right leg."""
+    cfg = make_microduck_bow_env_cfg()
+    # The position term covers exactly the two joints bow_head does NOT.
+    still = cfg.rewards["bow_head_still"]
+    assert still.func is microduck_mdp.bow_head_still_reward
+    assert tuple(still.params["joint_indices"]) == HEAD_STILL_JOINTS == (7, 8)
+    assert still.params["std"] == HEAD_STILL_STD == 0.08
+    head_joints = tuple(cfg.rewards["bow_head"].params.get(
+        "joint_indices", microduck_mdp.BOW_HEAD_JOINTS))
+    assert head_joints == (5, 6)
+    assert set(head_joints).isdisjoint(HEAD_STILL_JOINTS)
+    assert set(head_joints) | set(HEAD_STILL_JOINTS) == set(HEAD_VEL_JOINTS)
+    # HOME for yaw and roll is 0.0, so "hold at HOME" IS "hold at 0 rad".
+    from mjlab_microduck.robot.microduck_constants import HOME_FRAME
+    jp = HOME_FRAME.joint_pos
+    assert jp[r".*head_yaw.*"] == 0.0 and jp[r".*head_roll.*"] == 0.0
+    # The velocity cost covers all four neck/head joints — the only way to
+    # reach neck_pitch and head_pitch, which MUST move and so cannot be held by
+    # any position term.
+    vel = cfg.rewards["head_joint_vel"]
+    assert vel.func is microduck_mdp.bow_head_vel_penalty
+    assert tuple(vel.params["joint_indices"]) == HEAD_VEL_JOINTS == (5, 6, 7, 8)
+    assert vel.params["vel_cap"] == HEAD_VEL_CAP == 4.0
+    assert cfg.rewards["head_joint_vel"].weight == -0.5
+    # …and the cap sits far above the fastest thing the head ramp ever asks
+    # for, so the intended motion is essentially free.
+    assert math.isclose(HEAD_RAMP_RATE, 0.60, abs_tol=1e-6), HEAD_RAMP_RATE
+    assert HEAD_VEL_CAP > 5.0 * HEAD_RAMP_RATE
+    # It is a BOUNDED cost, and a small one. Even a head pinned at the cap for
+    # every step of the episode cannot cost more than holding it still is
+    # worth, so the v5 pair is net POSITIVE income for a head that behaves and
+    # can never push the per-step total down toward the value of quitting —
+    # which is the mechanism that made bow-v3 diverge.
+    steps = int(EPISODE_LENGTH_S / 0.02)
+    assert abs(vel.weight) * steps < still.weight * steps
+    assert still.weight + vel.weight > 0.0
 
 
 def test_collapse_termination_added():
@@ -215,6 +267,7 @@ class _FakeEnv:
                 root_link_pos_w=torch.tensor([[0.0, 0.0, STAND_Z]] * n),
                 root_link_quat_w=torch.tensor([[1.0, 0, 0, 0]] * n),
                 joint_pos=torch.zeros(n, 14),
+                joint_vel=torch.zeros(n, 14),
                 default_joint_pos=torch.zeros(n, 14)))
         self.scene = _FakeScene(n, sensor, asset)
         self.termination_manager = _FakeTerminations(n)
@@ -317,6 +370,92 @@ def test_head_target_goes_down_then_up():
     assert head() < 0.5, "the head that stayed down does not finish the bow"
     env._asset.data.joint_pos = up
     assert head() > 0.99, "head must be LIFTED by the stand phase"
+
+
+def test_head_still_holds_yaw_and_roll_at_zero():
+    """v5: head_yaw and head_roll away from zero must score LOW, in every phase.
+
+    This is the term that was missing when bow-v4 rendered: the head rotated
+    wildly through the dip and the rise and no reward term noticed."""
+    env = _FakeEnv()
+    still = lambda: float(microduck_mdp.bow_head_still_reward(env)[0])
+    env.tick()
+    assert still() > 0.99, "at HOME (yaw = roll = 0) it is worth full marks"
+
+    # Off-axis by a hair is nearly free; by a real angle it is not.
+    def at(yaw, roll):
+        q = torch.zeros(1, 14)
+        q[0, 7], q[0, 8] = yaw, roll
+        env._asset.data.joint_pos = q
+        return still()
+
+    assert at(0.02, 0.0) > 0.9, "a 1 deg wobble must not be punished"
+    assert at(HEAD_STILL_STD, 0.0) < 0.75         # one std on one joint
+    assert at(0.3, 0.0) < 0.55, "17 deg of yaw is a head that is not aiming"
+    assert at(0.3, 0.3) < 0.05, "yaw AND roll off is the v4 failure"
+    assert at(1.5, 0.0) < 0.51, "head_yaw has +/-170 deg of range to abuse"
+    # Symmetric: a bow is left/right symmetric and so is this term.
+    assert math.isclose(at(0.3, 0.0), at(-0.3, 0.0), rel_tol=1e-6)
+    assert math.isclose(at(0.0, 0.2), at(0.0, -0.2), rel_tol=1e-6)
+    # Mean, not product: one joint drifting must not delete the other's
+    # gradient (same reason bow_head uses a mean).
+    assert at(2.0, 0.0) > at(2.0, 0.2)
+    # It pays in EVERY phase — there is no window in a bow where the head is
+    # allowed to spin.
+    for boundary in (DIP_END_S, HOLD_END_S, RISE_END_S, STAND_END_S):
+        env.run_to(boundary)
+        env._asset.data.joint_pos = torch.zeros(1, 14)
+        assert still() > 0.99, boundary
+        assert at(0.3, 0.3) < 0.05, boundary
+    # …and the pitch pair it does NOT price is free to follow the ramp: a head
+    # correctly bowed still collects the full still-reward.
+    down = torch.zeros(1, 14)
+    down[0, 5], down[0, 6] = microduck_mdp.BOW_HEAD_DOWN
+    env._asset.data.joint_pos = down
+    assert still() > 0.99, "bow_head_still must not fight the head ramp"
+
+
+def test_head_vel_cost_fires_and_saturates():
+    """v5: a bounded cost on how fast the four head joints move.
+
+    The half of the fix bow_head_still cannot do — neck_pitch and head_pitch
+    have a ramp to track, so only their SPEED can be priced."""
+    env = _FakeEnv()
+    cost = lambda: float(microduck_mdp.bow_head_vel_penalty(env)[0])
+    env.tick()
+    assert cost() == 0.0, "a still head is free"
+
+    def at(vels):
+        v = torch.zeros(1, 14)
+        for j, x in zip(HEAD_VEL_JOINTS, vels):
+            v[0, j] = x
+        env._asset.data.joint_vel = v
+        return cost()
+
+    # The head ramp's own steepest rate is essentially free: 0.6 rad/s against
+    # a 4 rad/s cap is (0.6/4)^2 = 0.0225 on one joint, a quarter of that after
+    # the mean, and -0.5 * that is ~0.003 per step.
+    ramp = at((HEAD_RAMP_RATE, HEAD_RAMP_RATE, 0.0, 0.0))
+    assert ramp < 0.02, ramp
+    assert 0.5 * ramp < 0.01, "the intended motion must not be taxed"
+    # A yaw swing is not.
+    thrash = at((0.0, 0.0, 3.0, 0.0))
+    assert thrash > 10 * ramp, (thrash, ramp)
+    # Quadratic below the cap …
+    assert math.isclose(at((0.0, 0.0, 2.0, 0.0)), 4 * at((0.0, 0.0, 1.0, 0.0)),
+                        rel_tol=1e-6)
+    # … and FLAT above it: bounded, so it can never grow big enough to make
+    # ending the episode the cheap way out (that is how bow-v3 diverged).
+    capped = at((0.0, 0.0, HEAD_VEL_CAP, 0.0))
+    assert math.isclose(capped, at((0.0, 0.0, 40.0, 0.0)), rel_tol=1e-9)
+    assert math.isclose(capped, 0.25, rel_tol=1e-6)      # one of four joints
+    assert math.isclose(at((HEAD_VEL_CAP,) * 4), 1.0, rel_tol=1e-9)
+    assert at((400.0,) * 4) == 1.0, "the cost must saturate at 1.0"
+    # Sign-blind: swinging the head left costs what swinging it right costs.
+    assert math.isclose(at((0.0, 0.0, 3.0, 0.0)), at((0.0, 0.0, -3.0, 0.0)),
+                        rel_tol=1e-9)
+    # It reaches the pitch pair too — that is the whole reason it exists.
+    assert at((3.0, 0.0, 0.0, 0.0)) > 0.0 and at((0.0, 3.0, 0.0, 0.0)) > 0.0
 
 
 def test_foot_lift_cost_fires_on_sustained_contact_loss():
@@ -464,14 +603,22 @@ def _drive(env, traj):
     step. Placing before the tick keeps one `_bow_update` per step, which is
     what the one-shot terms (phase credits, `risen`) are counted on."""
     t = float(env.episode_length_buf[0] + 1) * env.step_dt
-    z, nose_down, head, legs = traj(t)
+    out = traj(t)
+    # A trajectory may add a 5th element, (head_yaw, head_roll) — the two
+    # joints v4 left free, which only the v5 strategies below ever move.
+    (z, nose_down, head, legs), yaw_roll = out[:4], out[4] if len(out) > 4 else (0.0, 0.0)
     env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
     env._asset.data.root_link_quat_w = torch.tensor(
         [[math.cos(nose_down / 2), 0.0, math.sin(nose_down / 2), 0.0]])
     q = torch.zeros(1, 14)
     q[0, 5], q[0, 6] = head
+    q[0, 7], q[0, 8] = yaw_roll
     for j, v in legs.items():
         q[0, j] = v
+    # A REAL joint velocity, by finite difference, so `head_joint_vel` (v5) is
+    # charged honestly in the four-strategy arithmetic: the textbook bow is the
+    # only strategy whose head actually moves, and it must still win anyway.
+    env._asset.data.joint_vel = (q - env._asset.data.joint_pos) / env.step_dt
     env._asset.data.joint_pos = q
     env.tick()
 
@@ -662,6 +809,12 @@ def _episode(traj, terminate_s=None):
                 microduck_mdp.bow_pitch_reward(env, **_cfg_params("bow_pitch"))[0]),
             "bow_head": w("bow_head") * float(
                 microduck_mdp.bow_head_reward(env, **_cfg_params("bow_head"))[0]),
+            "bow_head_still": w("bow_head_still") * float(
+                microduck_mdp.bow_head_still_reward(
+                    env, **_cfg_params("bow_head_still"))[0]),
+            "head_joint_vel": w("head_joint_vel") * float(
+                microduck_mdp.bow_head_vel_penalty(
+                    env, **_cfg_params("head_joint_vel"))[0]),
             "bow_upright": w("bow_upright") * float(
                 microduck_mdp.bow_upright_reward(env, **_cfg_params("bow_upright"))[0]),
             "stand_pose": w("stand_pose") * float(
@@ -720,7 +873,14 @@ def test_the_four_strategies():
                         book_ph[microduck_mdp.BOW_PHASE_DIP], rel_tol=1e-6)
     assert math.isclose(low_ph[microduck_mdp.BOW_PHASE_HOLD],
                         book_ph[microduck_mdp.BOW_PHASE_HOLD], rel_tol=1e-6)
-    assert low_t < 0.7 * book_t, (low_t, book_t)
+    # v5 loosened this bound from 0.7 to 0.75 and the reason is arithmetic, not
+    # a weakening: `bow_head_still` pays +2.0 every step to EVERY strategy whose
+    # head is where it belongs, parked ones included, which adds the same 400
+    # points to both sides and dilutes the RATIO while leaving the margin alone.
+    # The margin is what the policy actually optimizes, so it is asserted too —
+    # in points (below, unchanged from v4's 728) and per step (point 4).
+    assert low_t < 0.75 * book_t, (low_t, book_t)
+    assert book_t - low_t > 700.0, (book_t, low_t)
     # Every park stays POSITIVE overall: a half-done trick is worth less than a
     # whole one, but it must never be worth less than quitting (that inversion
     # is precisely what v3 built, and the policy quit).
@@ -748,6 +908,64 @@ def test_the_four_strategies():
                 (("book", book_t), ("high", high_t), ("low", low_t))}
     assert per_step["book"] > per_step["low"] + 3.0, per_step
     assert per_step["book"] > per_step["high"] + 3.0, per_step
+
+
+def _thrash(t):
+    """WHAT BOW-V4 ACTUALLY DID: a textbook bow — right height, right pitch,
+    right head DIP, feet planted — with the head also swinging hard about yaw
+    and roll the whole way through, "like it's going to break its own neck".
+
+    A 2 Hz swing across most of head_roll's +/-0.44 rad range and a wide arc of
+    head_yaw's +/-2.97 rad, i.e. a peak joint speed well past HEAD_VEL_CAP. Under
+    the v4 stack this scored EXACTLY what a clean bow scored, because no term in
+    that stack read joints 7 or 8 at all."""
+    z, nose_down, head, legs = _textbook(t)
+    w = 2.0 * math.pi / 0.5
+    return z, nose_down, head, legs, (1.5 * math.sin(w * t), 0.4 * math.sin(w * t))
+
+
+def test_the_thrashing_head_now_loses():
+    """The v5 thesis, measured against the strategy it was written to beat.
+
+    bow-v4 rendered a correct bow with a head rotating wildly through it. That
+    was not a training accident: `bow_head` prices neck_pitch and head_pitch
+    only, so head_yaw and head_roll were free, and a free joint on a head this
+    heavy is a free counterweight that buys trunk stability the trunk terms pay
+    for."""
+    book, _ = _episode(_textbook)
+    thrash, _ = _episode(_thrash)
+    v5 = ("bow_head_still", "head_joint_vel")
+
+    # 1. UNDER THE v4 STACK THE TWO ARE INDISTINGUISHABLE. This is the bug, in
+    #    one assertion: every v4 term scores a thrashing head exactly as it
+    #    scores a still one.
+    for k in book:
+        if k in v5:
+            continue
+        assert math.isclose(book[k], thrash[k], abs_tol=1e-6), k
+
+    # 2. …and the two v5 terms separate them, from both sides: the still head
+    #    collects the position reward the thrashing one forfeits, and the
+    #    thrashing one pays a speed cost the still one does not.
+    assert book["bow_head_still"] > 0.99 * 2.0 * int(STAND_END_S / 0.02)
+    # (not zero: a swinging head passes through centre twice a cycle and is
+    #  paid for the instants it is there — the term is a Gaussian, not a latch)
+    assert thrash["bow_head_still"] < 0.10 * book["bow_head_still"]
+    assert thrash["head_joint_vel"] < book["head_joint_vel"] < 0.0
+    assert sum(book.values()) > sum(thrash.values())
+
+    # 3. The gap is worth more per step than the whole action_rate_l2 bill that
+    #    was the only thing pricing the swing before — which is why -0.05 of
+    #    smoothness never came close to stopping it.
+    gap = (sum(book.values()) - sum(thrash.values())) / int(STAND_END_S / 0.02)
+    assert gap > 2.0, gap
+    assert gap > 10 * abs(_CFG.rewards["action_rate_l2"].weight)
+
+    # 4. But the bow-with-a-bad-head still beats not bowing: it is a worse bow,
+    #    not a failure. Costs that invert that ordering are how v3 taught the
+    #    policy to fall over instead.
+    low, _ = _episode(_park_low)
+    assert sum(thrash.values()) > sum(low.values())
 
 
 def test_rising_out_of_the_crouch_pays_at_every_millimetre():
