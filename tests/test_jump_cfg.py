@@ -469,6 +469,76 @@ def test_flight_is_paid_by_clearance_and_saturates_at_the_normaliser():
     assert math.isclose(_flight(env), 0.25, rel_tol=1e-6)
 
 
+def test_flight_is_paid_for_the_FIRST_flight_only():
+    """v2's single variable, and the whole of it.
+
+    v1 paid this term per airborne step with NO per-episode budget, so N hops
+    paid N times while `jp_land` — one shot, 0.30 s of settle — paid once and
+    only if the hopping stopped. jump-v1 duly POGOED: from iteration 500 to
+    1999 `Episode_Reward/jp_flight` sat at 16.6 of 25 on EVERY step (airborne
+    about two thirds of the episode), `jp_land` at 0.0003 and `jp_load` at
+    0.0000, and in the lab that pogo fell in 3 of 4 seeds. The flight income is
+    now a ONE-OFF."""
+    env = _FakeEnv()
+    env.tick(contacts=(1, 1))
+    first = 0.0
+    for _ in range(4):                        # hop one: paid in full
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+        first += _flight(env)
+    assert first == 4.0, first
+    assert math.isclose(first * W_FLIGHT, 100.0), "one hop is worth 100 points"
+    assert bool(env._jp_flight_used[0]) is False, (
+        "the latch closes when the flight ENDS, not while it is being flown")
+    env.tick(contacts=(1, 1), z=STAND_Z)
+    assert bool(env._jp_flight_used[0]) is True
+
+    second = 0.0
+    for _ in range(4):                        # hop two: identical, worth zero
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+        second += _flight(env)
+    assert second == 0.0, second
+    # ...and the apex it re-reaches is worth nothing either (a running maximum),
+    # so a second hop pays NOTHING while still costing a landing.
+    assert _apex(env) == 0.0
+
+
+def test_a_one_footed_touchdown_still_spends_the_episodes_flight():
+    """The latch closes on `~airborne` and not on `_jp_flight_end_t` (both feet
+    down, which is the LANDING timer's clock). The two differ for exactly one
+    trajectory — a pogo that touches one foot and re-launches without ever
+    putting both feet down — and that is the trajectory a both-feet-down latch
+    would leave free."""
+    env = _FakeEnv()
+    env.tick(contacts=(1, 1))
+    for _ in range(4):
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+    env.tick(contacts=(1, 0), z=0.116, feet_z=(0.0, 0.01))   # ONE foot, briefly
+    assert bool(env._jp_flight_used[0]) is True
+    assert float(env._jp_flight_end_t[0]) > 1e8, (
+        "both feet were never down, so the landing clock has not started")
+    again = 0.0
+    for _ in range(4):
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+        again += _flight(env)
+    assert again == 0.0
+
+
+def test_a_flicker_does_not_spend_the_episodes_flight():
+    """The latch closes on `_jp_flew`, which needs two airborne steps, so a
+    single step of contact chatter during the push does not burn the hop."""
+    env = _FakeEnv()
+    env.tick(contacts=(1, 1))
+    for _ in range(6):                        # chatter: one step off, one on
+        env.tick(contacts=(0, 0), z=STAND_Z, feet_z=(0.001, 0.001))
+        env.tick(contacts=(1, 1), z=STAND_Z)
+    assert bool(env._jp_flight_used[0]) is False
+    paid = 0.0
+    for _ in range(4):                        # the real hop, still worth 100
+        env.tick(contacts=(0, 0), z=0.128, feet_z=(0.02, 0.02))
+        paid += _flight(env)
+    assert math.isclose(paid * W_FLIGHT, 100.0)
+
+
 # ── the apex potential ───────────────────────────────────────────────────────
 
 def test_apex_is_a_monotone_potential_and_pays_once_per_millimetre():
@@ -785,12 +855,16 @@ def test_memory_rearms_on_a_fresh_episode():
     for _ in range(30):
         env.tick(contacts=(1, 1), z=STAND_Z, xy=(0.2, -0.1))
     assert bool(env._jp_flew[0]) and bool(env._jp_launched[0])
+    assert bool(env._jp_flight_used[0]), "the episode's one flight is spent"
     assert bool(env._jp_landed[0]) and float(env._jp_stagger[0]) > 0.0
     assert float(env._jp_apex[0]) > 0.0
 
     env.episode_length_buf[:] = 0                       # reset
     env.tick(contacts=(1, 1), z=STAND_Z, xy=(0.2, -0.1))
     assert bool(env._jp_flew[0]) is False, "the flight latch must re-arm"
+    assert bool(env._jp_flight_used[0]) is False, (
+        "...and so must the one-flight latch, or every episode after the "
+        "first would be unable to earn the flight at all")
     assert bool(env._jp_launched[0]) is False
     assert bool(env._jp_touched[0]) is True, (
         "...but only because this fresh step is itself on both feet: the "
@@ -887,6 +961,48 @@ def _textbook_hop():
     return steps[:_STEPS]
 
 
+def _pogo(settles: bool):
+    """WHAT jump-v1 ACTUALLY LEARNED, and the strategy v2 exists to demote.
+
+    Six hops of four control steps each, back to back: load, push, 80 ms of
+    flight at the lab-measured pogo apex (+11.5 mm), a hard landing at the
+    measured 32.4 deg, and straight into the next load. The lab numbers are
+    v1's own — flights of 80-100 ms, apex up to +11.5 mm — and this is the
+    CONSERVATIVE version of them: v1 was airborne about two thirds of every
+    episode (`jp_flight` 16.6 of 25 on every step), where six four-step hops
+    are airborne for 24% of it.
+
+    `settles`: whether the pogo ever stops. If it does, it stands for the rest
+    of the episode and collects `jp_land`; if it does not, it keeps bouncing on
+    the floor at 0.6 m/s — upright, both feet down, and never once settled —
+    which is what v1's `jp_land` of 0.0003 says it actually did."""
+    steps = []
+
+    def push_and_fly():
+        for z in (0.0985, 0.1090, 0.1210):        # the push, feet planted
+            steps.append(_flat(z=z))
+        for z in (0.1250, 0.1265, 0.1265, 0.1240):  # 80 ms off the floor
+            steps.append(dict(contacts=(0, 0), z=z, feet_z=(0.018, 0.018)))
+
+    def land_hard():
+        # the measured landing transient: three steps outside the 25 deg
+        # `alive` gate, and never inside the 15 deg finish cone.
+        for z, tilt in ((0.1050, 32.4), (0.0960, 30.0), (0.0920, 27.0)):
+            steps.append(_flat(z=z, tilt=tilt))
+
+    for z in (0.1080, 0.0980, 0.0920):            # the one load, before hop 1
+        steps.append(_flat(z=z))
+    push_and_fly()
+    for _ in range(5):
+        land_hard()
+        push_and_fly()
+    land_hard()
+    while len(steps) < _STEPS:
+        steps.append(_flat() if settles else
+                     _flat(z=STAND_Z + (0.006 if len(steps) % 2 else -0.006)))
+    return steps[:_STEPS]
+
+
 def _crouch_park():
     """bow v1's failure, in its strongest form: drop into the full 3 cm crouch
     immediately and hold it for the whole episode, collecting every point the
@@ -948,6 +1064,86 @@ def _crouch_and_fall():
         steps.append(_flat(z=STAND_Z - 0.010, tilt=25.0 + 3.5 * k))
     steps[-1]["fell"] = True
     return steps
+
+
+def _flight_without_the_latch(steps):
+    """`jp_flight` as v1 paid it: every airborne step, no per-episode budget.
+
+    The same formula the live term uses — both feet off, times the lower foot's
+    clearance over 12 mm — replayed over a strategy's own trajectory."""
+    total = 0.0
+    for state in steps:
+        if state.get("fell"):
+            break
+        if any(state.get("contacts", (1, 1))):
+            continue
+        feet = state.get("feet_z", (0.0, 0.0))
+        total += W_FLIGHT * min(min(feet) / CLEARANCE_M, 1.0)
+    return total
+
+
+def test_the_pogo_now_loses_to_one_hop():
+    """THE FINDING, and the fix, in one test.
+
+    jump-v1, iterations 500-1999: mean episode length 99.3 of 100, `fell_over`
+    0.4 per iteration, `alive` 2.94 of 3 — a healthy, upright, surviving policy
+    — and `Episode_Reward/jp_flight` 16.6 of 25 ON EVERY STEP, `jp_land`
+    0.0003, `jp_load` 0.0000. It was airborne about two thirds of the episode.
+    It had learned to POGO, because v1 paid the flight per airborne step with
+    no per-episode limit: continuous hopping simply out-earns one hop and a
+    landing, and the landing bonus never fires because the duck never settles.
+    In the lab that pogo fell in 3 of 4 seeds.
+
+    v2 pays `jp_flight` during the FIRST genuine flight only. Nothing else
+    changes."""
+    hop = _episode(_textbook_hop())
+    pogo = _episode(_pogo(settles=True))
+    bounce = _episode(_pogo(settles=False))
+    park = _episode(_crouch_park())
+    still = _episode(_stand_still())
+    tot = lambda d: sum(d.values())
+
+    # 1. UNDER v1 THE POGO WON, AND NOT NARROWLY. Six hops paid six times.
+    v1_hop = tot(hop) - hop["jp_flight"] + _flight_without_the_latch(
+        _textbook_hop())
+    v1_pogo = tot(bounce) - bounce["jp_flight"] + _flight_without_the_latch(
+        _pogo(settles=False))
+    assert math.isclose(v1_pogo - tot(bounce), 500.0, abs_tol=1.0), (
+        "five extra hops x four steps x 25 points that v2 no longer pays")
+    assert v1_pogo > 2.0 * v1_hop, (v1_pogo, v1_hop)
+
+    # 2. UNDER v2 THE SINGLE HOP WINS. The pogo's six hops are worth exactly
+    #    one hop of flight and one hop of apex between them, and the five extra
+    #    landings are pure cost.
+    assert math.isclose(pogo["jp_flight"], 100.0, abs_tol=1e-6), (
+        "one flight, four steps, saturated clearance — the same 100 points the "
+        "textbook hop earns for hopping ONCE")
+    assert math.isclose(pogo["jp_flight"], hop["jp_flight"], abs_tol=1e-6)
+    assert math.isclose(pogo["jp_apex"], 11.5, abs_tol=0.1), (
+        "the lab-measured pogo apex, +11.5 mm, banked once")
+    assert tot(hop) > tot(pogo) > tot(bounce)
+    assert tot(hop) - tot(pogo) > 40.0, (tot(hop), tot(pogo))
+
+    # 3. The only thing separating the two pogos is the landing bonus — which
+    #    is the term that pays for STOPPING, and the term v1 logged at 0.0003.
+    assert math.isclose(tot(pogo) - tot(bounce), W_LAND, abs_tol=1e-6)
+    assert pogo["jp_land"] == W_LAND and bounce["jp_land"] == 0.0
+
+    # 4. Both pogos still beat the parks, and that is CORRECT: a pogo did leave
+    #    the floor once, and a policy walking back from six hops to one must
+    #    never have to cross a valley to get there. The gradient it now sees is
+    #    monotone — every hop it deletes after the first saves a hard landing
+    #    and costs nothing, and stopping altogether pays +15.
+    for parked in (park, still):
+        assert tot(bounce) > tot(parked), (tot(bounce), tot(parked))
+    assert tot(bounce) - tot(park) > 25.0
+
+    # 5. The pogo's bill is its LANDINGS: six transients at the measured
+    #    32.4 deg, 18 steps outside the 25 deg `alive` gate, against the
+    #    textbook hop's three.
+    assert math.isclose(pogo["alive"], 246.0, abs_tol=1e-6), pogo["alive"]
+    assert math.isclose(hop["alive"], 291.0, abs_tol=1e-6)
+    assert pogo["jp_load"] < 2.0, "the load window dies at the first flight"
 
 
 def test_the_arithmetic_hopping_wins():

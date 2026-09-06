@@ -9871,7 +9871,9 @@ class PivotCommandCfg(VelocityCommandCommandOnlyCfg):
 # WHAT EACH TERM IS FOR, in one line each (the full table is in the cfg
 # docstring):
 #   `jp_flight_reward`  the hop itself, gated on BOTH feet off and paid by
-#                       clearance — the term the whole recipe turns on.
+#                       clearance — the term the whole recipe turns on. v2:
+#                       paid during the FIRST genuine flight of an episode
+#                       only, because v1 learned to pogo (see `_jp_update`).
 #   `jp_apex_reward`    potential-based height, advancing ONLY while airborne:
 #                       a stride bounce banks nothing.
 #   `jp_land_bonus`     one shot, conditioned on a PRIOR genuine flight.
@@ -9989,6 +9991,10 @@ def _jp_update(
       ``_jp_flew``       latched once both feet have been off for
                          ``flight_min_s`` — "a genuine flight happened", the
                          precondition for the landing bonus.
+      ``_jp_flight_used`` v2's latch: the first genuine flight is OVER, so
+                         `jp_flight_reward` pays nothing for the rest of the
+                         episode. The whole of v2 — v1 paid the flight per
+                         airborne step with no budget and learned to pogo.
       ``_jp_flight_end_t`` the time the FIRST genuine flight ended (both feet
                          back down). Large until then.
       ``_jp_apex``       the apex POTENTIAL: the running maximum of
@@ -10024,6 +10030,7 @@ def _jp_update(
         env._jp_launched = torch.zeros(n, dtype=torch.bool, device=dev)
         env._jp_stagger = torch.zeros(n, device=dev)
         env._jp_flew = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_flight_used = torch.zeros(n, dtype=torch.bool, device=dev)
         env._jp_flight_end_t = torch.full((n,), 1.0e9, device=dev)
         env._jp_apex = torch.zeros(n, device=dev)
         env._jp_prev_apex = torch.zeros(n, device=dev)
@@ -10056,6 +10063,7 @@ def _jp_update(
     env._jp_touched = env._jp_touched & ~fresh
     env._jp_launched = env._jp_launched & ~fresh
     env._jp_flew = env._jp_flew & ~fresh
+    env._jp_flight_used = env._jp_flight_used & ~fresh
     env._jp_landed = env._jp_landed & ~fresh
     env._jp_just_landed = env._jp_just_landed & ~fresh
     env._jp_stagger = torch.where(fresh, torch.zeros_like(env._jp_stagger),
@@ -10117,6 +10125,27 @@ def _jp_update(
     ended = env._jp_flew & env._jp_grounded & (env._jp_flight_end_t > 1.0e8)
     env._jp_flight_end_t = torch.where(ended, env._jp_t, env._jp_flight_end_t)
 
+    # ── ONE FLIGHT PER EPISODE (v2's single variable) ───────────────────────
+    # v1 paid `jp_flight` per airborne step with NO per-episode budget, and the
+    # policy found the consequence: POGO. Over iterations 500-1999 of jump-v1
+    # `Episode_Reward/jp_flight` sat at 16.6 of 25 EVERY STEP — airborne about
+    # two thirds of the episode — with `jp_land` at 0.0003 and `jp_load` at
+    # 0.0000: continuous hopping out-earned one hop and a landing several times
+    # over, and the landing bonus never fired because the duck never settled.
+    # In the lab that pogo fell in 3 of 4 seeds (flights of 80-100 ms, apex up
+    # to +11.5 mm). So the flight income is now a ONE-OFF: paid during the
+    # first genuine flight of an episode and never again.
+    #
+    # The latch closes when that flight ENDS — the first step after `_jp_flew`
+    # on which the duck is no longer airborne — and NOT when both feet are back
+    # down, which is what `_jp_flight_end_t` (the landing timer's clock) uses.
+    # The two differ for exactly one trajectory: a one-footed touch that
+    # re-launches without ever putting both feet down, i.e. the pogo variant a
+    # both-feet-down latch would leave free. `_jp_air_s` already resets on ANY
+    # contact, so `~airborne` IS "the flight is over" as the rest of the block
+    # measures it.
+    env._jp_flight_used = env._jp_flight_used | (env._jp_flew & ~airborne)
+
     # ── The apex potential: airborne-only, running max ──────────────────────
     # THE anti-farm. `run-v2` reaches 0.1277 m of trunk height mid-stride with
     # a foot planted — 81% of the best hop's apex — so a potential that
@@ -10152,9 +10181,21 @@ def jp_flight_reward(
     clearance_m: float = JP_CLEARANCE_M,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0..1 per step: THE HOP. Both feet off the floor, paid by clearance.
+    """0..1 per step: THE HOP. Both feet off the floor, paid by clearance,
+    and ONLY DURING THE FIRST GENUINE FLIGHT OF THE EPISODE.
 
-    ``both_feet_off × clip(min(foot site z) / clearance_m, 0, 1)``.
+    ``first_flight × both_feet_off × clip(min(foot site z) / clearance_m, 0, 1)``.
+
+    THE ONE-OFF IS v2, AND IT IS WHAT v1 GOT WRONG. Paid per airborne step with
+    no per-episode budget, this term makes CONTINUOUS HOPPING out-earn one hop
+    and a landing: N hops pay N times, while `jp_land` (one shot, 0.30 s of
+    settle) pays once and only if the hopping stops. jump-v1 duly pogoed —
+    `Episode_Reward/jp_flight` 16.6 of 25 on EVERY step from iteration 500 to
+    1999, airborne about two thirds of the episode, `jp_land` 0.0003, `jp_load`
+    0.0000, and 3 of 4 lab seeds fell. With the latch, hop number two pays
+    exactly zero while still costing a hard landing's worth of `alive`, so the
+    argmax moves back to one hop and a settle. Same shape as `jp_apex`'s
+    running maximum and `jp_land`'s one shot: a milestone, not an income.
 
     THE GATE IS THE WHOLE TERM. The measured alternative — a trained runner's
     stride bounce — reaches a trunk z of 0.1277 m, 81% of the best hop's apex,
@@ -10171,11 +10212,16 @@ def jp_flight_reward(
     scripted hop; the lab's `airflip._af_airborne` uses 0.06 m, which this body
     cannot reach at any schedule and which would make the term binary.
 
-    Not duration-gated: a hop this short (3-4 control steps) has no room for a
-    minimum-flight rule that is not also a rule against the hop."""
+    Not duration-gated WITHIN the first flight: a hop this short (3-4 control
+    steps) has no room for a minimum-flight rule that is not also a rule
+    against the hop. The one-off latch closes on `_jp_flew`, which needs two
+    airborne steps, so a single step of contact chatter does not spend the
+    episode's one flight."""
     _jp_update(env, sensor_name, feet_cfg, asset_cfg)
-    return env._jp_airborne.float() * torch.clamp(
-        env._jp_clear / max(clearance_m, 1e-6), 0.0, 1.0
+    return (
+        env._jp_airborne.float()
+        * (~env._jp_flight_used).float()
+        * torch.clamp(env._jp_clear / max(clearance_m, 1e-6), 0.0, 1.0)
     )
 
 

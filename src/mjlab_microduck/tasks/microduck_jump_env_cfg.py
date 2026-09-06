@@ -108,7 +108,8 @@ asserts it; the run check is that every `Episode_Reward/<penalty>` is <= 0.
     everything a hop can earn (~130). The gate is 25 deg and not the pivot's 15
     because the measured hop peaks at 32.4 deg on its own landing; 25 deg still
     costs it ~9 of the 300, which is the right size for a nudge.
-  * `jp_flight` +25.0/step, GATED ON BOTH FEET OFF, paid by
+  * `jp_flight` +25.0/step, GATED ON BOTH FEET OFF and ON THE FIRST GENUINE
+    FLIGHT OF THE EPISODE (v2's single variable — see below), paid by
     `clip(min(foot site z) / 0.012, 0, 1)`. The hop itself. The gate is the
     whole term (see the ungated table below); the 0.012 m normaliser is the
     measured 8-10 mm flat-foot clearance, where the lab's `_af_airborne` uses
@@ -119,7 +120,10 @@ asserts it; the run check is that every `Episode_Reward/<penalty>` is <= 0.
     ungated that free fall would pay this term at a saturating clearance,
     advance the apex potential, arm the landing bonus without a hop and switch
     `jp_load` off permanently at t = 0. Every airborne test is ANDed with a
-    touched-down latch, exactly as the bow gates its foot-lift cost.
+    touched-down latch, exactly as the bow gates its foot-lift cost. AND the
+    SECOND thing v1 had to learn the hard way: paid per airborne step with no
+    PER-EPISODE budget, this term makes continuous hopping out-earn one hop and
+    a landing, which is exactly what v1 did.
   * `jp_apex` +15.0, POTENTIAL-BASED on `clip((z - 0.115)/0.015, 0, 1)`,
     advancing only while airborne. Pays each new maximum once — holding pays
     zero, re-climbing pays zero, overshoot pays zero. bow v4's lesson stated
@@ -218,13 +222,16 @@ the bow's `collapsed` termination must NOT be copied across.
 ── The arithmetic: the stack scored over whole 2 s episodes ─────────────────
 Per-episode totals (mjlab's `Episode_Reward/x` x 100). The design note scored
 these on RECORDED trajectories (protocol step 2); the numbers below are what
-`tests/test_jump_cfg.py::test_the_arithmetic_hopping_wins` measures by running
-the REAL reward functions over synthetic reconstructions of those same
-trajectories for all 100 steps (protocol step 4: synthetic arithmetic is a
-sanity check on the ORDERING, never the reason to launch).
+`tests/test_jump_cfg.py::test_the_arithmetic_hopping_wins` and
+`::test_the_pogo_now_loses_to_one_hop` measure by running the REAL reward
+functions over synthetic reconstructions of those same trajectories for all 100
+steps (protocol step 4: synthetic arithmetic is a sanity check on the ORDERING,
+never the reason to launch).
 
   strategy                        steps  alive  flight  apex  land  load   term    total
   textbook hop (best, lands)        100    291   100.0  13.5  15.0   2.8      0    422.3
+  POGO, 6 hops, then settles        100    246   100.0  11.5  15.0   1.2      0    373.7
+  POGO, 6 hops, never settles       100    246   100.0  11.5     0   1.2      0    358.7
   crouch-and-park that holds        100    300       0     0     0  20.0      0    320.0
   stand still                       100    300       0     0     0     0      0    300.0
   trained runner (stride bounce)    100    300       0     0     0     0      0    300.0
@@ -232,9 +239,20 @@ sanity check on the ORDERING, never the reason to launch).
   hop that lands and falls           50    120    52.4  15.0     0   2.1   -100     89.4
   crouch-and-fall                    47    102       0     0     0   6.3   -100      8.3
 
-ORDERING: hop (422) > crouch-park (320) > still ~= runner (300) > tall park
-(288) >> hop-and-fall (89) > crouch-and-fall (8). The margin from the best
-non-hop to the hop is +102 (32%); a fall costs -333 relative to the hop.
+ORDERING: hop (422) > pogo-that-settles (374) > pogo (359) > crouch-park (320)
+> still ~= runner (300) > tall park (288) >> hop-and-fall (89) >
+crouch-and-fall (8). The margin from the best non-hop to the hop is +102 (32%);
+a fall costs -333 relative to the hop.
+
+THE TWO POGO ROWS ARE v2's, and they are the point of the version: under v1's
+per-step flight the same pogo scored 858.7 against the textbook hop's 423.2 —
+it won by more than 2x, because its six hops paid six times. Under v2 they pay
+ONCE between them (100 points, the same as hopping once) while still costing
+six hard landings' worth of `alive`. Note the pogos still beat the parks, and
+that is CORRECT: a pogo did leave the floor, and a policy walking back from six
+hops to one must not have to cross a valley to get there. The gradient it now
+sees is monotone — every hop deleted after the first saves a landing transient
+and costs nothing, and stopping altogether pays the +15 landing bonus.
 
 The test's synthetic reconstruction reproduces every row of that table within a
 point (423.2 / 320.0 / 300.0 / 300.0 / 300.0 / 89.6 / 8.7) with ONE exception:
@@ -305,6 +323,100 @@ with <= 1 fall. If `jp_flight` is below 0.1 at iteration 1500 the run is dead an
 v2's single variable is the `jp_load` window; if `jp_flight` is healthy and the
 falls are on landing, the variable is `jp_land`'s tolerance band.
 
+── v1 POGOED ───────────────────────────────────────────────────────────────
+THE FINDING (jump-v1, job 6a9d67bfe686246ca69a5970, iterations 500-1999, read
+off the training curve). The survival half of the recipe worked exactly as
+predicted: mean episode length 99.3 of 100, `Episode_Termination/fell_over` 0.4
+per iteration, `alive` 2.94 of 3. Pivot v5's arithmetic transferred.
+
+And then:
+
+    Episode_Reward/jp_flight    16.6 of 25   ON EVERY STEP
+    Episode_Reward/jp_land       0.0003
+    Episode_Reward/jp_load       0.0000
+
+`jp_flight` at two thirds of its per-step maximum, held for 1500 iterations, is
+not a hop. It is a duck AIRBORNE ABOUT TWO THIRDS OF THE EPISODE. The policy
+had learned to POGO — and `jp_land` at 0.0003 and `jp_load` at 0.0000 say the
+same thing from the other side: it never settled after a flight (so the landing
+bonus never fired), and it never spent a step in the pre-flight crouch window
+(so it was already hopping when the episode began). In the lab, under BAM,
+observation noise and DR, the pogo FELL IN 3 OF 4 SEEDS: flights of 80-100 ms,
+apex up to +11.5 mm, and no landing it could hold.
+
+WHY, IN ONE LINE. `jp_flight` was paid per airborne step with NO PER-EPISODE
+LIMIT, so N hops paid N times — while `jp_land`, the term that pays for
+STOPPING, is one shot and needs 0.30 s of settle. Six hops earn six flights;
+one hop and a landing earn one flight and 15 points. Continuous hopping simply
+out-earns the trick the ticket asked for. The prediction above ("jp_flight
+0.3-0.8 ... IT WILL NOT REACH ITS CAP") was right about the ceiling and wrong
+about what the ceiling meant: 0.66 of the cap was never going to be one 80 ms
+flight in a 2 s episode, and reading it as a strong hop instead of as a duty
+cycle is the mistake to not repeat. THE LESSON, which is `jp_apex`'s own lesson
+in a place it had not been applied: a per-step income for a MOMENT is a duty
+cycle, not a moment. `jp_apex` already knew this (a running maximum: rising
+pays, re-climbing pays zero) and `jp_land` already knew it (one shot, "it
+cannot be farmed by bouncing"). `jp_flight` was the one term in the stack still
+paying by the second.
+
+── v2: ONE FLIGHT PER EPISODE ──────────────────────────────────────────────
+THE FIX, and it is the only change in this version. `_jp_update` keeps a
+`_jp_flight_used` latch, set the first step after a GENUINE flight (>= 2
+airborne steps, after the touched-down latch has closed) on which the duck is
+no longer airborne; `jp_flight_reward` returns zero once it is set. Hop number
+two, and every hop after it, pays exactly nothing.
+
+Three details that are deliberate, not incidental:
+
+  * THE LATCH CLOSES ON `~airborne`, NOT ON `_jp_flight_end_t`. The landing
+    timer's clock starts when BOTH FEET are back down; the flight budget closes
+    when the flight ends, i.e. when either foot touches. The two differ for one
+    trajectory only — a pogo that brushes one foot and re-launches without ever
+    putting both feet down — and that is precisely the variant a both-feet-down
+    latch would leave free to farm.
+  * IT CLOSES ON `_jp_flew`, WHICH NEEDS TWO AIRBORNE STEPS. A single step of
+    contact chatter during the push does not spend the episode's one flight.
+  * NOTHING ELSE MOVES. No weight, no tolerance, no gate, no window. The apex
+    potential already saturates (a running maximum: the pogo's second hop banks
+    nothing), and `jp_land` already requires the first flight to have ENDED and
+    0.30 s of settle, so neither needed a second latch. One variable.
+
+PREDICTION FOR v2 (written before launch, per the protocol):
+
+  * ONE HOP EARLY IN THE EPISODE, THEN STANDING. The manoeuvre moves back to
+    the front of the episode — where `jp_load`'s 0.8 s window puts it — and the
+    remaining ~1.3 s is spent settled.
+  * MEAN EPISODE LENGTH ~100 and `fell_over` under 1 per iteration, i.e. v1's
+    survival numbers UNCHANGED. Nothing in this version touches `alive`,
+    `terminated` or any termination, and if the length drops the latch has
+    reached somewhere it should not have.
+  * `Episode_Reward/jp_flight` PER-STEP MEAN UNDER 3 (of 25). One 60-80 ms
+    flight in a 100-step episode is 3-4 airborne steps at 0.7-1.0 of the
+    clearance normaliser, i.e. 70-100 points an episode = 0.7-1.0 per step;
+    under 3 is the loose band that says "one hop", and v1's 16.6 is the number
+    it has to fall from. If it stays above 5 the latch is not doing its job and
+    the trajectory to look at is a one-footed pogo.
+  * `Episode_Reward/jp_land` FIRING IN MOST EPISODES — 0.08-0.13 (of 15.0),
+    against v1's 0.0003. This is the term the fix is for: with the extra hops
+    worth nothing, the only thing left to earn after the first flight is the
+    landing.
+  * `jp_load` back off the floor (0.01-0.05): the crouch is once again a
+    prelude that happens inside the window rather than something the episode
+    started past.
+  * The failure mode to watch for is the SAME ONE IN NEW CLOTHES: the flight
+    income is now bounded at ~100 points, so a policy that finds hopping hard
+    can bank 300 of `alive` by never leaving the floor. If `jp_flight` collapses
+    toward 0 while `alive` stays at 3.0, v3's variable is `jp_load`'s window
+    (the exploration rung), not this latch.
+
+VERDICT RULE for v2. The run works if the lab eval (`render-rollout`, 4 seeds,
+BAM + noise + DR) shows a FLIGHT OF 40-100 ms and an APEX >= 8 mm that LANDS
+WITHOUT FALLING ON 3 OF 4 SEEDS. Anything that hops more than twice in an
+episode means the latch is being circumvented — read the contact trace before
+touching a weight. If it hops once and still falls on landing, the flight is
+fine and v3's variable is `jp_land`'s tolerance band, exactly as v1's verdict
+rule already said.
+
 Open question carried from the design note: the head throw. 38% of the mass is
 in the head (`airflip._af_head_throw` exists for that reason), but a scripted
 +/-0.5 rad neck/head swing through the launch changed the apex by -2 to +1 mm —
@@ -366,10 +478,12 @@ assert abs(LOAD_CAP_POINTS - 20.0) < 1e-9
 W_ALIVE = 3.0        # pivot v5's term at pivot v5's weight, gated at 25 deg (not
                      # 15): the measured hop peaks at 32.4 deg on its own
                      # landing. 100 steps = 300 points a fall forfeits.
-W_FLIGHT = 25.0      # THE TERM. Both feet off, paid by clearance / 0.012 m.
-                     # Ungated, the trained runner takes 1352 of it for a gait
-                     # that never leaves the floor and wins the stack 1665 to
-                     # 616. The gate is not negotiable.
+W_FLIGHT = 25.0      # THE TERM. Both feet off, paid by clearance / 0.012 m,
+                     # ONCE PER EPISODE. Ungated, the trained runner takes 1352
+                     # of it for a gait that never leaves the floor and wins the
+                     # stack 1665 to 616; unbudgeted, v1's pogo took 600 and
+                     # beat the textbook hop 859 to 423. Neither limit is
+                     # negotiable, and the WEIGHT is unchanged in v2.
 W_APEX = 15.0        # potential-based, airborne-only. With APEX_M = 0.015 this
                      # is exactly one point per millimetre of apex, capped at 15.
 W_LAND = 15.0        # one shot, conditioned on a prior flight. Pivot v5's
@@ -484,6 +598,10 @@ def make_microduck_jump_env_cfg(
     # clearance so a step of contact chatter earns almost nothing. The trained
     # runner reaches 81% of the hop's apex with a foot planted and takes ZERO of
     # this; ungated it takes 1352 and wins the stack outright.
+    # v2: and paid only during the FIRST genuine flight of the episode. v1 paid
+    # it per airborne step with no per-episode budget and learned to POGO —
+    # `jp_flight` 16.6 of 25 on EVERY step, `jp_land` 0.0003, 3 of 4 lab seeds
+    # falling. Six hops now pay what one hop pays.
     cfg.rewards["jp_flight"] = RewardTermCfg(
         func=microduck_mdp.jp_flight_reward,
         weight=W_FLIGHT,
