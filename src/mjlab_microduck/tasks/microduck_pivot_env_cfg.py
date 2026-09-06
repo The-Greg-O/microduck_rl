@@ -31,9 +31,12 @@ So the turn direction rides the twist YAW slot (obs[50]) as a ±1 FLAG:
   * in training, `microduck_mdp.PivotCommand` samples the sign per env at
     reset and writes it into the pinned command, so the network sees it in the
     observation exactly as it will on the robot;
-  * `_pv_update` latches that sign for the episode and derives the pin foot
-    from it — the pin is the INSIDE foot of the turn, so +1 (counter-clockwise,
-    turning left) pivots on the LEFT foot and -1 on the right;
+  * `_pv_update` latches that sign for the episode, folds it into ONE signed
+    rate (`_pv_omega` = dir × body-frame omega_z, + = the commanded way) that
+    every direction-aware term reads, and derives the pin foot from it — the
+    pin is the INSIDE foot of the turn, so +1 (counter-clockwise, turning left)
+    pivots on the LEFT foot (site/contact slot 0, measured at +4.18 cm, the
+    robot's left) and -1 on the right;
   * at deploy time ONE onnx installs as two skill entries, `pivot-left` with
     `command = [0, 0, 1]` and `pivot-right` with `[0, 0, -1]`.
 
@@ -63,17 +66,22 @@ On robot_walk.xml at the STAND keyframe, feet flat:
 ── Reward design, in the playbook's terms ───────────────────────────────────
   * `pivot_progress` pays Δ(accumulated yaw) — potential-based, so holding
     still pays zero and nothing can be farmed; capped per step (no pay for
-    violence past ~1 turn/s) and capped in total at one turn.
+    violence past ~1.5 turns/s) and capped in total at one turn.
   * `pivot_complete` is ONE step, not a per-step "you are done" — that would be
     the jackpot the playbook warns about and would buy a ballistic whip. Speed
     is bought by the SETTLE phase instead: finish early and more of the 4 s is
     spent collecting settle pay, which only pays while upright, stopped, on
     both feet and back in the STAND pose.
   * `pin` is what makes this a PIVOT and not a spin, and it is weighted to say
-    so. Per step during the turn a pivot collects pin 3.0 + paddle 1.0 ≈ 4.0
-    while a two-footed spin collects ~0 of the pin pay AND pays the two pin
-    costs (-2.0 displacement, -0.5 slip): a ~5.5/step gap on an otherwise
-    identical progress score, over ~150 steps. Nothing subtle about it.
+    so — but it pays ONLY WHILE THE POTENTIAL IS RISING (it is multiplied by
+    the step's progress rate). Version 1 paid it unconditionally, which made
+    standing still the argmax of the whole stack: contact × stay is maximal for
+    a robot that never moves, so "pin 3.0 + height 1.0 + upright 2.0 ≈ 6/step
+    for doing nothing" beat every attempt at a turn, and checkpoint 2499 duly
+    stood there with both feet down 99% of frames. Happy spin never had this
+    problem because it has no pin term to make stillness lucrative. Gated on
+    progress, a pivot collects pin 2.0 + paddle ~1.5 per step of the turn while
+    a two-footed spin collects ~0 of the pin pay AND pays the two pin costs.
   * `paddle` is tippy-taps' tap term with the roles split: it pays the FREE
     foot for being mid-stroke, in an air-time window, while the pin is planted
     and the turn is unfinished. Air time resets on contact, so every paid
@@ -83,6 +91,24 @@ On robot_walk.xml at the STAND keyframe, feet flat:
   * `settle` is a PRODUCT (stopped × pose × both feet down), not a sum: an
     additive stack has a compromise basin where a still-turning one-legged
     crouch keeps most of it.
+  * `stall` makes standing still LOSE rather than merely not-win: a bounded
+    cost that ramps in after 0.5 s without progress, during the spin phase
+    only, resetting the instant the turn advances. AGENTS.md's rule is that an
+    attempt-TAX during discovery makes "do nothing" win; the inverse is a
+    do-nothing tax, which makes attempting win.
+  * `counter_yaw` is the SIGN FIX. The ±1 flag in the twist yaw slot was
+    one-sided — turning the commanded way paid, turning the opposite way was
+    free, and (through an un-floored raw integral) it also buried the potential
+    where the policy could not reach it. So the only direction-dependent
+    pressure on a policy that had not found the turn came from the pin/paddle
+    loading, which yaws the trunk AGAINST the command: measured -21°/-17° on
+    direction +1 and +28°/+33° on -1. The raw integral is now floored at zero
+    and the wrong-way rate is charged per step, bounded.
+  * DISCOVERY IS MADE CHEAP. The pin reward's std starts at 4 cm (a whole
+    footprint of slack) with the displacement cost at -0.5, and both tighten to
+    1.5 cm / -2.0 by iteration 1500 on phase-aligned stages; the paddle opens
+    at +3.0 so lifting the free foot pays from step one, instead of only
+    risking the pin, tilt and radius costs.
   * `foot_slip` is DELETED as a global term and re-added for the PIN ONLY. The
     paddle foot is supposed to scuff — that is the push. For the pin, slip is
     exactly what "planted" forbids.
@@ -133,27 +159,63 @@ PV_DIRECTION_CW = microduck_mdp.PV_DIRECTION_CW    # -1 = cw,  pin = RIGHT foot
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
 # ── Reward weights ───────────────────────────────────────────────────────────
-# The arithmetic (dt = 0.02, 200 steps). `pivot_progress` integrates to a FIXED
-# W_PROGRESS/dt = 200 over a completed turn however fast it is done, so the tie
-# is broken by the per-step stacks:
-#   pivoting   pin 3.0 + paddle ~1.0 + height 1.0 + upright 2.0   ≈ 7/step
-#   settled    pin 3.0 + settle 4.0 + height 1.0 + upright 2.0    ≈ 10/step
-#   spinning   pin ~0  + paddle 0    + height 1.0 + upright 2.0
-#              − displacement 2.0 − slip 0.5                      ≈ 0.5/step
-#   standing   pin 3.0 + height 1.0 + upright 2.0, no progress    ≈ 6/step
-# So: turning beats standing, finishing early beats dawdling, and pivoting
-# beats spinning by ~6.5/step over the ~150 steps a turn takes.
-W_PROGRESS = 4.0
+# THE ARITHMETIC (dt = 0.02, 200 steps, rate cap = 1.5 turns/s so a 1 turn/s
+# pivot scores `rate` = 2π/3π = 0.667 on every rate-scaled term).
+#
+# Version 1 of this table was wrong in one decisive place: it gave "standing"
+# the full pin pay. It does not any more — `pv_pin_reward` is multiplied by
+# this step's progress — and that single change is what turns the ranking over.
+# Per step of the SPIN phase, PIVOT-SPECIFIC terms only (height 1.0 + upright
+# 2.0 + head tracking are common to every row and cancel). These are MEASURED,
+# not estimated — `test_the_arithmetic_pivoting_wins` runs all three strategies
+# through the real reward functions at these weights:
+#
+#                                  still   pivoting   two-footed spin
+#   progress  6.0 × rate             0      +4.00        +4.00
+#   pin       3.0 × stay × rate      0      +2.00        +0.29  (slid: stay→0)
+#   paddle    3.0, in-window         0      +1.10         0     (pin airborne)
+#   stall    -2.0                  -1.62     0            0
+#   counter  -1.0                    0*      0            0
+#   pin displacement (-0.5 → -2.0)   0       0           -1.44
+#   pin slip -0.5                    0       0           -0.49
+#                                 ───────  ────────    ────────
+#                                  -1.62    +7.10       +2.37
+#   *the wrong-way wiggle checkpoint 2499 actually settled into pays the stall
+#    cost AND the counter cost, and collects nothing at all: it is the WORST
+#    row on the board, where in v1 it was the best.
+#
+# Settle phase (after the one-shot completion): progress / pin / paddle / stall
+# / pin displacement are all gated off by `_pv_done`, and settle 4.0 takes
+# over → +4.05/step.
+#
+# A whole 4 s episode, turning at 1 turn/s (49 steps of turn, 151 of settle):
+#   pivot   49 × 7.10 + 5.00 + 151 × 4.05 =  959
+#   spin    49 × 2.37 + 5.00 + 151 × 4.03 =  724
+#   still  200 × (-1.62)                  = -324
+# Pivoting beats standing by ~1283 and a two-footed spin by ~235, and finishing
+# early still wins because every step saved from the turn is a step of settle.
+# The ranking holds at BOTH ends of the pin curriculum (loose: 959 / 777 /
+# -324), which is what stops the loose early stage from teaching a spin.
+W_PROGRESS = 6.0
 W_COMPLETE = 5.0
 W_PIN = 3.0
 W_SETTLE = 4.0
-W_PADDLE = 1.0
+W_PADDLE = 3.0
 W_HEIGHT = 1.0
+# Opens loose (-0.5) so the first clumsy attempt at lifting the free foot is
+# affordable, tightened to -2.0 by iteration 1500 — phase-aligned with the pin
+# std curriculum below.
+W_PIN_DISPLACEMENT_START = -0.5
 W_PIN_DISPLACEMENT = -2.0
 W_PIN_SLIP = -0.5
 W_RADIUS = -1.5
 W_TILT = -0.5
+W_STALL = -2.0
+W_COUNTER_YAW = -1.0
 W_ACTION_RATE = -0.05
+
+# Curriculum boundary: the pin is loose until the turn exists, tight after.
+PIN_TIGHTEN_ITER = 1500
 
 
 def make_microduck_pivot_env_cfg(
@@ -243,7 +305,11 @@ def make_microduck_pivot_env_cfg(
     cfg.rewards["pin"] = RewardTermCfg(
         func=microduck_mdp.pv_pin_reward,
         weight=W_PIN,
-        params={**shared(), "pin_std": microduck_mdp.PV_PIN_STD_M},
+        # Starts at a whole footprint of slack; `pin_std` curriculum tightens
+        # it to the measured PV_PIN_STD_M by PIN_TIGHTEN_ITER. The pay is
+        # multiplied by this step's progress inside the function, so a still
+        # robot collects nothing however loose the std is.
+        params={**shared(), "pin_std": microduck_mdp.PV_PIN_STD_START_M},
     )
     cfg.rewards["paddle"] = RewardTermCfg(
         func=microduck_mdp.pv_paddle_reward,
@@ -281,7 +347,7 @@ def make_microduck_pivot_env_cfg(
     )
     cfg.rewards["pin_displacement"] = RewardTermCfg(
         func=microduck_mdp.pv_pin_displacement_penalty,
-        weight=W_PIN_DISPLACEMENT,
+        weight=W_PIN_DISPLACEMENT_START,
         params={**shared(), "saturate_m": microduck_mdp.PV_PIN_SAT_M},
     )
     cfg.rewards["pin_slip"] = RewardTermCfg(
@@ -303,6 +369,59 @@ def make_microduck_pivot_env_cfg(
         func=microduck_mdp.pv_tilt_penalty,
         weight=W_TILT,
         params=shared(),
+    )
+    # Standing still must LOSE, not merely fail to win: the pin no longer pays
+    # a motionless robot, and this charges it. Bounded, spin-phase only, timer
+    # resets the instant the potential moves.
+    cfg.rewards["stall"] = RewardTermCfg(
+        func=microduck_mdp.pv_stall_penalty,
+        weight=W_STALL,
+        params={
+            **shared(),
+            "grace_s": microduck_mdp.PV_STALL_GRACE_S,
+            "ramp_s": microduck_mdp.PV_STALL_RAMP_S,
+        },
+    )
+    # THE SIGN FIX. The ±1 flag in the twist yaw slot used to be one-sided —
+    # the commanded direction paid, the opposite direction was free — so the
+    # only direction-dependent pressure on a policy that had not found the turn
+    # came from the pin/paddle loading, which yaws the trunk the WRONG way.
+    # Charging the wrong-way rate makes obs[50] mean something from step one.
+    cfg.rewards["counter_yaw"] = RewardTermCfg(
+        func=microduck_mdp.pv_counter_yaw_penalty,
+        weight=W_COUNTER_YAW,
+        params={**shared(), "saturate_rate": microduck_mdp.PV_COUNTER_CAP},
+    )
+
+    # ── Discovery curricula: the pin is LOOSE until the turn exists ─────────
+    # AGENTS.md's proven split — `reward_weight` for weights, a dedicated params
+    # curriculum for everything else — and both ramps land on the same
+    # iterations so the pay and the cost tighten together (a phase-misaligned
+    # pair would tighten the cost while the pay was still slack, which is just a
+    # tax on attempting).
+    cfg.curriculum["pin_std"] = CurriculumTermCfg(
+        func=microduck_mdp.pv_pin_std_curriculum,
+        params={
+            "reward_name": "pin",
+            "std_stages": [
+                {"step": 0, "std": microduck_mdp.PV_PIN_STD_START_M},   # 4.0 cm
+                {"step": 600 * 24, "std": 0.030},
+                {"step": 1000 * 24, "std": 0.022},
+                {"step": PIN_TIGHTEN_ITER * 24, "std": microduck_mdp.PV_PIN_STD_M},
+            ],
+        },
+    )
+    cfg.curriculum["pin_displacement_weight"] = CurriculumTermCfg(
+        func=microduck_mdp.reward_weight,
+        params={
+            "reward_name": "pin_displacement",
+            "weight_stages": [
+                {"step": 0, "weight": W_PIN_DISPLACEMENT_START},
+                {"step": 600 * 24, "weight": -1.0},
+                {"step": 1000 * 24, "weight": -1.5},
+                {"step": PIN_TIGHTEN_ITER * 24, "weight": W_PIN_DISPLACEMENT},
+            ],
+        },
     )
 
     # Action smoothness stays LIGHT: the velocity recipe ramps this to -1.0 by

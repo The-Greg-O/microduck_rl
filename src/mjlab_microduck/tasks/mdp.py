@@ -8043,11 +8043,28 @@ def bow_drift_penalty(
 # a pivot has a PIN — one foot that stays exactly where it was, in contact, for
 # the whole turn — while the other paddles: lift, reach sideways, plant, push.
 # That distinction lives entirely in the pin terms (`pv_pin_reward` pays contact
-# × staying put, `pv_pin_displacement_penalty` / `pv_pin_slip_penalty` charge
-# moving) rather than in the progress term, which is the same potential-based
-# yaw integral happy spin uses. Weighted as in the cfg, a two-footed spin gives
-# up ~5 reward/step against a pivot: the pin pay collapses AND both pin costs
-# fire, while the paddle is worth only ~1.
+# × staying put × PROGRESS, `pv_pin_displacement_penalty` /
+# `pv_pin_slip_penalty` charge moving) rather than in the progress term, which
+# is the same potential-based yaw integral happy spin uses. Weighted as in the
+# cfg, a two-footed spin gives up ~4.5 reward/step against a pivot: the pin pay
+# collapses AND both pin costs fire.
+#
+# WHY THE FIRST RUN STOOD STILL (checkpoint 2499: both feet down 99% of frames,
+# <1.2 cm drift, total yaw ±20-30° and OPPOSITE to the command). Three things
+# conspired, and all three are fixed here:
+#   1. the pin paid its full weight for doing nothing — contact × stay is
+#      maximal for a robot that never moves — so "stand" scored ~6/step while
+#      the only term that required lifting a foot was undiscovered. The pin is
+#      now multiplied by this step's progress rate: stillness collects zero.
+#   2. nothing charged for the absence of a turn. `pv_stall_penalty` now does,
+#      bounded, during the spin phase only.
+#   3. the direction flag was ONE-SIDED — the commanded way paid, the opposite
+#      way was free AND (through an un-floored `_pv_raw`) buried the potential
+#      out of reach. `_pv_raw` is floored at zero and
+#      `pv_counter_yaw_penalty` charges the wrong-way rate.
+# Discovery is also made cheap: the pin std and the pin displacement weight are
+# on phase-aligned curricula (4 cm / -0.5 → 1.5 cm / -2.0 by iteration 1500) and
+# the paddle opens at +3.0, so lifting the free foot pays from step one.
 #
 # DIRECTION IS OBSERVED, NOT BAKED IN. The daemon does NOT zero the twist during
 # a skill window — it feeds the skill's CONFIGURED CONSTANT twist
@@ -8069,7 +8086,23 @@ PV_TARGET_YAW = 2.0 * math.pi   # one full turn about the pin
 PV_DIRECTION_CCW = 1.0          # +1 = counter-clockwise, pin = LEFT foot
 PV_DIRECTION_CW = -1.0          # -1 = clockwise, pin = RIGHT foot
 PV_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the pivot pays
-PV_RATE_CAP = 2.0 * math.pi     # progress pay saturates at 1 turn/s (rad/s)
+PV_RATE_CAP = 1.5 * 2.0 * math.pi   # progress pay saturates at 1.5 turns/s (rad/s)
+
+# ── The direction flag has to be TWO-SIDED ───────────────────────────────────
+# The potential is a running maximum clamped at zero, so turning the WRONG way
+# used to be perfectly free, and — worse — used to drive `_pv_raw` negative,
+# digging a hole the policy had to climb back out of before a single degree of
+# progress paid again. A counter-rotating wiggle was therefore a stable, costless
+# optimum, and the ONLY thing in the whole stack that reads the sign of the
+# command was a reward the policy never reached. `_pv_raw` is now floored at
+# zero (no hole) and counter-rotation is charged per step, bounded, so the
+# commanded sign has a gradient in BOTH directions from step one.
+PV_COUNTER_CAP = 2.0 * math.pi  # 1 turn/s the wrong way = the full counter cost
+
+# Stall: no progress for `GRACE` seconds during the spin phase starts a cost
+# that ramps to full over `RAMP` more. Bounded, and off in the settle phase.
+PV_STALL_GRACE_S = 0.5
+PV_STALL_RAMP_S = 0.5
 
 # Paddle stroke window. Longer than tippy-taps' 0.04–0.25 s tap: a paddle has to
 # lift, reach sideways, plant and push, not just touch. Beyond the max it is a
@@ -8085,6 +8118,9 @@ PV_MAX_AIR_S = 0.35
 #                  the sole, which moves the site by ≲1 cm; a STEP moves it 4+.
 #   PV_PIN_SAT_M   4 cm — one foot length: the cost is saturated, it stepped.
 PV_PIN_STD_M = 0.015
+PV_PIN_STD_START_M = 0.04       # curriculum start: a whole footprint of slack,
+                                # tightened to PV_PIN_STD_M by iter 1500 so the
+                                # first lift of the free foot is affordable.
 PV_PIN_SAT_M = 0.04
 PV_PIN_SLIP_SAT = 0.10          # m/s of in-contact sliding = full slip cost
 PV_RADIUS_M = 0.042             # measured trunk↔foot xy at STAND: the orbit radius
@@ -8169,6 +8205,9 @@ def _pv_update(
         env._pv_raw = torch.zeros(n, device=dev)
         env._pv_yaw = torch.zeros(n, device=dev)
         env._pv_prev_yaw = torch.zeros(n, device=dev)
+        env._pv_delta = torch.zeros(n, device=dev)
+        env._pv_omega = torch.zeros(n, device=dev)
+        env._pv_stall_s = torch.zeros(n, device=dev)
         env._pv_done = torch.zeros(n, dtype=torch.bool, device=dev)
         env._pv_just_done = torch.zeros(n, dtype=torch.bool, device=dev)
         env._pv_landed = torch.zeros(n, dtype=torch.bool, device=dev)
@@ -8202,6 +8241,10 @@ def _pv_update(
     env._pv_prev_yaw = torch.where(
         fresh, torch.zeros_like(env._pv_prev_yaw), env._pv_prev_yaw
     )
+    env._pv_delta = torch.where(fresh, torch.zeros_like(env._pv_delta), env._pv_delta)
+    env._pv_stall_s = torch.where(
+        fresh, torch.zeros_like(env._pv_stall_s), env._pv_stall_s
+    )
     env._pv_done = env._pv_done & ~fresh
     env._pv_just_done = env._pv_just_done & ~fresh
     env._pv_landed = env._pv_landed & ~fresh
@@ -8216,17 +8259,37 @@ def _pv_update(
     env._pv_pin_prev = pin_xy
 
     # ── Yaw progress potential ──────────────────────────────────────────────
+    # `_pv_omega` is the yaw rate SIGNED BY THE COMMAND: positive = turning the
+    # way the flag asked, negative = turning against it. Every direction-aware
+    # term downstream reads this one number, so the sign convention lives in
+    # exactly one place: dir (+1 = ccw) × body-frame omega_z (+ = ccw).
     omega_z = torch.nan_to_num(asset.data.root_link_ang_vel_b[:, 2], nan=0.0)
+    env._pv_omega = env._pv_dir * omega_z
     env._pv_prev_yaw = env._pv_yaw.clone()
-    env._pv_raw = env._pv_raw + env._pv_dir * omega_z * env.step_dt
+    # FLOORED AT ZERO. Un-floored, a wrong-way wobble drove `_pv_raw` negative
+    # and the potential became unreachable until the policy had un-turned it —
+    # so the cheapest response to an accidental counter-rotation was to stop
+    # trying. Counter-rotation is priced by `pv_counter_yaw_penalty` instead:
+    # per step, bounded, and it cannot destroy banked progress.
+    env._pv_raw = torch.clamp(
+        env._pv_raw + env._pv_omega * env.step_dt, min=0.0
+    )
     env._pv_yaw = torch.maximum(
         env._pv_yaw, torch.clamp(env._pv_raw, 0.0, target_yaw)
     )
+    env._pv_delta = env._pv_yaw - env._pv_prev_yaw
     reached = env._pv_yaw >= target_yaw
     env._pv_just_done = reached & ~env._pv_done
     env._pv_done = env._pv_done | reached
 
     env._pv_landed = env._pv_landed | found.all(dim=1)
+
+    # ── Stall timer: how long the potential has been flat during the SPIN ────
+    env._pv_stall_s = torch.where(
+        (env._pv_delta > 0.0) | env._pv_done | fresh | ~env._pv_landed,
+        torch.zeros_like(env._pv_stall_s),
+        env._pv_stall_s + env.step_dt,
+    )
 
 
 def _pv_upright(
@@ -8248,6 +8311,18 @@ def _pv_contacts(
     return _pv_gather1(found, pin), _pv_gather1(found, free), _pv_gather1(air, free)
 
 
+def _pv_rate(env: ManagerBasedRlEnv, rate_cap: float) -> torch.Tensor:
+    """(B,) 0..1: this step's progress, normalized by the per-step pay cap.
+
+    The one number that says "the turn is happening right now". Both the
+    progress reward and the pin pay read it, which is what stops standing still
+    from collecting the pin.
+    """
+    return torch.clamp(
+        env._pv_delta / max(rate_cap * env.step_dt, 1e-6), 0.0, 1.0
+    )
+
+
 def pv_progress_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
@@ -8264,7 +8339,7 @@ def pv_progress_reward(
     Pays Δ(progress potential)/(rate_cap · dt) — potential-based, so holding
     still pays zero, a back-and-forth wobble cannot re-earn the same degrees
     (the potential is a running maximum) and turning on past 360° pays nothing.
-    Capped at 1.0/step so violence past ~1 turn/s buys nothing, and zeroed
+    Capped at 1.0/step so violence past ~1.5 turns/s buys nothing, and zeroed
     while tilted past the upright gate.
 
     Deliberately NOT gated on the pin being planted: the potential is a running
@@ -8273,9 +8348,7 @@ def pv_progress_reward(
     costs pay for that step only and nothing is destroyed.
     """
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
-    delta = env._pv_yaw - env._pv_prev_yaw
-    rate = torch.clamp(delta / max(rate_cap * env.step_dt, 1e-6), 0.0, 1.0)
-    return rate * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+    return _pv_rate(env, rate_cap) * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
 
 
 def pv_complete_bonus(
@@ -8306,20 +8379,34 @@ def pv_pin_reward(
     direction: Optional[float] = None,
     target_yaw: float = PV_TARGET_YAW,
     pin_std: float = PV_PIN_STD_M,
+    rate_cap: float = PV_RATE_CAP,
     gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0..1 per step: the PIN is planted — in contact AND still where it began.
+    """0..1 per step: the PIN is planted WHILE THE TURN IS HAPPENING.
 
     THE term that makes this a pivot and not a spin. A product, not a sum:
-    contact × Gaussian(displacement from the episode-start position). Both
-    factors are what "planted" means, and a sum would let a foot that slid
-    30 cm keep half the pay for still touching the floor.
+    contact × Gaussian(displacement from the episode-start position) ×
+    this step's progress rate. The first two factors are what "planted" means,
+    and a sum would let a foot that slid 30 cm keep half the pay for still
+    touching the floor.
+
+    THE THIRD FACTOR IS WHY THIS TASK STOPPED STANDING STILL. Un-gated, the pin
+    paid its full weight to a robot that never moved — contact 1 × stay 1 —
+    which made standing the argmax of the whole stack (pin 3.0 + height 1.0 +
+    upright 2.0 ≈ 6/step for doing nothing) while progress, the only term that
+    required lifting a foot, was never discovered because lifting risked the
+    pin, tilt and radius costs. Scaled by progress, "planted" pays only as part
+    of a turn: stillness collects exactly zero and the pin becomes the thing
+    that makes a turn worth MORE, never the thing that makes it unnecessary.
     """
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     pin_contact, _, _ = _pv_contacts(env, sensor_name)
     stay = torch.exp(-((env._pv_pin_d / max(pin_std, 1e-6)) ** 2))
-    return pin_contact.float() * stay * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+    return (
+        pin_contact.float() * stay * _pv_rate(env, rate_cap)
+        * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+    )
 
 
 def pv_pin_displacement_penalty(
@@ -8333,14 +8420,24 @@ def pv_pin_displacement_penalty(
     max_cost: float = 1.0,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Bounded 0..1 cost (negative weight): the pin foot has MOVED.
+    """Bounded 0..1 cost (negative weight): the pin foot has MOVED, during the
+    SPIN phase.
 
     The pin reward alone is not enough — it only fails to pay. This charges,
     so a policy that gives up on the pin and spins on both feet is worse off
-    than one that never started, instead of merely no better off."""
+    than one that never started, instead of merely no better off.
+
+    Spin-phase only, because "planted" is a constraint on the TURN. Once the
+    full turn has been banked the robot is supposed to bring both feet back
+    under itself and stand, which usually means moving the pin — charging the
+    tightened -2.0 for every step of the ~150-step settle would swamp the
+    settle pay (+4.0) and make finishing the trick worse than never finishing
+    it. The weight is on a curriculum (-0.5 → -2.0 by iteration 1500) so the
+    first, clumsy attempts at lifting the free foot stay affordable."""
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     d2 = torch.square(env._pv_pin_d)
-    return torch.clamp(d2 / max(saturate_m**2, 1e-9), 0.0, max_cost)
+    cost = torch.clamp(d2 / max(saturate_m**2, 1e-9), 0.0, max_cost)
+    return cost * (~env._pv_done).float()
 
 
 def pv_pin_slip_penalty(
@@ -8488,6 +8585,104 @@ def pv_tilt_penalty(
         1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0
     )
     return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
+
+
+def pv_counter_yaw_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    saturate_rate: float = PV_COUNTER_CAP,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): the trunk is yawing AGAINST the
+    commanded direction.
+
+    THE SIGN FIX. Before this term the ±1 flag in the twist yaw slot was
+    one-sided: turning the commanded way paid, turning the opposite way was
+    free (the potential is a running maximum clamped at zero, so negative yaw
+    simply did not register). A policy that never found the turn was therefore
+    free to drift either way, and the drift it did settle on was the one the
+    pin/paddle loading happens to produce — opposite to the command, which is
+    exactly what checkpoint 2499 measured (-21°/-17° on direction +1,
+    +28°/+33° on -1). Charging the wrong-way rate gives the flag a gradient in
+    BOTH directions, so obs[50] finally means something on step one.
+
+    Priced only during the SPIN phase: once the turn is done the robot is
+    supposed to stop, and stopping is the settle term's business — a
+    counter-yaw cost there would punish the deceleration that ends the trick.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    wrong_way = torch.clamp(-env._pv_omega, min=0.0)
+    cost = torch.clamp(wrong_way / max(saturate_rate, 1e-6), 0.0, max_cost)
+    return cost * (~env._pv_done).float() * env._pv_landed.float()
+
+
+def pv_stall_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = PV_FEET_SITE_CFG,
+    command_name: str = "twist",
+    direction: Optional[float] = None,
+    target_yaw: float = PV_TARGET_YAW,
+    grace_s: float = PV_STALL_GRACE_S,
+    ramp_s: float = PV_STALL_RAMP_S,
+    max_cost: float = 1.0,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Bounded 0..1 cost (negative weight): the turn has not advanced for
+    ``grace_s`` during the SPIN phase.
+
+    The complement of gating the pin on progress. Gating removes the pay for
+    standing still; this makes standing still actively worse than a failed
+    attempt, which is what a discovery problem needs — AGENTS.md's rule is that
+    an attempt-TAX during discovery makes "do nothing" win, and the inverse
+    holds: a do-nothing tax makes attempting win. Bounded (it ramps from 0 to
+    ``max_cost`` over ``ramp_s`` and stops), so it can never out-shout the task
+    stack or buy violence.
+
+    Off in the settle phase (standing still IS the goal there), off before both
+    feet have touched down (the spawn transient is not a stall), and the timer
+    resets the instant the potential moves — so a policy that turns in bursts
+    pays nothing.
+    """
+    _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
+    over = torch.clamp(env._pv_stall_s - grace_s, min=0.0)
+    cost = torch.clamp(over / max(ramp_s, 1e-6), 0.0, max_cost)
+    return cost * (~env._pv_done).float() * env._pv_landed.float()
+
+
+def pv_pin_std_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    reward_name: str = "pin",
+    std_stages: Optional[list] = None,
+) -> torch.Tensor:
+    """Step-staged curriculum on the pin reward's Gaussian std (metres).
+
+    Discovery has to be CHEAP: at the tuned 1.5 cm the pin pay collapses the
+    moment the planted foot shifts, so the very first, clumsy attempt at
+    lifting the free foot loses the pin as well — and doing nothing wins. The
+    curriculum opens with a whole footprint of slack (4 cm) and tightens to the
+    measured value once the turn exists, phase-aligned with the pin
+    DISPLACEMENT weight ramp in the cfg (AGENTS.md: use the proven split,
+    ``reward_weight`` for weights, a params curriculum for everything else, and
+    mutate through the manager — ``env.cfg`` is a deepcopy and writes to it are
+    silent no-ops).
+    """
+    del env_ids
+    if not std_stages:
+        return torch.tensor([PV_PIN_STD_M])
+    term_cfg = env.reward_manager.get_term_cfg(reward_name)
+    current = std_stages[0]["std"]
+    for stage in std_stages:
+        if env.common_step_counter > stage["step"]:
+            current = stage["std"]
+    term_cfg.params["pin_std"] = current
+    return torch.tensor([current])
 
 
 class PivotCommand(UniformVelocityCommand):
