@@ -3636,6 +3636,77 @@ def speed_ceiling_curriculum(
     return torch.tensor([ceiling])
 
 
+# ── The stop-from-speed handover (run task) ──────────────────────────────────
+# docs/research/runner-room-falls.md §4: the chain hands a stopped robot to
+# Pollen's separate STAND policy the tick the commanded twist crosses 0.05, and
+# 3 of 225 (seed 0) / 3 of 221 (seed 1) of those handovers put the runner down
+# within 2 s against the shipped walker's 0 of 229. The mix ALREADY resamples
+# into a standing bucket; what it has never priced is the POSE at the handover.
+# "Held still" is not the same as "in the pose the stander expects to inherit".
+RUN_STAND_Z = 0.115  # measured standing trunk z at HOME (standup/bow/pivot)
+# Servo-view indices of the ten LEG joints (0–4 left, 9–13 right). The head is
+# deliberately excluded: it is command-driven by head_pose_tracking, and pulling
+# it to HOME here would fight that term (the same reason the `pose` reward is
+# leg-only — see microduck_velocity_env_cfg.py).
+RUN_LEG_JOINT_INDICES = (0, 1, 2, 3, 4, 9, 10, 11, 12, 13)
+
+
+def stop_pose_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    pose_std: float = 0.15,
+    height_std: float = 0.01,
+    target_height: float = RUN_STAND_Z,
+    command_threshold: float = 0.01,
+    joint_indices: Optional[list] = None,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step, ONLY at a zero commanded twist: land in the STAND pose.
+
+    A PRODUCT of two Gaussians — leg joints against the STAND/HOME keyframe
+    (``pose_std`` ≈ 0.15 rad ≈ 8.6°) and trunk z against ``target_height``
+    (``height_std`` = 1 cm) — times a hard gate on ``|twist| < command_threshold``.
+
+    Why a product and not a sum (AGENTS.md): an additive pair has a compromise
+    basin where a deep, stable crouch collects most of the stack, and a crouch
+    is precisely the state the stander cannot inherit. The product collapses on
+    either deficient factor.
+
+    Why the gate is hard: the standing bucket zeroes the command EXACTLY
+    (``_update_command`` writes 0 to every standing env every step), so the
+    threshold only has to reject a live command, and a soft gate would pay a
+    slowly-walking policy for looking stopped.
+
+    Why this is not a jackpot: the reward is a per-step Gaussian on a state the
+    policy has to hold, not a one-shot "reached it" bonus, and it is unreachable
+    while a command is live — there is nothing to arrive early at. The standing
+    bucket is entered FROM speed (a resample can flip any running env to zero),
+    which is exactly the transition the note measured as failing.
+
+    Args:
+      pose_std: leg-pose Gaussian std, radians.
+      height_std: trunk-height Gaussian std, metres (1 cm = "within 1 cm").
+      target_height: trunk z at STAND, measured off the model (``RUN_STAND_Z``).
+      command_threshold: below this |twist| the command counts as zero.
+      joint_indices: servo-view indices to score; ``None`` = the ten leg joints.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    stopped = (torch.norm(cmd[:, :3], dim=-1) < command_threshold).float()
+
+    indices = list(RUN_LEG_JOINT_INDICES if joint_indices is None else joint_indices)
+    pose = pose_target_match(
+        env,
+        target_overrides=None,
+        asset_cfg=asset_cfg,
+        std=pose_std,
+        joint_indices=indices,
+    )
+    height = height_target_gaussian(
+        env, target_height=target_height, asset_cfg=asset_cfg, std=height_std
+    )
+    return stopped * pose * height
+
+
 def projected_gravity(
     env: ManagerBasedRlEnv,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
@@ -4543,32 +4614,99 @@ def face_down_prob_curriculum(
 class VelocityCommandCommandOnly(UniformVelocityCommand):
     """Like UniformVelocityCommand but only draws the command arrows (no actual velocity arrows)."""
 
-    def _resample_command(self, env_ids: torch.Tensor) -> None:
-        super()._resample_command(env_ids)
-        # Turn-in-place practice: for a fraction of envs, zero the linear velocity
-        # and force a meaningful (away-from-zero) yaw command. Independent uniform
-        # sampling almost never produces "lin≈0, |ang| large" (~2% of samples), so
-        # spinning on the spot was effectively untrained → slow/unstable real-robot
-        # turning. Mirrors the base rel_forward_envs mechanism.
-        p = getattr(self.cfg, "rel_turn_in_place_envs", 0.0)
-        if p <= 0.0:
-            return
-        r = torch.empty(len(env_ids), device=self.device)
-        turn_ids = env_ids[r.uniform_(0.0, 1.0) < p]
-        if len(turn_ids) == 0:
-            return
-        self.vel_command_b[turn_ids, 0] = 0.0
-        self.vel_command_b[turn_ids, 1] = 0.0
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        # Fail at env-build time, not silently at the first resample: a job that
+        # over-subscribes the buckets must not spend GPU hours on a mix nobody
+        # intended. (getattr: RelativeHeadingVelocityCommand subclasses this
+        # term with a plain UniformVelocityCommandCfg that has no buckets.)
+        validate = getattr(cfg, "validate_bucket_fractions", None)
+        if validate is not None:
+            validate()
+
+    def _random_signed(self, n: int, lo: float, hi: float) -> torch.Tensor:
+        """`n` samples of ±U(lo, hi) — magnitude uniform, sign a coin flip."""
+        mag = torch.empty(n, device=self.device).uniform_(lo, hi)
+        coin = torch.empty(n, device=self.device).uniform_(0.0, 1.0)
+        return torch.where(coin < 0.5, -1.0, 1.0) * mag
+
+    def _activate_bucket(self, ids: torch.Tensor) -> None:
+        """Make a bucket's command the one the env actually gets.
+
+        Un-marks the envs as standing (``_update_command`` zeroes the command of
+        a standing env every step, which would erase the bucket) and as
+        forward-only (the base template's independent draw, whose vx/vy/wz
+        rewrite these buckets deliberately override), then refreshes the
+        world-frame reference copy the world-env branch reads.
+        """
+        self.is_standing_env[ids] = False
+        self.is_forward_env[ids] = False
+        self.vel_command_w[ids] = self.vel_command_b[ids]
+
+    def _apply_turn_in_place(self, ids: torch.Tensor) -> None:
+        # Zero the linear velocity and force a meaningful (away-from-zero) yaw
+        # command. Independent uniform sampling almost never produces
+        # "lin≈0, |ang| large" (~2% of samples), so spinning on the spot was
+        # effectively untrained → slow/unstable real-robot turning. Mirrors the
+        # base rel_forward_envs mechanism.
+        self.vel_command_b[ids, 0] = 0.0
+        self.vel_command_b[ids, 1] = 0.0
         lo, hi = self.cfg.ranges.ang_vel_z
         maxr = max(abs(lo), abs(hi))
-        rr = torch.empty(len(turn_ids), device=self.device)
-        sign = torch.where(rr.uniform_(0.0, 1.0) < 0.5, -1.0, 1.0)
-        mag = torch.empty(len(turn_ids), device=self.device).uniform_(0.4 * maxr, maxr)
-        self.vel_command_b[turn_ids, 2] = sign * mag
-        # These envs must actually turn — un-mark them as standing (which would
-        # zero the command) and refresh the world-frame reference copy.
-        self.is_standing_env[turn_ids] = False
-        self.vel_command_w[turn_ids] = self.vel_command_b[turn_ids]
+        self.vel_command_b[ids, 2] = self._random_signed(
+            len(ids), 0.4 * maxr, maxr
+        )
+        self._activate_bucket(ids)
+
+    def _apply_reverse(self, ids: torch.Tensor) -> None:
+        # The brain's OBSTACLE REACTION, verbatim: back out of what you just met,
+        # with a small yaw on it. docs/research/runner-room-falls.md measured
+        # 2 718 and 3 694 seconds of an office day under this command and 57 of
+        # the day's 149 falls — every one of them at vx = -0.4 with |wz| ≤ 0.3,
+        # a region no ruler ever commanded and no round ever trained.
+        n = len(ids)
+        lo, hi = self.cfg.reverse_lin_vel_x
+        self.vel_command_b[ids, 0] = torch.empty(n, device=self.device).uniform_(lo, hi)
+        self.vel_command_b[ids, 1] = 0.0
+        wlo, whi = self.cfg.reverse_ang_vel_z
+        self.vel_command_b[ids, 2] = torch.empty(n, device=self.device).uniform_(
+            wlo, whi
+        )
+        self._activate_bucket(ids)
+
+    def _apply_lateral(self, ids: torch.Tensor) -> None:
+        # The brain's LATERAL FLOOR — its real turn-in-place: a small crab step
+        # carrying a large yaw. It is the only command in either measured office
+        # day with zero falls (613 s), and training it is the route to retiring
+        # the runtime's twist shaping. vx is small but NOT zero: the shaping
+        # issues it while still creeping.
+        n = len(ids)
+        lo, hi = self.cfg.lateral_lin_vel_x
+        self.vel_command_b[ids, 0] = torch.empty(n, device=self.device).uniform_(lo, hi)
+        self.vel_command_b[ids, 1] = self._random_signed(n, *self.cfg.lateral_lin_vel_y_mag)
+        self.vel_command_b[ids, 2] = self._random_signed(n, *self.cfg.lateral_ang_vel_z_mag)
+        self._activate_bucket(ids)
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        super()._resample_command(env_ids)
+        turn_p = float(getattr(self.cfg, "rel_turn_in_place_envs", 0.0) or 0.0)
+        rev_p = float(getattr(self.cfg, "rel_reverse_envs", 0.0) or 0.0)
+        lat_p = float(getattr(self.cfg, "rel_lateral_envs", 0.0) or 0.0)
+        if turn_p <= 0.0 and rev_p <= 0.0 and lat_p <= 0.0:
+            return
+        # ONE uniform draw partitions the three buckets, so they are mutually
+        # exclusive by construction and each one's marginal is exactly its
+        # fraction. (Three independent draws would let an env be "reverse AND
+        # lateral", and whichever ran last would silently win.)
+        u = torch.empty(len(env_ids), device=self.device).uniform_(0.0, 1.0)
+        edges = (0.0, turn_p, turn_p + rev_p, turn_p + rev_p + lat_p)
+        appliers = (self._apply_turn_in_place, self._apply_reverse, self._apply_lateral)
+        for apply, lo, hi in zip(appliers, edges[:-1], edges[1:]):
+            if hi <= lo:
+                continue
+            ids = env_ids[(u >= lo) & (u < hi)]
+            if len(ids) > 0:
+                apply(ids)
 
     def _debug_vis_impl(self, visualizer: "DebugVisualizer") -> None:
         batch = visualizer.env_idx
@@ -4603,9 +4741,61 @@ class VelocityCommandCommandOnly(UniformVelocityCommand):
 
 @_dataclass(kw_only=True)
 class VelocityCommandCommandOnlyCfg(UniformVelocityCommandCfg):
+    """Uniform velocity command + three MUTUALLY EXCLUSIVE manoeuvre buckets.
+
+    Rare-but-important command regions never train under independent uniform
+    sampling, so each gets an explicit slice of every resample. All three are
+    drawn from ONE uniform, so an env is in at most one of them, and each
+    fraction is that bucket's exact share of resampled envs.
+
+    They take priority over the base template's own two draws
+    (``rel_forward_envs``, ``rel_standing_envs``): an env picked for a bucket is
+    un-marked as forward and as standing, so the effective forward/standing
+    share is scaled by ``1 - (turn + reverse + lateral)``. That is why
+    :meth:`validate_bucket_fractions` checks only the three exclusive fractions
+    — ``rel_forward_envs`` is a separate, independent draw that these buckets
+    override rather than compete with, and folding it into the sum would reject
+    perfectly intentional mixes (0.55 forward + 0.42 buckets, the round-seven
+    run recipe).
+    """
+
     # Fraction of envs commanded to turn in place (lin=0, |ang| forced to
     # [0.4·max, max]) each resample. 0 = disabled (base uniform sampling only).
     rel_turn_in_place_envs: float = 0.0
+    # Fraction commanded to REVERSE (the brain's obstacle reaction / back-out).
+    rel_reverse_envs: float = 0.0
+    # Fraction commanded LATERALLY with a large yaw (the brain's lateral floor).
+    rel_lateral_envs: float = 0.0
+
+    # Bucket sampling ranges. Defaults are the measured office-day commands
+    # from docs/research/runner-room-falls.md, not round numbers.
+    reverse_lin_vel_x: tuple[float, float] = (-0.5, -0.3)
+    reverse_ang_vel_z: tuple[float, float] = (-0.3, 0.3)
+    lateral_lin_vel_x: tuple[float, float] = (-0.1, 0.1)
+    # |vy| and |wz| magnitudes; the sign is a coin flip so both sides train.
+    lateral_lin_vel_y_mag: tuple[float, float] = (0.2, 0.3)
+    lateral_ang_vel_z_mag: tuple[float, float] = (0.4, 1.0)
+
+    def validate_bucket_fractions(self) -> float:
+        """Raise unless the three exclusive bucket fractions fit in one resample.
+
+        Returns the total so callers/tests can assert on it.
+        """
+        parts = {
+            "rel_turn_in_place_envs": float(self.rel_turn_in_place_envs or 0.0),
+            "rel_reverse_envs": float(self.rel_reverse_envs or 0.0),
+            "rel_lateral_envs": float(self.rel_lateral_envs or 0.0),
+        }
+        for name, value in parts.items():
+            if value < 0.0:
+                raise ValueError(f"{name} must be >= 0, got {value}")
+        total = sum(parts.values())
+        if total > 1.0 + 1e-9:
+            raise ValueError(
+                "the mutually exclusive command buckets must sum to <= 1.0, got "
+                f"{total:.4f} from " + ", ".join(f"{k}={v}" for k, v in parts.items())
+            )
+        return total
 
     def build(self, env: ManagerBasedRlEnv) -> "VelocityCommandCommandOnly":
         return VelocityCommandCommandOnly(self, env)

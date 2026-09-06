@@ -39,6 +39,14 @@ Command mix (the other half of the recipe):
   - the remaining envs stay omni (vy ±0.3, wz ±1.0), so the policy is still a
     drop-in replacement for the walk policy at the runtime's command contract.
   - turn-in-place is OFF here (the walk policy owns spinning).
+  - ROUND SEVEN adds two more buckets, both OFF by default, both mutually
+    exclusive with turn-in-place and with each other (one uniform draw
+    partitions all three — see VelocityCommandCommandOnlyCfg):
+      * REVERSE (MICRODUCK_RUN_REVERSE_FRAC): vx ∈ [-0.5, -0.3], vy = 0,
+        |wz| ≤ 0.3 — the brain's obstacle reaction and back-out verbatim.
+      * LATERAL (MICRODUCK_RUN_LATERAL_FRAC): vx ∈ [-0.1, 0.1],
+        |vy| ∈ [0.2, 0.3], |wz| ∈ [0.4, 1.0] — the brain's lateral floor,
+        which is its REAL turn in place.
   - standing envs ramp 0.02 → 0.10 by iter 1500 — lower than velocity's 0.25,
     because at this sample budget standing envs are experience not spent on
     running, but non-zero so the deployment idle state stays trained.
@@ -58,6 +66,55 @@ sweep them without a code change — HF Jobs pass env, not patches):
   MICRODUCK_RUN_TURN_FRAC      turn-in-place env fraction, default 0.0.
   MICRODUCK_RUN_TRACK_ANG_W    yaw-tracking weight, default 2.0 (4.0 = 1:1 with speed).
   MICRODUCK_RUN_AIR_MIN/_MAX   air_time window in seconds, default 0.15/0.35.
+  MICRODUCK_RUN_REVERSE_FRAC   reverse-bucket env fraction, default 0.0 (OFF).
+  MICRODUCK_RUN_LATERAL_FRAC   lateral-bucket env fraction, default 0.0 (OFF).
+  MICRODUCK_RUN_STOP_POSE_W    stop_pose reward weight, default 0.0 (OFF).
+
+Round seven — "train the room, not more speed"
+(docs/research/runner-room-falls.md, Recommendation (a)). The office found that
+99 of a run policy's 149 falls in two eight-hour days happen while it is
+TOUCHING something, and that what the brain is doing at those moments is a
+short list of manoeuvres this task has never sampled: a REVERSE (2 718 and
+3 694 s of a day, 57 of the 149 falls, never commanded by the ruler), a LATERAL
+floor turn (613 s, zero falls — the manoeuvre that WORKS, and the only route to
+retiring the runtime's twist shaping), and a STOP from speed into Pollen's
+separate stand policy (3 of 225 and 3 of 221 handovers put the runner down
+within 2 s, against the shipped walker's 0 of 229). Round seven adds all three:
+two command buckets, and a `stop_pose` reward that prices the POSE at the
+handover — the leg pose the stander expects to inherit and a trunk at STAND
+height — rather than merely holding still, which is all the standing bucket has
+ever asked for. The launch:
+
+  MICRODUCK_RUN_SPEED_CEILING=0.9 \
+  MICRODUCK_RUN_STAGE_SCALE=0.7 \
+  MICRODUCK_RUN_TURN_FRAC=0.22 \
+  MICRODUCK_RUN_TRACK_ANG_W=4.0 \
+  MICRODUCK_RUN_REVERSE_FRAC=0.10 \
+  MICRODUCK_RUN_LATERAL_FRAC=0.10 \
+  MICRODUCK_RUN_STOP_POSE_W=2.0 \
+  uv run train Mjlab-Run-Flat-MicroDuck --env.scene.num-envs 4096 \
+      --agent.max_iterations 5500 --hf-jobs
+
+Turn 0.22 and TRACK_ANG_W 4.0 are carried over from round six unchanged, so
+round seven's deltas are exactly the two new buckets and the stop pose.
+
+NOT built — static box obstacles, and why (recipe change 1). The template
+cannot express contact between the robot's SHELL and world geometry: the walk
+model has five non-visual geoms, and after `FULL_COLLISION`
+(`geom_names_expr=[".*_collision"]`, `disable_other_geoms=True`) only
+`left_foot_collision` and `right_foot_collision` carry contype/conaffinity = 1.
+The trunk, both leg shells and the head are class `self_collision_only` at
+contype/conaffinity = 2, which by MuJoCo's mask rule (2 & 1 == 0) cannot touch
+the terrain at all. A box in front of an env would therefore be invisible to
+everything except a swinging foot — the robot would walk THROUGH the wall — and
+a `wall_contact` cost on "non-foot body contacts" has no geom to fire on. The
+terrain half is cheap (mjlab ships `BoxRandomSpreadTerrainCfg`, and this repo
+already ships a custom `SubTerrainCfg` in `slope_terrain.py`); the blocker is
+the shared robot collision model. Giving the shell world-collision geoms means
+editing `FULL_COLLISION`, which every task in the family uses — it would change
+the physics of walk, standup, ground_pick and every `-Backlash-` twin at once
+and confound their comparisons. That is a robot-model change, not a task knob,
+so it belongs in its own round with its own A/B.
 
 Deliberate deviations from the transcribed recipe, and why:
   - `head_pose_bias` (+ its curriculum) is kept from the fork's velocity
@@ -74,7 +131,7 @@ import math
 import os
 
 from mjlab.envs import ManagerBasedRlEnvCfg
-from mjlab.managers import CurriculumTermCfg
+from mjlab.managers import CurriculumTermCfg, RewardTermCfg
 from mjlab.rl import RslRlModelCfg, RslRlOnPolicyRunnerCfg
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
@@ -119,6 +176,14 @@ STAGE_SCALE = _env_float("MICRODUCK_RUN_STAGE_SCALE", DEFAULT_STAGE_SCALE)
 FORWARD_FRAC = _env_float("MICRODUCK_RUN_FORWARD_FRAC", DEFAULT_FORWARD_FRAC)
 DEFAULT_TURN_FRAC = 0.0
 TURN_FRAC = _env_float("MICRODUCK_RUN_TURN_FRAC", DEFAULT_TURN_FRAC)
+# Round-seven knobs. All default OFF so every earlier run reproduces bit for
+# bit; the recipe values (0.10 / 0.10 / 2.0) live in the launch command above.
+DEFAULT_REVERSE_FRAC = 0.0
+DEFAULT_LATERAL_FRAC = 0.0
+DEFAULT_STOP_POSE_W = 0.0
+REVERSE_FRAC = _env_float("MICRODUCK_RUN_REVERSE_FRAC", DEFAULT_REVERSE_FRAC)
+LATERAL_FRAC = _env_float("MICRODUCK_RUN_LATERAL_FRAC", DEFAULT_LATERAL_FRAC)
+STOP_POSE_W = _env_float("MICRODUCK_RUN_STOP_POSE_W", DEFAULT_STOP_POSE_W)
 AIR_MIN = _env_float("MICRODUCK_RUN_AIR_MIN", DEFAULT_AIR_MIN)
 AIR_MAX = _env_float("MICRODUCK_RUN_AIR_MAX", DEFAULT_AIR_MAX)
 
@@ -211,6 +276,14 @@ RUN_STD_RUNNING = {
 FOOT_CLEARANCE_TARGET = 0.03  # 3 cm of swing lift (walk asks 2 cm)
 COMMAND_THRESHOLD = 0.01      # gate the gait terms on a live command
 
+# stop_pose: the pose the chain's STAND policy inherits at the handover.
+# 0.15 rad ≈ 8.6° of leg-joint slack — tight enough that a crouch scores near
+# zero, loose enough that the CURRENT run policy's stop scores visibly (a std
+# the policy cannot reach has no gradient, AGENTS.md).
+STOP_POSE_STD = 0.15
+STOP_POSE_HEIGHT_STD = 0.01   # "trunk within 1 cm of STAND height"
+STOP_POSE_TARGET_Z = microduck_mdp.RUN_STAND_Z  # 0.115, measured on the model
+
 
 def _scaled_stages(stages, scale: float) -> list[tuple[int, float]]:
     """Iteration-indexed stages → env-step-indexed stages, times STAGE_SCALE."""
@@ -254,6 +327,9 @@ def make_microduck_run_env_cfg(
     forward_frac = _env_float("MICRODUCK_RUN_FORWARD_FRAC", DEFAULT_FORWARD_FRAC)
     air_min = _env_float("MICRODUCK_RUN_AIR_MIN", DEFAULT_AIR_MIN)
     air_max = _env_float("MICRODUCK_RUN_AIR_MAX", DEFAULT_AIR_MAX)
+    reverse_frac = _env_float("MICRODUCK_RUN_REVERSE_FRAC", DEFAULT_REVERSE_FRAC)
+    lateral_frac = _env_float("MICRODUCK_RUN_LATERAL_FRAC", DEFAULT_LATERAL_FRAC)
+    stop_pose_w = _env_float("MICRODUCK_RUN_STOP_POSE_W", DEFAULT_STOP_POSE_W)
 
     cfg = make_microduck_velocity_env_cfg(play=play, rough=rough)
 
@@ -273,6 +349,14 @@ def make_microduck_run_env_cfg(
     # recipe had 0; the office found the run policy could not turn on the
     # spot and fell there, so it is a knob (MICRODUCK_RUN_TURN_FRAC).
     command.rel_turn_in_place_envs = _env_float("MICRODUCK_RUN_TURN_FRAC", DEFAULT_TURN_FRAC)
+    # Reverse and lateral buckets (round seven). Both OFF by default. They share
+    # ONE uniform draw with turn-in-place, so the three are mutually exclusive
+    # and each fraction is that bucket's exact share of every resample; an env
+    # in any of them is un-marked as forward and as standing.
+    command.rel_reverse_envs = reverse_frac
+    command.rel_lateral_envs = lateral_frac
+    # Fail here, on CPU, at cfg-build time — not 40 minutes into a paid job.
+    command.validate_bucket_fractions()
 
     # ── Rewards ──────────────────────────────────────────────────────────────
     # Speed is the biggest term in the stack.
@@ -318,6 +402,22 @@ def make_microduck_run_env_cfg(
     cfg.rewards["body_ang_vel"].weight = W_BODY_ANG_VEL
     cfg.rewards["angular_momentum"].weight = W_ANGULAR_MOMENTUM
     cfg.rewards["self_collisions"].weight = W_SELF_COLLISIONS
+
+    # stop_pose: pays ONLY at a zero commanded twist, for the leg pose the
+    # chain's STAND policy expects to inherit AND a trunk at STAND height.
+    # Registered unconditionally (weight 0 = OFF) so the term exists in every
+    # run's log and MICRODUCK_RUN_STOP_POSE_W is the only thing that changes.
+    cfg.rewards["stop_pose"] = RewardTermCfg(
+        func=microduck_mdp.stop_pose_reward,
+        weight=stop_pose_w,
+        params={
+            "command_name": "twist",
+            "pose_std": STOP_POSE_STD,
+            "height_std": STOP_POSE_HEIGHT_STD,
+            "target_height": STOP_POSE_TARGET_Z,
+            "command_threshold": COMMAND_THRESHOLD,
+        },
+    )
 
     # Smoothness starts gentle; the curriculum below caps it at -0.5.
     cfg.rewards["action_rate_l2"].weight = W_ACTION_RATE_START
