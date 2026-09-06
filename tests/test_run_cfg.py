@@ -340,3 +340,10 @@ def test_turn_in_place_bucket_is_a_knob(monkeypatch):
     assert make_microduck_run_env_cfg().commands["twist"].rel_turn_in_place_envs == 0.0
     monkeypatch.setenv("MICRODUCK_RUN_TURN_FRAC", "0.15")
     assert make_microduck_run_env_cfg().commands["twist"].rel_turn_in_place_envs == 0.15
+
+
+def test_yaw_tracking_weight_is_a_knob(monkeypatch):
+    from mjlab_microduck.tasks.microduck_run_env_cfg import make_microduck_run_env_cfg
+    assert make_microduck_run_env_cfg().rewards["track_angular_velocity"].weight == 2.0
+    monkeypatch.setenv("MICRODUCK_RUN_TRACK_ANG_W", "4.0")
+    assert make_microduck_run_env_cfg().rewards["track_angular_velocity"].weight == 4.0

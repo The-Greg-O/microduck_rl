@@ -56,6 +56,7 @@ sweep them without a code change — HF Jobs pass env, not patches):
                                the whole schedule for a longer run.
   MICRODUCK_RUN_FORWARD_FRAC   forward-only env fraction, default 0.55.
   MICRODUCK_RUN_TURN_FRAC      turn-in-place env fraction, default 0.0.
+  MICRODUCK_RUN_TRACK_ANG_W    yaw-tracking weight, default 2.0 (4.0 = 1:1 with speed).
   MICRODUCK_RUN_AIR_MIN/_MAX   air_time window in seconds, default 0.15/0.35.
 
 Deliberate deviations from the transcribed recipe, and why:
@@ -277,7 +278,10 @@ def make_microduck_run_env_cfg(
     # Speed is the biggest term in the stack.
     cfg.rewards["track_linear_velocity"].weight = W_TRACK_LIN
     cfg.rewards["track_linear_velocity"].params["std"] = math.sqrt(STD2_TRACK_LIN)
-    cfg.rewards["track_angular_velocity"].weight = W_TRACK_ANG
+    # Yaw was priced at half of speed (2:1) and collected 7% of its weight: a
+    # half-rad/s DC yaw drift was nearly free (docs/research/yaw-asymmetry.md).
+    # MICRODUCK_RUN_TRACK_ANG_W raises it; 4.0 puts it back at 1:1 with speed.
+    cfg.rewards["track_angular_velocity"].weight = _env_float("MICRODUCK_RUN_TRACK_ANG_W", W_TRACK_ANG)
     cfg.rewards["track_angular_velocity"].params["std"] = math.sqrt(STD2_TRACK_ANG)
 
     # Lean is cheap: a run leans, and the walk recipe's std²=0.05 erases it.
