@@ -24,15 +24,18 @@ from mjlab_microduck.tasks.microduck_pivot_env_cfg import (
     PV_TARGET_YAW,
     W_PIN_BROKEN,
     W_PIN_BROKEN_START,
+    W_BODY_ANG_VEL,
     W_PIN_DISPLACEMENT,
     W_PIN_DISPLACEMENT_START,
+    W_TERMINATED,
+    W_TILT,
     MicroduckPivotRlCfg,
     make_microduck_pivot_env_cfg,
 )
 
-# The per-step pay cap. Ticking at exactly this rate makes every rate-scaled
-# term (progress, and now the pin) score its full 1.0, which is what the
-# geometry assertions below want to isolate.
+# The per-step pay cap (v4: 0.75 turns/s, down from 1.5). Ticking at exactly
+# this rate makes every rate-scaled term (progress, and now the pin) score its
+# full 1.0, which is what the geometry assertions below want to isolate.
 _CAP = microduck_mdp.PV_RATE_CAP
 
 
@@ -126,7 +129,7 @@ def test_reward_signs():
                 "height_stand", "upright", "head_pose_tracking"):
         assert cfg.rewards[pos].weight > 0, pos
     for cost in ("pin_displacement", "pin_slip", "pin_broken",
-                 "two_feet_still", "pivot_radius", "tilt",
+                 "two_feet_still", "pivot_radius", "tilt", "terminated",
                  "stall", "counter_yaw",
                  "body_ang_vel", "action_rate_l2", "dof_pos_limits",
                  "self_collisions"):
@@ -135,7 +138,7 @@ def test_reward_signs():
     assert cfg.rewards["action_rate_l2"].weight == -0.05
     stages = cfg.curriculum["action_rate_weight"].params["weight_stages"]
     assert [s["weight"] for s in stages] == [-0.05, -0.10, -0.20]
-    assert stages[1]["step"] >= 1000 * 24
+    assert stages[1]["step"] >= 1600 * 24   # v4: stretched with the run
 
 
 def test_v3_terms_exist_with_the_stated_thresholds():
@@ -161,13 +164,95 @@ def test_v3_terms_exist_with_the_stated_thresholds():
     # the stroke window floor rose so a shuffle's twitch no longer clears it
     assert microduck_mdp.PV_MIN_AIR_S == 0.08
     assert cfg.rewards["paddle"].params["min_air"] == 0.08
-    assert cfg.rewards["paddle"].params["max_air"] == 0.35
+    assert cfg.rewards["paddle"].params["max_air"] == 0.45
 
     two = cfg.rewards["two_feet_still"]
     assert two.func is microduck_mdp.pv_two_feet_still_penalty
     assert two.weight == -2.0
     assert two.params["yaw_gate"] == microduck_mdp.PV_TWOFOOT_YAW_GATE == 0.5
     assert two.params["yaw_cap"] > two.params["yaw_gate"]
+
+
+def test_v4_terms_price_staying_up():
+    """The five v4 changes, wired: the fall is charged, the progress potential
+    is gated tightly on upright, the pay cap is halved, the paddle window is
+    widened to match, and the two lean/rock costs are felt."""
+    cfg = make_microduck_pivot_env_cfg()
+
+    term = cfg.rewards["terminated"]
+    assert term.func is microduck_mdp.pv_fall_penalty
+    assert term.weight == W_TERMINATED == -20.0
+    assert term.params["term_names"] == ("fell_over",)
+    assert "nan_state" not in term.params["term_names"], (
+        "a sim blow-up is not something the policy chose"
+    )
+    # the termination it prices has to be a real, non-timeout termination
+    assert cfg.terminations["fell_over"].time_out is False
+
+    # the progress gate: 15 deg, and STRICTLY tighter than the fallen gate it
+    # replaces for this purpose (40 deg is where the fall is already lost).
+    assert microduck_mdp.PV_PROGRESS_TILT_DEG == 15.0
+    assert (microduck_mdp.PV_PROGRESS_TILT_DEG
+            < microduck_mdp.PV_UPRIGHT_GATE_DEG == 40.0)
+
+    # the pay cap, halved: full pay now lives on a 1.33 s turn, not a 0.67 s whip
+    assert math.isclose(microduck_mdp.PV_RATE_CAP, 0.75 * 2 * math.pi)
+    assert math.isclose(PV_TARGET_YAW / microduck_mdp.PV_RATE_CAP, 4.0 / 3.0)
+
+    # the stroke window widened with it — a slower turn has longer strokes
+    assert microduck_mdp.PV_MIN_AIR_S == 0.08
+    assert microduck_mdp.PV_MAX_AIR_S == 0.45
+
+    assert cfg.rewards["tilt"].weight == W_TILT == -2.0
+    assert cfg.rewards["body_ang_vel"].weight == W_BODY_ANG_VEL == -0.2
+
+    # the run is longer and the pin curriculum was stretched WITH it, so the
+    # pressures still land at the same fraction of training (60%).
+    assert MicroduckPivotRlCfg.max_iterations == 4_000
+    assert PIN_TIGHTEN_ITER == 2400
+    assert math.isclose(PIN_TIGHTEN_ITER / MicroduckPivotRlCfg.max_iterations, 0.6)
+
+
+def test_the_fall_penalty_is_one_shot_and_charges_only_the_fall():
+    env = _FakeEnv()
+    env.tick(0.0)
+    assert float(microduck_mdp.pv_fall_penalty(env)[0]) == 0.0
+    env.termination_manager.fire("nan_state")
+    assert float(microduck_mdp.pv_fall_penalty(env)[0]) == 0.0, (
+        "a NaN guard is a sim blow-up, not a behaviour"
+    )
+    env.termination_manager.fire("out_of_terrain_bounds")
+    assert float(microduck_mdp.pv_fall_penalty(env)[0]) == 0.0, (
+        "the trunk of a pivoting robot is SUPPOSED to travel"
+    )
+    env.termination_manager.fire("fell_over")
+    assert float(microduck_mdp.pv_fall_penalty(env)[0]) == 1.0
+    # a term the env does not have must not raise (the base cfg owns the names)
+    assert float(microduck_mdp.pv_fall_penalty(env, term_names=("nope",))[0]) == 0.0
+
+
+def test_the_progress_potential_freezes_past_fifteen_degrees():
+    """The v4 gate on the potential itself, not on a term's output: degrees
+    turned while toppling are not progress, and nothing banked is burned."""
+    env = _FakeEnv()
+    _turn_for(env, _CAP, 0.4)                     # 0.3 turns, upright
+    banked = float(env._pv_yaw[0])
+    assert banked > 0.0
+
+    env.set_tilt(20.0)                            # past 15, well short of 40
+    for _ in range(50):                           # 1 s: past the stall grace
+        env.tick(_CAP)
+        assert float(microduck_mdp.pv_progress_reward(env)[0]) == 0.0
+        assert float(microduck_mdp.pv_pin_reward(env)[0]) == 0.0
+    assert float(env._pv_yaw[0]) == banked, "banked degrees are never burned"
+    # ...and the stall timer runs while the potential is frozen, so leaning is
+    # not a free parking spot either.
+    assert float(microduck_mdp.pv_stall_penalty(env)[0]) > 0.0
+
+    env.set_tilt(10.0)                            # back inside the gate
+    env.tick(_CAP)
+    assert float(env._pv_yaw[0]) > banked
+    assert float(microduck_mdp.pv_progress_reward(env)[0]) > 0.0
 
 
 def test_a_spin_scores_clearly_less_than_a_pivot():
@@ -208,7 +293,7 @@ def test_symmetry_off_and_runner_cfg():
     assert MicroduckPivotRlCfg.actor.obs_normalization is True
     assert MicroduckPivotRlCfg.critic.obs_normalization is True
     assert MicroduckPivotRlCfg.experiment_name == "pivot"
-    assert MicroduckPivotRlCfg.max_iterations == 2_500
+    assert MicroduckPivotRlCfg.max_iterations == 4_000
 
 
 def test_direction_constants():
@@ -270,6 +355,20 @@ class _FakeCommandManager:
         return self._cmd
 
 
+class _FakeTerminations:
+    """Just enough of mjlab's TerminationManager for the v4 fall penalty."""
+
+    def __init__(self, n):
+        self.active_terms = ["fell_over", "out_of_terrain_bounds", "nan_state"]
+        self._dones = {k: torch.zeros(n, dtype=torch.bool) for k in self.active_terms}
+
+    def get_term(self, name):
+        return self._dones[name]
+
+    def fire(self, name):
+        self._dones[name][:] = True
+
+
 class _FakeEnv:
     def __init__(self, n=1, yaw_flag=PV_DIRECTION_CCW):
         self.num_envs = n
@@ -280,6 +379,7 @@ class _FakeEnv:
         self._asset = _FakeAsset(n)
         self.scene = _FakeScene(n, self._asset)
         self.command_manager = _FakeCommandManager(n, yaw_flag)
+        self.termination_manager = _FakeTerminations(n)
 
     @property
     def sensor(self):
@@ -289,6 +389,14 @@ class _FakeEnv:
         self.sensor.data.found[:, foot] = 1.0 if down else 0.0
         if down:
             self.sensor.data.current_air_time[:, foot] = 0.0
+
+    def set_tilt(self, deg):
+        """Roll the trunk `deg` degrees about x — what a topple looks like to
+        every tilt-aware gate in the stack."""
+        half = math.radians(deg) / 2.0
+        self._asset.data.root_link_quat_w[:] = torch.tensor(
+            [math.cos(half), math.sin(half), 0.0, 0.0]
+        )
 
     def tick(self, omega_z=0.0, pin_dxy=(0.0, 0.0), trunk_dxy=(0.0, 0.0),
              free_dxy=(0.0, 0.0)):
@@ -373,7 +481,7 @@ def test_progress_is_a_monotone_potential():
 
 def test_progress_rate_is_normalized_and_capped():
     env = _FakeEnv()
-    assert math.isclose(_CAP, 1.5 * 2 * math.pi), "1.5 turns/s"
+    assert math.isclose(_CAP, 0.75 * 2 * math.pi), "v4: 0.75 turns/s"
     env.tick(_CAP / 2)                    # half the cap rate
     assert math.isclose(float(microduck_mdp.pv_progress_reward(env)[0]), 0.5, rel_tol=1e-6)
     env.tick(_CAP)                        # exactly the cap
@@ -383,17 +491,26 @@ def test_progress_rate_is_normalized_and_capped():
 
 
 def test_progress_total_is_potential_based():
-    """A completed turn is worth the same total however fast it is done — the
-    speed incentive lives in the settle phase, not here."""
-    totals = []
-    for omega in (math.pi, 2 * math.pi):
+    """A completed turn is worth the same total however fast it is done, AT OR
+    BELOW the pay cap — the speed incentive lives in the settle phase, not here.
+
+    Above the cap the total FALLS, which is the v4 cap doing its job: at
+    1 turn/s (v3's whip speed) a third of the turn's progress pay is simply
+    forfeited, because the per-step clamp bites and the potential is spent."""
+    totals = {}
+    for omega in (math.pi / 2, math.pi, _CAP, 2 * math.pi):
         env = _FakeEnv()
         total = 0.0
         for _ in range(200):              # a full 4 s episode
             env.tick(omega)
             total += float(microduck_mdp.pv_progress_reward(env)[0])
-        totals.append(total)
-    assert math.isclose(totals[0], totals[1], rel_tol=1e-6)
+        totals[omega] = total
+    at_or_under = [totals[o] for o in (math.pi / 2, math.pi, _CAP)]
+    assert math.isclose(min(at_or_under), max(at_or_under), rel_tol=1e-6)
+    assert totals[2 * math.pi] < totals[_CAP] * 0.8, (
+        "turning faster than the cap forfeits pay — v3's 1.5 turns/s cap was "
+        "read as a target", totals
+    )
 
 
 def test_complete_bonus_is_one_shot():
@@ -438,7 +555,7 @@ def test_pin_costs_stop_at_the_settle():
     assert 0.0 < float(env._pv_pin_d[0]) < microduck_mdp.PV_PIN_BREAK_M
     assert bool(env._pv_broken[0]) is False
     assert 0.0 < float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) < 1.0
-    _turn_for(env, _CAP, 0.6)                          # ...and finish the turn
+    _turn_for(env, _CAP, 1.1)                          # ...and finish the turn
     assert bool(env._pv_done[0]) is True
     assert float(env._pv_pin_d[0]) > 0.0, "still moved"
     assert float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) == 0.0
@@ -461,7 +578,7 @@ def test_pin_pays_nothing_while_standing_still():
     env.tick(_CAP)
     assert math.isclose(float(microduck_mdp.pv_pin_reward(env)[0]), 1.0, rel_tol=1e-6)
     # over-turning past the full turn banks nothing, so the pin stops paying too
-    _turn_for(env, _CAP, 1.0)
+    _turn_for(env, _CAP, 1.4)
     assert bool(env._pv_done[0]) is True
     env.tick(_CAP)
     assert float(microduck_mdp.pv_pin_reward(env)[0]) == 0.0
@@ -599,7 +716,7 @@ def test_a_broken_pin_earns_no_progress():
 
 def test_pin_broken_cost_is_bounded_and_spin_phase_only():
     env = _FakeEnv()
-    _turn_for(env, _CAP, 1.1)                    # finish the turn cleanly
+    _turn_for(env, _CAP, 1.4)                    # finish the turn cleanly
     assert bool(env._pv_done[0]) is True
     env.set_contact(_LEFT, False)                # lift the pin during the settle
     _turn_for(env, 0.0, 0.5)
@@ -931,7 +1048,7 @@ def test_counter_rotation_is_charged():
     # ...and it is OFF once the turn is done: stopping is the settle's job, and
     # decelerating out of a turn overshoots the other way.
     env = _FakeEnv()
-    _turn_for(env, _CAP, 1.0)
+    _turn_for(env, _CAP, 1.4)
     assert bool(env._pv_done[0]) is True
     env.tick(-_CAP)
     assert float(microduck_mdp.pv_counter_yaw_penalty(env)[0]) == 0.0
@@ -976,7 +1093,7 @@ def test_stall_cost_fires():
     assert float(microduck_mdp.pv_stall_penalty(env)[0]) == 0.0
 
     # and standing still is the GOAL once the turn is done: no stall cost there
-    _turn_for(env, _CAP, 1.0)
+    _turn_for(env, _CAP, 1.4)
     assert bool(env._pv_done[0]) is True
     for _ in range(100):
         env.tick(0.0)
@@ -1019,7 +1136,7 @@ def test_pin_curriculum_stages_parse():
         steps = [s["step"] for s in stages]
         assert steps == sorted(steps) and len(set(steps)) == len(steps)
         assert steps[0] == 0
-        assert steps[-1] == PIN_TIGHTEN_ITER * 24 == 1500 * 24
+        assert steps[-1] == PIN_TIGHTEN_ITER * 24 == 2400 * 24
         assert all(isinstance(s[key], float) for s in stages)
     assert [s["step"] for s in std_stages] == [s["step"] for s in w_stages]
 
@@ -1066,17 +1183,37 @@ def test_pin_curriculum_applies_through_the_manager():
 _PIVOT_TERMS = (
     "pivot_progress", "pivot_complete", "pin", "paddle", "paddle_reach",
     "settle", "pin_displacement", "pin_slip", "pin_broken", "two_feet_still",
-    "stall", "counter_yaw",
+    "stall", "counter_yaw", "terminated",
 )
 
+# The terms every strategy collects identically — WHILE IT IS ALIVE AND UPRIGHT.
+#
+# v3's table left these out as "common to every row, they cancel", and that is
+# exactly why v3's arithmetic never priced a fall. They cancel only between
+# strategies that survive the whole episode. A strategy that TERMINATES forfeits
+# them for every remaining step, and that forfeit is the larger half of what a
+# fall actually costs: at +3.0/step, dying at 0.6 s throws away ~+510 of income
+# that standing still collects in full. It is also, arithmetically, what v3's
+# log was reporting — mean episode return 4.29 over 43 steps is 4.29/(43 x 0.02)
+# = ~5.0 of stack per step, i.e. essentially this common income and nothing
+# else, which is what a policy that pivots and falls at 0.87 s takes home.
+#
+# `upright` + `height_stand` only. head_pose_tracking is left out (it is a
+# neck-posture term, not a survival term), which makes the comparison
+# CONSERVATIVE: counting it would make every terminating strategy look worse.
+def _weights(cfg):
+    """The live weights for every term the arithmetic scores."""
+    return {n: cfg.rewards[n].weight for n in _PIVOT_TERMS + ("tilt",)}
 
-def _score(env, weights):
-    """Weighted sum of the pivot-specific terms for the current step.
 
-    height_stand / upright / head_pose_tracking are common to every strategy
-    and cancel, so they are left out (and the fake env has no bodies to
-    resolve them against).
-    """
+def _common_per_step(cfg):
+    return cfg.rewards["upright"].weight + cfg.rewards["height_stand"].weight
+
+
+def _score(env, weights, common=0.0):
+    """Weighted sum of the pivot-specific terms for the current step, plus the
+    common upright/height income the step earns (0 once the trunk is past the
+    fallen gate — a toppling robot does not collect it either)."""
     fns = {
         "pivot_progress": microduck_mdp.pv_progress_reward,
         "pivot_complete": microduck_mdp.pv_complete_bonus,
@@ -1090,26 +1227,48 @@ def _score(env, weights):
         "two_feet_still": microduck_mdp.pv_two_feet_still_penalty,
         "stall": microduck_mdp.pv_stall_penalty,
         "counter_yaw": microduck_mdp.pv_counter_yaw_penalty,
+        "terminated": microduck_mdp.pv_fall_penalty,
     }
-    return sum(weights[n] * float(fns[n](env)[0]) for n in _PIVOT_TERMS)
+    total = sum(weights[n] * float(fns[n](env)[0]) for n in _PIVOT_TERMS)
+    alive = float(microduck_mdp._pv_upright(
+        env, microduck_mdp._DEFAULT_ASSET_CFG, microduck_mdp.PV_UPRIGHT_GATE_DEG
+    )[0])
+    return total + common * alive
 
 
-def _episode(strategy, weights, steps=200):
-    """Run one 4 s episode of `strategy` and return the total pivot reward.
+# The tilt costs are the only common-stack terms that differ per strategy in a
+# way that matters here, and the fake env can compute them exactly, so they are
+# scored for real rather than assumed away.
+def _tilt_cost(env, weights):
+    return weights["tilt"] * float(microduck_mdp.pv_tilt_penalty(env)[0])
 
-    `pivot`   — 1 turn/s, pin planted and motionless, free foot on a 0.2 s up /
-                0.1 s down cadence, carrying its contact point 6 cm per stroke.
-    `shuffle` — WHAT v2 ACTUALLY LEARNED: both feet on the floor the whole time,
-                both sliding (the pin travels at 0.1 m/s), trunk yawing at
-                1.5 rad/s. Contact fractions 1.0 / 1.0 is the limit of the
-                measured 0.91 / 0.85, and 0.1 m/s of pin travel reproduces the
-                6-17 cm of trunk drift over a 4 s episode.
-    `still`   — the v1 argmax: nothing moves.
+
+def _episode(strategy, weights, steps=200, common=0.0):
+    """Run one 4 s episode of `strategy` and return the total reward.
+
+    `pivot`    — 0.75 turns/s (the v4 rate cap: full pay, a 1.33 s turn), pin
+                 planted and motionless, free foot on a 0.24 s up / 0.12 s down
+                 cadence carrying its contact point 6 cm per stroke, trunk
+                 upright throughout.
+    `shuffle`  — WHAT v2 LEARNED: both feet on the floor the whole time, both
+                 sliding (the pin travels at 0.1 m/s), trunk yawing at
+                 1.5 rad/s. Contact fractions 1.0 / 1.0 is the limit of the
+                 measured 0.91 / 0.85, and 0.1 m/s of pin travel reproduces the
+                 6-17 cm of trunk drift over a 4 s episode.
+    `fastfall` — WHAT v3 LEARNED, given every benefit of the doubt: a 2 turns/s
+                 whip with the pin held perfectly planted and the paddle cadence
+                 of a textbook pivot, the trunk tipping linearly to 90° over
+                 0.6 s and `fell_over` firing there (v3's clean render went over
+                 at 0.54 s; the run's mean episode length was 0.87 s). The
+                 episode ENDS at the fall and collects nothing after it.
+    `still`    — the v1 argmax: nothing moves.
     """
     env = _FakeEnv()
     total = 0.0
-    turn_rate = 2 * math.pi                       # 1 turn/s
+    turn_rate = microduck_mdp.PV_RATE_CAP         # 0.75 turns/s: full pay
     shuffle_rate = 1.5                            # rad/s, as measured on v2
+    whip_rate = 2 * 2 * math.pi                   # 2 turns/s, as measured on v3
+    fall_step = int(round(0.6 / 0.02))            # the topple completes at 0.6 s
     for k in range(steps):
         done = bool(env._pv_done[0]) if hasattr(env, "_pv_done") else False
         if strategy == "still":
@@ -1119,46 +1278,69 @@ def _episode(strategy, weights, steps=200):
                 env.set_contact(_RIGHT, True)
                 env.tick(0.0)
             else:
-                # the free foot alternates: 0.2 s up, 0.1 s down, pin planted,
-                # and it TRAVELS while it is up — 10 steps x 6 mm = 6 cm per
+                # the free foot alternates: 0.24 s up, 0.12 s down, pin planted,
+                # and it TRAVELS while it is up — 12 steps x 5 mm = 6 cm per
                 # stroke, in the middle of the 4-8 cm reach plateau.
-                up = (k % 15) < 10
+                up = (k % 18) < 12
                 env.set_contact(_RIGHT, not up)
-                env.tick(turn_rate, free_dxy=(0.0, 0.006) if up else (0.0, 0.0))
+                env.tick(turn_rate, free_dxy=(0.0, 0.005) if up else (0.0, 0.0))
         elif strategy == "shuffle":
             env.tick(0.0 if done else shuffle_rate,
                      pin_dxy=(0.0, 0.0) if done else (0.002, 0.0))
-        total += _score(env, weights)
+        elif strategy == "fastfall":
+            up = (k % 18) < 12
+            env.set_contact(_RIGHT, not up)
+            env.set_tilt(90.0 * min(1.0, (k + 1) / fall_step))
+            env.tick(whip_rate, free_dxy=(0.0, 0.005) if up else (0.0, 0.0))
+            if k + 1 >= fall_step:
+                env.termination_manager.fire("fell_over")
+        total += _score(env, weights, common) + _tilt_cost(env, weights)
+        if strategy == "fastfall" and k + 1 >= fall_step:
+            break                                 # a terminated episode is over
     return total
 
 
 def test_the_arithmetic_pivoting_wins():
-    """still vs pivoting vs the two-footed shuffle-spin, priced with the live
-    weights on the fake env — the per-step table in the cfg docstring, executed.
+    """FOUR strategies over a whole 4 s episode, priced with the live weights on
+    the fake env — the table in the cfg docstring, executed.
 
-    The v3 ranking is not v2's. In v2 the shuffle came SECOND (it collected the
-    progress and merely gave up the pin), which is exactly why checkpoint 2499
-    learned it. Here it comes LAST, below standing still: its pin passes 3 cm
-    after ~0.3 s, `_pv_broken` latches, the potential stops advancing, and from
-    then on it collects nothing while paying pin_broken + displacement + slip +
-    two_feet_still + stall.
+    v1 ranked STANDING first. v2 ranked the SHUFFLE second, and duly learned it.
+    v3 fixed both and ranked FALLING second — checkpoint 2499 pivoted with the
+    foot roles finally right and then went over in 4 evaluation episodes out of
+    4, mean episode length 43 steps of 200. This is the v4 ranking, and the
+    fourth row is the one v3 was missing.
+
+    The decisive line for the faller is `common`. v3's table dropped the
+    upright/height stack as "common to every row"; it is common only to rows
+    that SURVIVE, and a strategy that terminates at 0.6 s collects 30 steps of
+    it instead of 200. The termination penalty is real but small next to that —
+    which is the point: a fall has to lose on the income it throws away, not on
+    a single punitive spike.
     """
     cfg = make_microduck_pivot_env_cfg()
-    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}
+    weights = _weights(cfg)
     weights["pin_displacement"] = W_PIN_DISPLACEMENT       # the tightened values
     weights["pin_broken"] = W_PIN_BROKEN
+    common = _common_per_step(cfg)
 
-    still = _episode("still", weights)
-    pivot = _episode("pivot", weights)
-    shuffle = _episode("shuffle", weights)
+    still = _episode("still", weights, common=common)
+    pivot = _episode("pivot", weights, common=common)
+    shuffle = _episode("shuffle", weights, common=common)
+    fastfall = _episode("fastfall", weights, common=common)
 
-    assert still < 0.0, f"standing still must LOSE outright, scored {still}"
-    assert pivot > still > shuffle, (pivot, still, shuffle)
+    assert pivot > still > fastfall > shuffle, (pivot, still, fastfall, shuffle)
     assert pivot - still > 1000.0, "turning must beat standing by a landslide"
     assert still - shuffle > 200.0, (
         "the shuffle-spin must score BELOW standing still, not just below a "
         "pivot — v2 ranked it second and duly learned it"
     )
+    # THE v4 ASSERTION.
+    assert still - fastfall > 200.0, (
+        "a fast pivot that falls at 0.6 s must lose to STANDING STILL — v3 "
+        "priced the shuffle and the stall but never the fall, and the policy "
+        "read that correctly", still, fastfall
+    )
+    assert pivot - fastfall > 1500.0, (pivot, fastfall)
 
     # the wrong-way wiggle v1 settled into: it still collects nothing at all.
     env = _FakeEnv()
@@ -1166,7 +1348,67 @@ def test_the_arithmetic_pivoting_wins():
     for _ in range(200):
         env.tick(-0.4)                            # ~-23 deg/s, as measured
         wrong += _score(env, weights)
-    assert wrong < still, (wrong, still)
+    assert wrong < _episode("still", weights), (wrong,)
+
+
+def test_falling_loses_on_forfeited_income_not_only_on_the_penalty():
+    """Where the fall's price actually comes from — the number that decides it
+    is the one v3's arithmetic cancelled away.
+
+    A 0.6 s fall forfeits 170 steps of the common upright/height stack. The
+    one-shot termination penalty is deliberately NOT sized to carry this on its
+    own: a -300 spike on one terminal step is the kind of jackpot AGENTS.md
+    warns about, in reverse. -20 is the marker; the forfeit is the money.
+    """
+    cfg = make_microduck_pivot_env_cfg()
+    weights = _weights(cfg)
+    common = _common_per_step(cfg)
+    assert cfg.rewards["terminated"].weight == W_TERMINATED == -20.0
+
+    forfeited = common * (200 - int(round(0.6 / 0.02)))
+    assert forfeited > 10 * abs(W_TERMINATED), (
+        "the forfeited income must dominate the one-shot penalty", forfeited
+    )
+
+    # and the penalty still has to be doing work: without it the gap narrows.
+    unpriced = dict(weights, terminated=0.0)
+    still = _episode("still", weights, common=common)
+    with_pen = _episode("fastfall", weights, common=common)
+    without = _episode("fastfall", unpriced, common=common)
+    assert without - with_pen == abs(W_TERMINATED), (with_pen, without)
+    assert with_pen < without < still, (with_pen, without, still)
+
+
+def test_the_progress_gate_is_what_stops_the_falling_whip():
+    """The single most load-bearing v4 change, isolated: a 2 turns/s whip that
+    topples earns progress only while the trunk is within 15 deg of vertical.
+
+    Under v3's 40 deg gate the same trajectory banked progress most of the way
+    to the floor — the run's `Episode_Reward/pivot_progress` was 0.755, i.e.
+    ~0.88 of the per-step cap over a 43-step episode, while every pin cost sat
+    near zero. Falling was not a failure of the reward's constraints, it was
+    what the reward paid for.
+    """
+    env = _FakeEnv()
+    earned, paid_steps = 0.0, 0
+    for k in range(30):                           # tipping to 90 deg over 0.6 s
+        env.set_tilt(90.0 * (k + 1) / 30.0)
+        env.tick(2 * 2 * math.pi)                 # 2 turns/s
+        step = float(microduck_mdp.pv_progress_reward(env)[0])
+        earned += step
+        paid_steps += int(step > 0.0)
+    assert paid_steps <= 6, (
+        "past 15 deg of lean the potential must stop advancing", paid_steps
+    )
+    # a 0.6 s topple therefore banks well under half a turn and never completes
+    assert float(env._pv_yaw[0]) < PV_TARGET_YAW / 2.0
+    assert bool(env._pv_done[0]) is False
+    # ...and nothing banked was BURNED: the same env, brought back upright,
+    # picks up exactly where it left off.
+    banked = float(env._pv_yaw[0])
+    env.set_tilt(0.0)
+    env.tick(microduck_mdp.PV_RATE_CAP)
+    assert float(env._pv_yaw[0]) > banked
 
 
 def test_the_shuffle_loses_per_step_during_the_spin_phase():
@@ -1175,7 +1417,7 @@ def test_the_shuffle_loses_per_step_during_the_spin_phase():
     moment the policy is choosing between the two, the shuffle must already be
     losing to doing nothing."""
     cfg = make_microduck_pivot_env_cfg()
-    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}
+    weights = _weights(cfg)
     weights["pin_displacement"] = W_PIN_DISPLACEMENT
     weights["pin_broken"] = W_PIN_BROKEN
 
@@ -1183,14 +1425,14 @@ def test_the_shuffle_loses_per_step_during_the_spin_phase():
     for strategy in ("still", "pivot", "shuffle"):
         env = _FakeEnv()
         total, counted = 0.0, 0
-        turn_rate, shuffle_rate = 2 * math.pi, 1.5
-        for k in range(75):                       # 1.5 s, spin phase throughout
+        turn_rate, shuffle_rate = microduck_mdp.PV_RATE_CAP, 1.5
+        for k in range(65):                       # 1.3 s, spin phase throughout
             if strategy == "still":
                 env.tick(0.0)
             elif strategy == "pivot":
-                up = (k % 15) < 10
+                up = (k % 18) < 12
                 env.set_contact(_RIGHT, not up)
-                env.tick(turn_rate, free_dxy=(0.0, 0.006) if up else (0.0, 0.0))
+                env.tick(turn_rate, free_dxy=(0.0, 0.005) if up else (0.0, 0.0))
             else:
                 env.tick(shuffle_rate, pin_dxy=(0.002, 0.0))
             if bool(env._pv_done[0]):
@@ -1211,10 +1453,13 @@ def test_the_loose_curriculum_still_prefers_a_pivot():
     ranking through the loose stage: a policy that could earn progress off the
     pin while the costs were cheap would learn to earn progress off the pin."""
     cfg = make_microduck_pivot_env_cfg()
-    weights = {n: cfg.rewards[n].weight for n in _PIVOT_TERMS}   # loose
+    weights = _weights(cfg)                                      # loose
+    common = _common_per_step(cfg)
     assert weights["pin_displacement"] == W_PIN_DISPLACEMENT_START
     assert weights["pin_broken"] == W_PIN_BROKEN_START
-    pivot = _episode("pivot", weights)
-    still = _episode("still", weights)
-    shuffle = _episode("shuffle", weights)
+    pivot = _episode("pivot", weights, common=common)
+    still = _episode("still", weights, common=common)
+    shuffle = _episode("shuffle", weights, common=common)
+    fastfall = _episode("fastfall", weights, common=common)
     assert pivot > still > shuffle, (pivot, still, shuffle)
+    assert pivot > still > fastfall, (pivot, still, fastfall)

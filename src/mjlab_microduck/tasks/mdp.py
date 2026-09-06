@@ -8244,6 +8244,30 @@ def bow_drift_penalty(
 #   c. `pv_two_feet_still_penalty`: both feet planted while the trunk yaws hard
 #      is the shuffle, named and charged directly.
 #
+# v4 — IT PIVOTS AND FALLS OVER. v3 (checkpoint 2499, lab sim, BAM, noise + DR,
+# twist (0,0,±1) held 4 s, two seeds each way) got the FOOT ROLES right at last:
+# pin contact 0.74 / 0.95 / 0.81 / 0.97, free-foot contact 0.24 / 0.21 / 0.14 /
+# 0.18, pin displacement 2.4–3.5 cm, trunk yaw +298° / +182° / -273° / -557°.
+# And 4 falls out of 4 — the clean render went over at 0.54 s, the training log
+# reports mean episode length 43 steps of 200 and `fell_over` as the only
+# termination that ever fired. v3's arithmetic made the shuffle lose and made
+# standing still lose; it never priced FALLING, which is not merely un-penalised
+# but actively PROFITABLE under v3's own stack, because ending the episode also
+# ends the stall bill a standing robot pays for the full 4 s. v4 prices staying
+# up, in four places:
+#   a. `pv_fall_penalty` — the terminal state charged directly, one shot, as
+#      the bow's v4 does.
+#   b. `PV_PROGRESS_TILT_DEG` — the progress potential only advances within 15°
+#      of vertical, so a toppling turn earns nothing. This is the one that
+#      actually removes the income: v3 collected ~0.88 of the per-step progress
+#      cap all the way to the floor.
+#   c. `PV_RATE_CAP` 1.5 → 0.75 turns/s — a cap set at "we will not pay for
+#      violence past here" was read as a target, and 1.5 turns/s is not a speed
+#      this robot can pivot at over a planted foot. Full pay now lives on a
+#      1.3 s turn.
+#   d. heavier `tilt` and `body_ang_vel` (x/y) costs — the rocking that precedes
+#      a fall, priced before it becomes one.
+#
 # DIRECTION IS OBSERVED, NOT BAKED IN. The daemon does NOT zero the twist during
 # a skill window — it feeds the skill's CONFIGURED CONSTANT twist
 # (`robotd-params::SkillDef::command`, `robotd/src/control.rs`), which is zeros
@@ -8264,7 +8288,33 @@ PV_TARGET_YAW = 2.0 * math.pi   # one full turn about the pin
 PV_DIRECTION_CCW = 1.0          # +1 = counter-clockwise, pin = LEFT foot
 PV_DIRECTION_CW = -1.0          # -1 = clockwise, pin = RIGHT foot
 PV_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the pivot pays
-PV_RATE_CAP = 1.5 * 2.0 * math.pi   # progress pay saturates at 1.5 turns/s (rad/s)
+
+# ── v4: the progress potential is gated on being UPRIGHT, tightly ────────────
+# v3 (checkpoint 2499) finally got the FOOT ROLES right — pin contact 0.74 /
+# 0.95 / 0.81 / 0.97, free-foot contact 0.24 / 0.21 / 0.14 / 0.18, pin
+# displacement 2.4–3.5 cm — and then fell over in 4 episodes out of 4 (the clean
+# render at 0.54 s; the log's mean episode length was 43 steps of 200 and
+# `Episode_Termination/fell_over` was the ONLY termination that ever fired).
+# It was not a pivot that happened to fall: falling was the STRATEGY. v3 priced
+# the shuffle out but never priced a topple, and a toppling whip collects the
+# progress and pin pay at full rate all the way down — v3's log shows
+# `pivot_progress` at 0.755 per episode, i.e. ~0.88 of the per-step cap earned
+# over 43 steps, while every pin cost sat near zero.
+#
+# 40° is the FALLEN gate; it is far too late to stop this, because by 40° the
+# robot is already going over. The potential now only advances while the trunk
+# is within `PV_PROGRESS_TILT_DEG` of vertical, so degrees turned on the way to
+# the floor are not progress and are never paid for — the same trick v3 played
+# on the shuffle with `_pv_broken`, applied to the topple. Nothing banked is
+# lost (the potential is a running maximum and `_pv_raw` is floored at zero);
+# the turn simply stops accruing until the robot is back over its feet.
+PV_PROGRESS_TILT_DEG = 15.0
+
+# v4: 1.5 turns/s (a 0.7 s whip) was a speed no Microduck can pivot at while
+# staying over its pin — the cap was set to "do not pay for violence past here"
+# and the policy read it as a target. 0.75 turns/s puts the full per-step pay on
+# a 1.3 s turn, which still leaves ~2.7 s of the 4 s episode for the settle.
+PV_RATE_CAP = 0.75 * 2.0 * math.pi  # progress pay saturates at 0.75 turns/s (rad/s)
 
 # ── The direction flag has to be TWO-SIDED ───────────────────────────────────
 # The potential is a running maximum clamped at zero, so turning the WRONG way
@@ -8289,8 +8339,12 @@ PV_STALL_RAMP_S = 0.5
 # of the v2 shuffle-spin (per-foot contact fractions 0.91 / 0.85) were already
 # long enough to collect the paddle, so the term paid for a twitch. 0.08 s is
 # four control steps of genuine air.
+# v4 widens the ceiling 0.35 → 0.45 s. The rate cap came down to 0.75 turns/s,
+# so a paid turn is now a ~1.3 s affair and its strokes are correspondingly
+# longer; a 0.35 s ceiling would have paid the whip's cadence and not the slow
+# one's. Still well short of a flamingo hold.
 PV_MIN_AIR_S = 0.08
-PV_MAX_AIR_S = 0.35
+PV_MAX_AIR_S = 0.45
 
 # ── v3: the pin is a HARD REQUIREMENT, not a graded preference ───────────────
 # v2 (checkpoint 2499) turned — +421°/+362° on +1, -365°/-303° on -1, 360°
@@ -8391,6 +8445,7 @@ def _pv_update(
     break_air_s: float = PV_PIN_BREAK_AIR_S,
     break_disp_m: float = PV_PIN_BREAK_M,
     replant_m: float = PV_PIN_REPLANT_M,
+    progress_tilt_deg: float = PV_PROGRESS_TILT_DEG,
     min_air: float = PV_MIN_AIR_S,
 ) -> None:
     """Tick the per-env pivot memory exactly once per env step.
@@ -8587,7 +8642,19 @@ def _pv_update(
     # (v2's docstring argued against a gate on exactly the burn grounds; the
     # burn was the un-floored integral, and that is gone.) The pressure to
     # repair is automatic: while the potential is frozen the stall timer runs.
-    counts = pin_contact & ~env._pv_broken
+    #
+    # v4: ALSO GATED ON BEING UPRIGHT, at `progress_tilt_deg` (15°) rather than
+    # the 40° fallen gate. v3 fell over in 4 evaluation episodes out of 4 and
+    # still collected ~0.88 of the per-step progress cap on the way down: a
+    # topple yaws the trunk beautifully, and nothing in v3 distinguished those
+    # degrees from a pivot's. They are not the same degrees. 40° is the gate on
+    # "has fallen"; by then the fall is already unrecoverable, so the pay has to
+    # stop while the lean is still a lean. Same safety argument as the pin gate:
+    # the potential is a running maximum and the raw integral is floored, so
+    # this can only stop new degrees accruing, never burn banked ones — a robot
+    # that leans hard, recovers and carries on keeps everything it earned.
+    upright = _pv_upright(env, asset_cfg, progress_tilt_deg) > 0.0
+    counts = pin_contact & ~env._pv_broken & upright
     env._pv_raw = torch.clamp(
         env._pv_raw + env._pv_omega * env.step_dt * counts.float(), min=0.0
     )
@@ -9028,6 +9095,39 @@ def pv_tilt_penalty(
         1.0 - 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2), nan=1.0
     )
     return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
+
+
+def pv_fall_penalty(
+    env: ManagerBasedRlEnv,
+    term_names: tuple[str, ...] = ("fell_over",),
+) -> torch.Tensor:
+    """0/1 cost (negative weight): the episode ENDED in a fall this step.
+
+    THE v4 TERM, and the bow's lesson arriving here a version late. v3's
+    arithmetic made the shuffle lose and made standing still lose, but it never
+    priced FALLING — a fall just ends the episode and stops the income, and an
+    episode that stops early stops paying the stall bill too. Checkpoint 2499
+    read that correctly: every one of four evaluation episodes ended in a fall,
+    mean episode length was 43 steps of 200, and `fell_over` was the only
+    termination that ever fired in the whole run.
+
+    The forfeited income is most of the real price (see the cfg's arithmetic:
+    the common upright/height stack alone is +3.0/step, so dying at 0.6 s throws
+    away ~+510 of it), but forfeiting is not the same as being charged, and a
+    terminal state that merely stops the meter is still an exit. This charges
+    it. One shot, on the terminating step, exactly as `bow_termination_penalty`
+    does — thin delegation to that function rather than a second copy of the
+    same three lines, because the semantics are identical and the subtlety
+    (read the named terms individually so a `nan_state` sim blow-up is not
+    billed to the policy; terminations are computed before rewards in
+    ``ManagerBasedRlEnv.step``, so the flag is this step's) is worth having in
+    exactly one place.
+
+    Only `fell_over` is named: the pivot cfg adds no behavioural termination of
+    its own, and `out_of_terrain_bounds` on a task whose trunk is supposed to
+    orbit is an arena-size artifact, not a failure the policy chose.
+    """
+    return bow_termination_penalty(env, term_names=term_names)
 
 
 def pv_counter_yaw_penalty(
