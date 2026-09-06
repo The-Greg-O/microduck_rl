@@ -8569,6 +8569,43 @@ def bow_drift_penalty(
 #   d. heavier `tilt` and `body_ang_vel` (x/y) costs — the rocking that precedes
 #      a fall, priced before it becomes one.
 #
+# v5 — THE CURVE WENT THE WRONG WAY. v4's log (4000 iterations, 4096 envs) is
+# not a failure to learn; it is a preference being discovered, in order:
+#
+#   iter 1000  mean episode length 191 of 200, `fell_over` 1.6/iter,
+#              progress 0.59/step         — surviving, turning slowly
+#   iter 2000  length 133,  falls 18/iter
+#   iter 3000  length  74,  falls 58/iter, progress 0.82
+#   iter 3999  length  77,  falls 47/iter, progress 0.90,
+#              `terminated` -0.09/step, `pivot_complete` 0.0014, `settle` 0.0009
+#
+# Progress rose monotonically while episode length collapsed. The lab eval
+# agrees the SKILL is there — BAM, noise + DR, 3 seeds per direction: 2 of 6
+# episodes complete a full turn on one foot without falling, pin contact
+# 0.76-0.97, free foot 0.31-0.49, pin drift 2-6 cm — and that the reward makes
+# falling profitable past ~iteration 1500. The arithmetic, at v4 weights: a turn
+# that falls at 0.9 s pays -20 once (=-0.09/step averaged) and collects progress
+# at up to 6.0/step; the "common survival income" v4's whole argument rested on
+# was upright 2.0 + height 1.0 = 3.0/step, HALF the progress term. v4 named the
+# right mechanism (a fall is paid for in forfeited income) and then under-funded
+# it. Two things fix that, and v5 does both by construction:
+#   a. `pv_alive_reward` — a CONSTANT +3.0/step, upright-gated at 15 deg, so a
+#      surviving episode banks 600 against a perfect turn's whole 400-point
+#      progress budget. Nothing to farm, no pose to seek: just the price of the
+#      clock continuing. A fall now forfeits ~570, not ~510 of a smaller stack.
+#   b. `pv_fall_penalty` at -100 (was -20) — the marker sized against the term
+#      it actually competes with.
+# And two stop the policy being PUSHED into the instability it then priced:
+#   c. `PV_RATE_CAP` 0.75 -> 0.5 turns/s with the progress weight 6 -> 4: full
+#      pay on a 2 s turn, and a progress budget that no longer out-earns being
+#      alive.
+#   d. the pin curriculum stops at `PV_PIN_STD_FLOOR_M` (2.5 cm) and -1.5 by
+#      iteration 1600 and then HOLDS. v4 tightened toward 1.5 cm / -2.0 across
+#      1600-2400 — precisely the window where falls went 1.6 -> 18 -> 58.
+# The finish is where the money moves TO: `pivot_complete` +5 -> +15 and
+# `settle` +4 -> +6, both re-gated from 40 deg to 15 deg, so the jackpot is
+# finishing the turn UPRIGHT rather than reaching 360 deg fast.
+#
 # DIRECTION IS OBSERVED, NOT BAKED IN. The daemon does NOT zero the twist during
 # a skill window — it feeds the skill's CONFIGURED CONSTANT twist
 # (`robotd-params::SkillDef::command`, `robotd/src/control.rs`), which is zeros
@@ -8611,11 +8648,27 @@ PV_UPRIGHT_GATE_DEG = 40.0      # beyond this tilt nothing about the pivot pays
 # the turn simply stops accruing until the robot is back over its feet.
 PV_PROGRESS_TILT_DEG = 15.0
 
-# v4: 1.5 turns/s (a 0.7 s whip) was a speed no Microduck can pivot at while
-# staying over its pin — the cap was set to "do not pay for violence past here"
-# and the policy read it as a target. 0.75 turns/s puts the full per-step pay on
-# a 1.3 s turn, which still leaves ~2.7 s of the 4 s episode for the settle.
-PV_RATE_CAP = 0.75 * 2.0 * math.pi  # progress pay saturates at 0.75 turns/s (rad/s)
+# ── v5: the same 15 deg gate, on the SURVIVAL income and on the FINISH ───────
+# v4's alive/complete/settle gates all sat at the 40 deg FALLEN line, which is
+# a gate on "has already lost". v5 pays the constant `alive` income (the term
+# that makes staying up worth more than any turn — see `pv_alive_reward`) and
+# the completion/settle jackpot only inside the same 15 deg cone the progress
+# potential uses, so "upright" means one thing everywhere the reward is large.
+# Named separately from PV_PROGRESS_TILT_DEG so a future tune can move one
+# without silently moving the others.
+PV_ALIVE_TILT_DEG = 15.0
+PV_FINISH_TILT_DEG = 15.0
+
+# v5: 0.75 turns/s (a 1.33 s turn) was still faster than this robot can carry a
+# trunk around a planted foot, and the v4 log shows exactly what happened when
+# the policy reached for it: at iteration 1000 mean episode length was 191 of
+# 200 with 1.6 falls per iteration and progress at 0.59/step (surviving, turning
+# slowly); by 3000 progress was 0.82 and falls were 58 per iteration; by 3999,
+# progress 0.90 and 47 falls. The policy did not fail to learn the cap — it
+# learned it, and falling on the way was the cheaper half of the deal. 0.5
+# turns/s puts full pay on a 2 s turn, which still leaves half the 4 s episode
+# for the settle.
+PV_RATE_CAP = 0.5 * 2.0 * math.pi  # progress pay saturates at 0.5 turns/s (rad/s)
 
 # ── The direction flag has to be TWO-SIDED ───────────────────────────────────
 # The potential is a running maximum clamped at zero, so turning the WRONG way
@@ -8641,9 +8694,11 @@ PV_STALL_RAMP_S = 0.5
 # long enough to collect the paddle, so the term paid for a twitch. 0.08 s is
 # four control steps of genuine air.
 # v4 widens the ceiling 0.35 → 0.45 s. The rate cap came down to 0.75 turns/s,
-# so a paid turn is now a ~1.3 s affair and its strokes are correspondingly
-# longer; a 0.35 s ceiling would have paid the whip's cadence and not the slow
-# one's. Still well short of a flamingo hold.
+# so a paid turn became a ~1.3 s affair and its strokes correspondingly longer;
+# a 0.35 s ceiling would have paid the whip's cadence and not the slow one's.
+# v5 halves the cap again (0.5 turns/s, a 2 s turn) and LEAVES THIS WINDOW
+# ALONE: 0.45 s is already well short of a flamingo hold, and widening it
+# further would start paying for a one-legged park rather than a stroke.
 PV_MIN_AIR_S = 0.08
 PV_MAX_AIR_S = 0.45
 
@@ -8695,9 +8750,18 @@ PV_TWOFOOT_YAW_CAP = 3.0    # rad/s: fully charged
 #                  the sole, which moves the site by ≲1 cm; a STEP moves it 4+.
 #   PV_PIN_SAT_M   4 cm — one foot length: the cost is saturated, it stepped.
 PV_PIN_STD_M = 0.015
-PV_PIN_STD_START_M = 0.04       # curriculum start: a whole footprint of slack,
-                                # tightened to PV_PIN_STD_M by iter 1500 so the
-                                # first lift of the free foot is affordable.
+PV_PIN_STD_START_M = 0.04       # curriculum start: a whole footprint of slack.
+# ── v5: THE CURRICULUM NO LONGER REACHES THE MEASURED VALUE ──────────────────
+# 1.5 cm is the geometry — the site travel of a foot that rotates about a point
+# inside its own sole — and it stays here as the function default and as the
+# number the docstring above derives. It is NOT where the curriculum stops any
+# more. The v4 run's falls per iteration went 1.6 → 18 → 58 across exactly the
+# window the pin ramp was tightening in (1600-2400), while episode length went
+# 191 → 133 → 74: squeezing the pin toward its geometric limit while the pay
+# cap was pulling the policy faster is what pushed it into the instability.
+# v5 stops the ramp at 2.5 cm — still under a foot width, still a pin and not a
+# step — and holds it there for the rest of the run.
+PV_PIN_STD_FLOOR_M = 0.025
 PV_PIN_SAT_M = 0.04
 PV_PIN_SLIP_SAT = 0.10          # m/s of in-contact sliding = full slip cost
 PV_RADIUS_M = 0.042             # measured trunk↔foot xy at STAND: the orbit radius
@@ -9022,8 +9086,8 @@ def pv_progress_reward(
     Pays Δ(progress potential)/(rate_cap · dt) — potential-based, so holding
     still pays zero, a back-and-forth wobble cannot re-earn the same degrees
     (the potential is a running maximum) and turning on past 360° pays nothing.
-    Capped at 1.0/step so violence past ~1.5 turns/s buys nothing, and zeroed
-    while tilted past the upright gate.
+    Capped at 1.0/step so violence past the rate cap (v5: 0.5 turns/s, a 2 s
+    turn) buys nothing, and zeroed while tilted past the upright gate.
 
     v3 GATES THE POTENTIAL ON THE PIN (in ``_pv_update``): the integral only
     advances while the pin foot is in contact and not in the broken state, so
@@ -9048,14 +9112,22 @@ def pv_complete_bonus(
     command_name: str = "twist",
     direction: Optional[float] = None,
     target_yaw: float = PV_TARGET_YAW,
-    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    gate_tilt_above_deg: float = PV_FINISH_TILT_DEG,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0/1, ONE step per episode: the full turn just completed, upright.
+    """0/1, ONE step per episode: the full turn just completed, UPRIGHT (15 deg).
 
     One-shot on purpose — a per-step "you are done" is the jackpot the playbook
     warns about and would buy a ballistic whip. The incentive to be FAST comes
     from the settle phase: finish sooner, collect settle pay longer.
+
+    v5 moves the gate from the 40 deg fallen line to 15 deg and triples the
+    weight (+5 -> +15). Those two go together: a completion bonus paid at 39 deg
+    of lean is a bonus for arriving in a state the robot is about to fall out
+    of, and tripling THAT would buy the whip. Paid only for a turn finished with
+    the trunk actually over its feet, it is the reward for finishing the trick
+    rather than for turning fast — which is the substitution v5 is making
+    everywhere: speed is no longer what the stack pays for, FINISHING UPRIGHT is.
     """
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     return env._pv_just_done.float() * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
@@ -9122,8 +9194,10 @@ def pv_pin_displacement_penalty(
     under itself and stand, which usually means moving the pin — charging the
     tightened -2.0 for every step of the ~150-step settle would swamp the
     settle pay (+4.0) and make finishing the trick worse than never finishing
-    it. The weight is on a curriculum (-0.5 → -2.0 by iteration 1500) so the
-    first, clumsy attempts at lifting the free foot stay affordable."""
+    it. The weight is on a curriculum (v5: -0.5 → -1.5 by iteration 1600, then
+    held) so the first, clumsy attempts at lifting the free foot stay
+    affordable — and so the back half of the run is not spent tightening a
+    pressure a working pivot pays every step."""
     _pv_update(env, sensor_name, feet_cfg, asset_cfg, command_name, direction, target_yaw)
     d2 = torch.square(env._pv_pin_d)
     cost = torch.clamp(d2 / max(saturate_m**2, 1e-9), 0.0, max_cost)
@@ -9319,10 +9393,11 @@ def pv_settle_reward(
     rate_std: float = 1.0,
     pose_std: float = 0.4,
     joint_indices: Optional[list] = None,
-    gate_tilt_above_deg: float = PV_UPRIGHT_GATE_DEG,
+    gate_tilt_above_deg: float = PV_FINISH_TILT_DEG,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0..1 per step, settle phase only: BOTH feet down, stopped, STAND pose.
+    """0..1 per step, settle phase only: BOTH feet down, stopped, STAND pose,
+    and (v5) within 15 deg of vertical rather than the 40 deg fallen line.
 
     A PRODUCT of factors (yaw rate → 0, legs → HOME, both feet on the floor),
     not a sum: an additive stack has a compromise basin where a still-turning
@@ -9398,6 +9473,46 @@ def pv_tilt_penalty(
     return torch.clamp(1.0 - cos_tilt, 0.0, max_cost)
 
 
+def pv_alive_reward(
+    env: ManagerBasedRlEnv,
+    gate_tilt_above_deg: float = PV_ALIVE_TILT_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """1.0 every step the episode is ALIVE and the trunk is within
+    ``gate_tilt_above_deg`` (15 deg) of vertical. THE v5 TERM.
+
+    A constant, not a shaped one: it has no gradient toward any pose, no
+    optimum to seek and nothing to farm — it is simply the price of the clock
+    continuing to run. Its whole job is to be BIG. At +3.0/step a surviving
+    episode banks 600 over its 200 steps, which is larger than the entire
+    progress budget of a perfect turn (4.0 x 100 steps = 400), so no turn —
+    however fast, however complete — can pay for the episode it ends.
+
+    WHY v4 NEEDED THIS. v4 already argued that a fall is paid for mostly in
+    FORFEITED INCOME rather than in its one-shot penalty, and that argument was
+    right; the income was just too small. v4's forfeitable stack was
+    `upright` 2.0 + `height_stand` 1.0 = 3.0/step, against a progress term
+    paying up to 6.0/step. So a turn that fell at ~0.9 s traded only ~465 of
+    forfeited income for a turn taken at twice the paid rate, and the -20
+    marker averaged -0.09/step against progress at 0.90/step. The v4 log is
+    that trade being discovered: mean episode length 191 -> 133 -> 74 over
+    iterations 1000 -> 2000 -> 3000, `fell_over` 1.6 -> 18 -> 58 per iteration,
+    and `pivot_progress` RISING the whole way (0.59 -> 0.82 -> 0.90). The curve
+    went the wrong way because the arithmetic said it should.
+
+    This term makes the forfeit the dominant number by construction, and it is
+    gated at 15 deg rather than the 40 deg fallen line for the same reason the
+    progress potential is: 40 deg is where the fall is already lost, so income
+    paid up to it is income paid to a robot on its way down.
+
+    Not gated on the pivot at all — no `_pv_update`, no pin, no phase. Staying
+    up is worth this whether the policy is turning, settling or has not yet
+    worked out what the command means, which is exactly the property the
+    "common survival income" was supposed to have in v4 and did not.
+    """
+    return is_alive(env) * _pv_upright(env, asset_cfg, gate_tilt_above_deg)
+
+
 def pv_fall_penalty(
     env: ManagerBasedRlEnv,
     term_names: tuple[str, ...] = ("fell_over",),
@@ -9412,17 +9527,27 @@ def pv_fall_penalty(
     mean episode length was 43 steps of 200, and `fell_over` was the only
     termination that ever fired in the whole run.
 
-    The forfeited income is most of the real price (see the cfg's arithmetic:
-    the common upright/height stack alone is +3.0/step, so dying at 0.6 s throws
-    away ~+510 of it), but forfeiting is not the same as being charged, and a
-    terminal state that merely stops the meter is still an exit. This charges
-    it. One shot, on the terminating step, exactly as `bow_termination_penalty`
-    does — thin delegation to that function rather than a second copy of the
-    same three lines, because the semantics are identical and the subtlety
-    (read the named terms individually so a `nan_state` sim blow-up is not
-    billed to the policy; terminations are computed before rewards in
-    ``ManagerBasedRlEnv.step``, so the flag is this step's) is worth having in
-    exactly one place.
+    The forfeited income is most of the real price, but forfeiting is not the
+    same as being charged, and v3 proved a terminal state that merely stops the
+    meter is an exit the policy will take. This charges it. One shot, on the
+    terminating step, exactly as `bow_termination_penalty` does — thin
+    delegation to that function rather than a second copy of the same three
+    lines, because the semantics are identical and the subtlety (read the named
+    terms individually so a `nan_state` sim blow-up is not billed to the policy;
+    terminations are computed before rewards in ``ManagerBasedRlEnv.step``, so
+    the flag is this step's) is worth having in exactly one place.
+
+    v5 RAISES THE WEIGHT -20 -> -100, and raises the income it forfeits at the
+    same time (`pv_alive_reward`, +3.0/step). v4 sized this marker against a
+    +3.0/step common stack and reasoned that -20 was enough because the forfeit
+    carried the argument; measured against a progress term paying up to
+    +6.0/step it was not. -0.09/step of averaged penalty against +0.90/step of
+    progress is what the v4 log actually reports at iteration 3999, and the
+    policy priced it correctly: falls per iteration went 1.6 -> 18 -> 58 while
+    progress ROSE. -100 is still not a jackpot — one step in 200, ~-0.5/step
+    averaged over a 0.9 s episode — and it is still the smaller half of the
+    price next to the ~570 of alive+common income a 0.9 s fall throws away. It
+    is a marker sized to be visible against the term it competes with.
 
     Only `fell_over` is named: the pivot cfg adds no behavioural termination of
     its own, and `out_of_terrain_bounds` on a task whose trunk is supposed to
@@ -9510,8 +9635,11 @@ def pv_pin_std_curriculum(
     Discovery has to be CHEAP: at the tuned 1.5 cm the pin pay collapses the
     moment the planted foot shifts, so the very first, clumsy attempt at
     lifting the free foot loses the pin as well — and doing nothing wins. The
-    curriculum opens with a whole footprint of slack (4 cm) and tightens to the
-    measured value once the turn exists, phase-aligned with the pin
+    curriculum opens with a whole footprint of slack (4 cm) and tightens once
+    the turn exists — v5 stops at ``PV_PIN_STD_FLOOR_M`` (2.5 cm) rather than at
+    the measured 1.5 cm, because the v4 run's falls per iteration went
+    1.6 -> 18 -> 58 across exactly the window this ramp was still tightening in.
+    Phase-aligned with the pin
     DISPLACEMENT weight ramp in the cfg (AGENTS.md: use the proven split,
     ``reward_weight`` for weights, a params curriculum for everything else, and
     mutate through the manager — ``env.cfg`` is a deepcopy and writes to it are

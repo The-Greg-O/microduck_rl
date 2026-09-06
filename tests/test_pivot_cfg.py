@@ -22,20 +22,24 @@ from mjlab_microduck.tasks.microduck_pivot_env_cfg import (
     PV_DIRECTION_CCW,
     PV_DIRECTION_CW,
     PV_TARGET_YAW,
+    W_ALIVE,
+    W_COMPLETE,
     W_PIN_BROKEN,
     W_PIN_BROKEN_START,
     W_BODY_ANG_VEL,
     W_PIN_DISPLACEMENT,
     W_PIN_DISPLACEMENT_START,
+    W_PROGRESS,
+    W_SETTLE,
     W_TERMINATED,
     W_TILT,
     MicroduckPivotRlCfg,
     make_microduck_pivot_env_cfg,
 )
 
-# The per-step pay cap (v4: 0.75 turns/s, down from 1.5). Ticking at exactly
-# this rate makes every rate-scaled term (progress, and now the pin) score its
-# full 1.0, which is what the geometry assertions below want to isolate.
+# The per-step pay cap (v5: 0.5 turns/s — a 2 s turn — down from v4's 0.75).
+# Ticking at exactly this rate makes every rate-scaled term (progress, and the
+# pin) score its full 1.0, which is what the geometry assertions below isolate.
 _CAP = microduck_mdp.PV_RATE_CAP
 
 
@@ -174,14 +178,14 @@ def test_v3_terms_exist_with_the_stated_thresholds():
 
 
 def test_v4_terms_price_staying_up():
-    """The five v4 changes, wired: the fall is charged, the progress potential
-    is gated tightly on upright, the pay cap is halved, the paddle window is
-    widened to match, and the two lean/rock costs are felt."""
+    """The v4 changes that SURVIVE into v5: the fall is charged, the progress
+    potential is gated tightly on upright, the paddle window is wide, and the
+    two lean/rock costs are felt. (v5 re-sizes the fall penalty and the pay cap;
+    those are `test_v5_makes_staying_up_worth_more_than_any_turn`.)"""
     cfg = make_microduck_pivot_env_cfg()
 
     term = cfg.rewards["terminated"]
     assert term.func is microduck_mdp.pv_fall_penalty
-    assert term.weight == W_TERMINATED == -20.0
     assert term.params["term_names"] == ("fell_over",)
     assert "nan_state" not in term.params["term_names"], (
         "a sim blow-up is not something the policy chose"
@@ -195,22 +199,83 @@ def test_v4_terms_price_staying_up():
     assert (microduck_mdp.PV_PROGRESS_TILT_DEG
             < microduck_mdp.PV_UPRIGHT_GATE_DEG == 40.0)
 
-    # the pay cap, halved: full pay now lives on a 1.33 s turn, not a 0.67 s whip
-    assert math.isclose(microduck_mdp.PV_RATE_CAP, 0.75 * 2 * math.pi)
-    assert math.isclose(PV_TARGET_YAW / microduck_mdp.PV_RATE_CAP, 4.0 / 3.0)
-
-    # the stroke window widened with it — a slower turn has longer strokes
+    # the stroke window: wide enough for a slow turn's long strokes
     assert microduck_mdp.PV_MIN_AIR_S == 0.08
     assert microduck_mdp.PV_MAX_AIR_S == 0.45
 
     assert cfg.rewards["tilt"].weight == W_TILT == -2.0
     assert cfg.rewards["body_ang_vel"].weight == W_BODY_ANG_VEL == -0.2
 
-    # the run is longer and the pin curriculum was stretched WITH it, so the
-    # pressures still land at the same fraction of training (60%).
     assert MicroduckPivotRlCfg.max_iterations == 4_000
-    assert PIN_TIGHTEN_ITER == 2400
-    assert math.isclose(PIN_TIGHTEN_ITER / MicroduckPivotRlCfg.max_iterations, 0.6)
+
+
+def test_v5_makes_staying_up_worth_more_than_any_turn():
+    """THE v5 CHANGE, as an invariant rather than as a table.
+
+    v4's log went the wrong way: iteration 1000 had mean episode length 191 of
+    200 with 1.6 falls/iter, iteration 3999 had length 77 with 47 falls/iter and
+    `pivot_progress` RISING the whole way (0.59 -> 0.82 -> 0.90). The policy was
+    not failing to learn; it was learning that a turn that falls at ~0.9 s
+    out-earns a careful one. v5 removes that trade by construction, and the
+    construction is checkable: the ALIVE income of a surviving episode must
+    exceed the ENTIRE progress budget of a perfect turn.
+    """
+    cfg = make_microduck_pivot_env_cfg()
+    steps = int(round(EPISODE_LENGTH_S / 0.02))          # 200
+
+    # (a) the alive income, upright-gated at the same 15 deg as the potential
+    alive = cfg.rewards["alive"]
+    assert alive.func is microduck_mdp.pv_alive_reward
+    assert alive.weight == W_ALIVE == 3.0
+    assert microduck_mdp.PV_ALIVE_TILT_DEG == 15.0
+    assert alive.params["gate_tilt_above_deg"] == microduck_mdp.PV_ALIVE_TILT_DEG
+
+    # THE ARITHMETIC THAT DEFINES v5. A full turn at the pay cap takes
+    # target/cap seconds and pays W_PROGRESS for each of those steps; surviving
+    # pays W_ALIVE for all 200. Surviving has to be worth more.
+    turn_steps = (PV_TARGET_YAW / microduck_mdp.PV_RATE_CAP) / 0.02
+    progress_budget = W_PROGRESS * turn_steps
+    alive_income = W_ALIVE * steps
+    assert alive_income > progress_budget, (alive_income, progress_budget)
+    assert alive_income == 600.0 and progress_budget == 400.0
+
+    # (b) the fall, charged against the term it competes with
+    assert cfg.rewards["terminated"].weight == W_TERMINATED == -100.0
+    # ...and still not a jackpot: one step in 200, smaller than the income the
+    # same fall forfeits.
+    forfeited = (W_ALIVE + cfg.rewards["upright"].weight
+                 + cfg.rewards["height_stand"].weight) * (steps - 45)
+    assert forfeited > 2 * abs(W_TERMINATED), forfeited
+
+    # (c) the pay cap, halved again: full pay on a 2 s turn, not a 1.33 s one
+    assert math.isclose(microduck_mdp.PV_RATE_CAP, 0.5 * 2 * math.pi)
+    assert math.isclose(PV_TARGET_YAW / microduck_mdp.PV_RATE_CAP, 2.0)
+    assert cfg.rewards["pivot_progress"].weight == W_PROGRESS == 4.0
+    # half the episode is left for the settle
+    assert turn_steps == steps / 2
+
+    # (d) the pin curriculum stops SHORT and stops EARLY, then holds
+    assert microduck_mdp.PV_PIN_STD_FLOOR_M == 0.025
+    assert microduck_mdp.PV_PIN_STD_FLOOR_M > microduck_mdp.PV_PIN_STD_M, (
+        "v5 deliberately never reaches the measured 1.5 cm"
+    )
+    assert W_PIN_DISPLACEMENT == -1.5
+    assert PIN_TIGHTEN_ITER == 1600
+    assert PIN_TIGHTEN_ITER < 0.5 * MicroduckPivotRlCfg.max_iterations, (
+        "the back half of the run consolidates rather than tightens"
+    )
+    std_stages = cfg.curriculum["pin_std"].params["std_stages"]
+    assert std_stages[-1]["std"] == microduck_mdp.PV_PIN_STD_FLOOR_M
+    assert std_stages[-1]["step"] == PIN_TIGHTEN_ITER * 24
+
+    # (e) the jackpot moved to FINISHING UPRIGHT
+    assert cfg.rewards["pivot_complete"].weight == W_COMPLETE == 15.0
+    assert cfg.rewards["settle"].weight == W_SETTLE == 6.0
+    assert microduck_mdp.PV_FINISH_TILT_DEG == 15.0
+    for name in ("pivot_complete", "settle"):
+        assert cfg.rewards[name].params["gate_tilt_above_deg"] == (
+            microduck_mdp.PV_FINISH_TILT_DEG
+        ), name
 
 
 def test_the_fall_penalty_is_one_shot_and_charges_only_the_fall():
@@ -269,17 +334,32 @@ def test_a_spin_scores_clearly_less_than_a_pivot():
     assert cfg.rewards["paddle"].weight >= abs(W_PIN_DISPLACEMENT_START) * 2
 
 
-def test_standing_still_loses():
-    """The v1 argmax, priced with the current weights. Standing collects the
-    stall cost and nothing else; pivoting collects progress, pin and paddle."""
+def test_standing_still_loses_to_pivoting_but_beats_falling():
+    """The v1 argmax, priced with the current weights — and the v5 correction to
+    what "loses" means.
+
+    v4 wanted standing still to be NEGATIVE, and it was: the stall bill and
+    nothing else. That is exactly the shape that made falling attractive, since
+    ending the episode also ends the bill. v5 pays a large constant `alive`
+    income instead, so standing still is comfortably in profit — it just earns
+    far less than a pivot. The task-specific stack (progress, pin, paddle,
+    stall) still ranks pivoting far above standing; the alive income is added to
+    both and cancels, which is precisely why it is safe to make it this large.
+    """
     cfg = make_microduck_pivot_env_cfg()
     w = {k: cfg.rewards[k].weight for k in
-         ("pivot_progress", "pin", "paddle", "stall")}
-    rate = (2.0 * math.pi) / microduck_mdp.PV_RATE_CAP   # a 1 turn/s pivot
+         ("pivot_progress", "pin", "paddle", "stall", "alive")}
+    rate = 1.0                                           # a pivot at the pay cap
     still = w["stall"] * 1.0                             # pin/progress pay 0
     pivoting = (w["pivot_progress"] + w["pin"]) * rate + w["paddle"] * 0.5
-    assert still < 0.0, "standing still must LOSE, not merely fail to win"
+    assert still < 0.0, "the stall bill still makes doing nothing the worse deal"
     assert pivoting - still >= 8.0, (still, pivoting)
+
+    # ...and the alive income, which both collect, is what stops the stall bill
+    # from making a fall look like an escape: it is bigger than the bill.
+    assert w["alive"] + still > 0.0, (
+        "standing still must be in PROFIT, or ending the episode is an exit"
+    )
 
 
 def test_terminates_on_fall():
@@ -481,7 +561,7 @@ def test_progress_is_a_monotone_potential():
 
 def test_progress_rate_is_normalized_and_capped():
     env = _FakeEnv()
-    assert math.isclose(_CAP, 0.75 * 2 * math.pi), "v4: 0.75 turns/s"
+    assert math.isclose(_CAP, 0.5 * 2 * math.pi), "v5: 0.5 turns/s"
     env.tick(_CAP / 2)                    # half the cap rate
     assert math.isclose(float(microduck_mdp.pv_progress_reward(env)[0]), 0.5, rel_tol=1e-6)
     env.tick(_CAP)                        # exactly the cap
@@ -555,7 +635,7 @@ def test_pin_costs_stop_at_the_settle():
     assert 0.0 < float(env._pv_pin_d[0]) < microduck_mdp.PV_PIN_BREAK_M
     assert bool(env._pv_broken[0]) is False
     assert 0.0 < float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) < 1.0
-    _turn_for(env, _CAP, 1.1)                          # ...and finish the turn
+    _turn_for(env, _CAP, 2.0)                          # ...and finish the turn
     assert bool(env._pv_done[0]) is True
     assert float(env._pv_pin_d[0]) > 0.0, "still moved"
     assert float(microduck_mdp.pv_pin_displacement_penalty(env)[0]) == 0.0
@@ -578,7 +658,7 @@ def test_pin_pays_nothing_while_standing_still():
     env.tick(_CAP)
     assert math.isclose(float(microduck_mdp.pv_pin_reward(env)[0]), 1.0, rel_tol=1e-6)
     # over-turning past the full turn banks nothing, so the pin stops paying too
-    _turn_for(env, _CAP, 1.4)
+    _turn_for(env, _CAP, 2.1)
     assert bool(env._pv_done[0]) is True
     env.tick(_CAP)
     assert float(microduck_mdp.pv_pin_reward(env)[0]) == 0.0
@@ -716,7 +796,7 @@ def test_a_broken_pin_earns_no_progress():
 
 def test_pin_broken_cost_is_bounded_and_spin_phase_only():
     env = _FakeEnv()
-    _turn_for(env, _CAP, 1.4)                    # finish the turn cleanly
+    _turn_for(env, _CAP, 2.1)                    # finish the turn cleanly
     assert bool(env._pv_done[0]) is True
     env.set_contact(_LEFT, False)                # lift the pin during the settle
     _turn_for(env, 0.0, 0.5)
@@ -848,7 +928,7 @@ def test_two_feet_still_needs_both_feet_and_the_spin_phase():
     assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0
 
     env.set_contact(_RIGHT, True)
-    _turn_for(env, _CAP, 1.1)
+    _turn_for(env, _CAP, 2.1)
     assert bool(env._pv_done[0]) is True
     env.tick(50.0)                                # decelerating out of the turn
     assert float(microduck_mdp.pv_two_feet_still_penalty(env)[0]) == 0.0, (
@@ -1048,7 +1128,7 @@ def test_counter_rotation_is_charged():
     # ...and it is OFF once the turn is done: stopping is the settle's job, and
     # decelerating out of a turn overshoots the other way.
     env = _FakeEnv()
-    _turn_for(env, _CAP, 1.4)
+    _turn_for(env, _CAP, 2.1)
     assert bool(env._pv_done[0]) is True
     env.tick(-_CAP)
     assert float(microduck_mdp.pv_counter_yaw_penalty(env)[0]) == 0.0
@@ -1093,7 +1173,7 @@ def test_stall_cost_fires():
     assert float(microduck_mdp.pv_stall_penalty(env)[0]) == 0.0
 
     # and standing still is the GOAL once the turn is done: no stall cost there
-    _turn_for(env, _CAP, 1.4)
+    _turn_for(env, _CAP, 2.1)
     assert bool(env._pv_done[0]) is True
     for _ in range(100):
         env.tick(0.0)
@@ -1121,10 +1201,12 @@ def test_pin_curriculum_stages_parse():
         "pin_displacement"
     )
 
-    # start loose, end at the measured values, monotone in between
-    assert std_stages[0]["std"] == 0.04 and std_stages[-1]["std"] == 0.015
+    # start loose, end at the v5 FLOOR (not the measured 1.5 cm / -2.0),
+    # monotone in between
+    assert std_stages[0]["std"] == 0.04 and std_stages[-1]["std"] == 0.025
+    assert std_stages[-1]["std"] == microduck_mdp.PV_PIN_STD_FLOOR_M
     assert w_stages[0]["weight"] == W_PIN_DISPLACEMENT_START == -0.5
-    assert w_stages[-1]["weight"] == W_PIN_DISPLACEMENT == -2.0
+    assert w_stages[-1]["weight"] == W_PIN_DISPLACEMENT == -1.5
     assert [s["std"] for s in std_stages] == sorted(
         (s["std"] for s in std_stages), reverse=True
     )
@@ -1136,7 +1218,7 @@ def test_pin_curriculum_stages_parse():
         steps = [s["step"] for s in stages]
         assert steps == sorted(steps) and len(set(steps)) == len(steps)
         assert steps[0] == 0
-        assert steps[-1] == PIN_TIGHTEN_ITER * 24 == 2400 * 24
+        assert steps[-1] == PIN_TIGHTEN_ITER * 24 == 1600 * 24
         assert all(isinstance(s[key], float) for s in stages)
     assert [s["step"] for s in std_stages] == [s["step"] for s in w_stages]
 
@@ -1182,8 +1264,8 @@ def test_pin_curriculum_applies_through_the_manager():
 
 _PIVOT_TERMS = (
     "pivot_progress", "pivot_complete", "pin", "paddle", "paddle_reach",
-    "settle", "pin_displacement", "pin_slip", "pin_broken", "two_feet_still",
-    "stall", "counter_yaw", "terminated",
+    "settle", "alive", "pin_displacement", "pin_slip", "pin_broken",
+    "two_feet_still", "stall", "counter_yaw", "terminated",
 )
 
 # The terms every strategy collects identically — WHILE IT IS ALIVE AND UPRIGHT.
@@ -1217,10 +1299,17 @@ def _score(env, weights, common=0.0):
     fns = {
         "pivot_progress": microduck_mdp.pv_progress_reward,
         "pivot_complete": microduck_mdp.pv_complete_bonus,
-        "pin": microduck_mdp.pv_pin_reward,
         "paddle": microduck_mdp.pv_paddle_reward,
         "paddle_reach": microduck_mdp.pv_paddle_reach_reward,
         "settle": microduck_mdp.pv_settle_reward,
+        # v5's decisive term: a constant +1 per alive, upright (15 deg) step.
+        "alive": microduck_mdp.pv_alive_reward,
+        # ...scored at the value the curriculum actually STOPS at (2.5 cm), not
+        # at the function's geometric default, so the table prices the reward
+        # the policy trains under for the back 60% of the run.
+        "pin": lambda e: microduck_mdp.pv_pin_reward(
+            e, pin_std=microduck_mdp.PV_PIN_STD_FLOOR_M
+        ),
         "pin_displacement": microduck_mdp.pv_pin_displacement_penalty,
         "pin_slip": microduck_mdp.pv_pin_slip_penalty,
         "pin_broken": microduck_mdp.pv_pin_broken_penalty,
@@ -1246,29 +1335,30 @@ def _tilt_cost(env, weights):
 def _episode(strategy, weights, steps=200, common=0.0):
     """Run one 4 s episode of `strategy` and return the total reward.
 
-    `pivot`    — 0.75 turns/s (the v4 rate cap: full pay, a 1.33 s turn), pin
+    `pivot`    — 0.5 turns/s (the v5 rate cap: full pay, a 2 s turn), pin
                  planted and motionless, free foot on a 0.24 s up / 0.12 s down
                  cadence carrying its contact point 6 cm per stroke, trunk
-                 upright throughout.
+                 upright throughout — and then ~2 s of settle.
     `shuffle`  — WHAT v2 LEARNED: both feet on the floor the whole time, both
                  sliding (the pin travels at 0.1 m/s), trunk yawing at
                  1.5 rad/s. Contact fractions 1.0 / 1.0 is the limit of the
                  measured 0.91 / 0.85, and 0.1 m/s of pin travel reproduces the
                  6-17 cm of trunk drift over a 4 s episode.
-    `fastfall` — WHAT v3 LEARNED, given every benefit of the doubt: a 2 turns/s
+    `fastfall` — WHAT v4 LEARNED, given every benefit of the doubt: a 2 turns/s
                  whip with the pin held perfectly planted and the paddle cadence
                  of a textbook pivot, the trunk tipping linearly to 90° over
-                 0.6 s and `fell_over` firing there (v3's clean render went over
-                 at 0.54 s; the run's mean episode length was 0.87 s). The
-                 episode ENDS at the fall and collects nothing after it.
+                 0.9 s and `fell_over` firing there. 0.9 s is v4's OWN measured
+                 number — at iteration 3999 the log reports mean episode length
+                 77 steps of 200 with 47 falls per iteration — not a strawman.
+                 The episode ENDS at the fall and collects nothing after it.
     `still`    — the v1 argmax: nothing moves.
     """
     env = _FakeEnv()
     total = 0.0
-    turn_rate = microduck_mdp.PV_RATE_CAP         # 0.75 turns/s: full pay
+    turn_rate = microduck_mdp.PV_RATE_CAP         # v5: 0.5 turns/s, full pay
     shuffle_rate = 1.5                            # rad/s, as measured on v2
     whip_rate = 2 * 2 * math.pi                   # 2 turns/s, as measured on v3
-    fall_step = int(round(0.6 / 0.02))            # the topple completes at 0.6 s
+    fall_step = int(round(0.9 / 0.02))            # v4's own mean: 77 steps
     for k in range(steps):
         done = bool(env._pv_done[0]) if hasattr(env, "_pv_done") else False
         if strategy == "still":
@@ -1305,17 +1395,21 @@ def test_the_arithmetic_pivoting_wins():
     the fake env — the table in the cfg docstring, executed.
 
     v1 ranked STANDING first. v2 ranked the SHUFFLE second, and duly learned it.
-    v3 fixed both and ranked FALLING second — checkpoint 2499 pivoted with the
-    foot roles finally right and then went over in 4 evaluation episodes out of
-    4, mean episode length 43 steps of 200. This is the v4 ranking, and the
-    fourth row is the one v3 was missing.
+    v3 ranked FALLING second and duly learned that. v4 said it had fixed the
+    fall — and its own log says otherwise: mean episode length 191 -> 133 -> 74
+    over iterations 1000 -> 2000 -> 3000, `fell_over` 1.6 -> 18 -> 58 per
+    iteration, `pivot_progress` RISING the whole way (0.59 -> 0.82 -> 0.90). The
+    v4 table was not wrong about the mechanism (a fall is paid for in forfeited
+    income); it was wrong about the size. The income a fall forfeited was
+    upright 2.0 + height 1.0 = 3.0/step, against a progress term paying up to
+    6.0/step, and the -20 marker averaged -0.09/step. Falling at ~0.9 s was a
+    good trade and the policy took it.
 
-    The decisive line for the faller is `common`. v3's table dropped the
-    upright/height stack as "common to every row"; it is common only to rows
-    that SURVIVE, and a strategy that terminates at 0.6 s collects 30 steps of
-    it instead of 200. The termination penalty is real but small next to that —
-    which is the point: a fall has to lose on the income it throws away, not on
-    a single punitive spike.
+    v5 makes the forfeit the biggest number on the board by construction: the
+    `alive` row is +600 for surviving and +21 for the faller. THE DECISIVE LINE
+    IS `alive`, and the required margin below is 500 — an order of magnitude
+    more than the -100 termination marker, so the ranking cannot be flipped back
+    by tuning the penalty.
     """
     cfg = make_microduck_pivot_env_cfg()
     weights = _weights(cfg)
@@ -1334,11 +1428,14 @@ def test_the_arithmetic_pivoting_wins():
         "the shuffle-spin must score BELOW standing still, not just below a "
         "pivot — v2 ranked it second and duly learned it"
     )
-    # THE v4 ASSERTION.
-    assert still - fastfall > 200.0, (
-        "a fast pivot that falls at 0.6 s must lose to STANDING STILL — v3 "
-        "priced the shuffle and the stall but never the fall, and the policy "
-        "read that correctly", still, fastfall
+    # THE v5 ASSERTION, and the number the whole version turns on. v4 asserted
+    # this same ordering with a 200-point margin and shipped a policy that fell
+    # 47 times per iteration; 500 is the margin that says the ranking survives
+    # the noise of an actual run rather than merely holding on the page.
+    assert still - fastfall > 500.0, (
+        "a fast pivot that falls at 0.9 s must lose to STANDING STILL by a "
+        "wide margin — v4 priced the fall but not nearly enough, and the log "
+        "shows the policy reading that correctly", still, fastfall
     )
     assert pivot - fastfall > 1500.0, (pivot, fastfall)
 
@@ -1355,20 +1452,32 @@ def test_falling_loses_on_forfeited_income_not_only_on_the_penalty():
     """Where the fall's price actually comes from — the number that decides it
     is the one v3's arithmetic cancelled away.
 
-    A 0.6 s fall forfeits 170 steps of the common upright/height stack. The
-    one-shot termination penalty is deliberately NOT sized to carry this on its
-    own: a -300 spike on one terminal step is the kind of jackpot AGENTS.md
-    warns about, in reverse. -20 is the marker; the forfeit is the money.
+    A 0.9 s fall forfeits 155 steps of the survival stack — v5's `alive` term
+    plus the common upright/height income. The one-shot termination penalty is
+    deliberately NOT sized to carry this on its own: a -900 spike on one
+    terminal step is the kind of jackpot AGENTS.md warns about, in reverse.
+    -100 is the marker; the forfeit is the money.
+
+    v4 made this exact argument at -20 against a 3.0/step stack and LOST it, and
+    that is the whole reason v5 exists: at iteration 3999 the v4 log has
+    `terminated` averaging -0.09/step against `pivot_progress` at +0.90/step.
+    The mechanism was right; the numbers were an order of magnitude short.
     """
     cfg = make_microduck_pivot_env_cfg()
     weights = _weights(cfg)
     common = _common_per_step(cfg)
-    assert cfg.rewards["terminated"].weight == W_TERMINATED == -20.0
+    assert cfg.rewards["terminated"].weight == W_TERMINATED == -100.0
 
-    forfeited = common * (200 - int(round(0.6 / 0.02)))
-    assert forfeited > 10 * abs(W_TERMINATED), (
+    survival_per_step = W_ALIVE + common
+    assert survival_per_step == 6.0, "alive 3.0 + upright 2.0 + height 1.0"
+    forfeited = survival_per_step * (200 - int(round(0.9 / 0.02)))
+    assert forfeited > 5 * abs(W_TERMINATED), (
         "the forfeited income must dominate the one-shot penalty", forfeited
     )
+    # ...and it must dominate what the fall BOUGHT, which is what v4's did not:
+    # a whip cannot bank more progress than the survival income it gives up.
+    assert forfeited > W_PROGRESS * (PV_TARGET_YAW / microduck_mdp.PV_RATE_CAP
+                                     / 0.02), forfeited
 
     # and the penalty still has to be doing work: without it the gap narrows.
     unpriced = dict(weights, terminated=0.0)
@@ -1415,7 +1524,18 @@ def test_the_shuffle_loses_per_step_during_the_spin_phase():
     """The episode totals are dominated by the settle a pivot reaches and a
     shuffle never does, so check the SPIN-PHASE per-step rate directly: at the
     moment the policy is choosing between the two, the shuffle must already be
-    losing to doing nothing."""
+    losing to doing nothing.
+
+    v5 changes what "losing to doing nothing" means. In v4 the stall bill made
+    standing still NEGATIVE, so the assertion was `shuffle < still < 0`. That is
+    no longer the target: the `alive` income is deliberately large enough that a
+    robot which does nothing but stay upright is comfortably in profit, because
+    the whole v5 thesis is that survival must out-earn any turn that ends the
+    episode. What still has to hold is the ORDER — the shuffle loses to doing
+    nothing, and doing nothing loses to pivoting by a wide margin — and that the
+    shuffle is genuinely under water on its own account, i.e. it is not merely
+    winning less than standing but paying for the privilege.
+    """
     cfg = make_microduck_pivot_env_cfg()
     weights = _weights(cfg)
     weights["pin_displacement"] = W_PIN_DISPLACEMENT
@@ -1441,9 +1561,15 @@ def test_the_shuffle_loses_per_step_during_the_spin_phase():
             counted += 1
         rates[strategy] = total / counted
 
+    assert rates["pivot"] > rates["still"] > rates["shuffle"], rates
     assert rates["pivot"] > 6.0, rates
-    assert rates["shuffle"] < rates["still"] < 0.0, rates
+    assert rates["still"] > 0.0, "v5: staying upright is income, by design"
+    assert rates["shuffle"] < 0.0, (
+        "the shuffle must be under water on its own account, not merely "
+        "second — the alive income is paid to it too", rates
+    )
     assert rates["still"] - rates["shuffle"] > 3.0, rates
+    assert rates["pivot"] - rates["still"] > 5.0, rates
 
 
 def test_the_loose_curriculum_still_prefers_a_pivot():
@@ -1463,3 +1589,15 @@ def test_the_loose_curriculum_still_prefers_a_pivot():
     fastfall = _episode("fastfall", weights, common=common)
     assert pivot > still > shuffle, (pivot, still, shuffle)
     assert pivot > still > fastfall, (pivot, still, fastfall)
+    # The two rows that must NOT move with the curriculum at all: `alive` and
+    # the fall penalty are flat from step one, so the 500-point margin that
+    # keeps the policy off the v4 trajectory is there at iteration 0 too.
+    assert still - fastfall > 500.0, (still, fastfall)
+    # (fastfall vs shuffle DOES swap while the pin costs are cheap — that is
+    # what "cheap discovery" buys, and it is the shuffle, not the fall, that the
+    # loose stage tolerates. The progress gates are never relaxed, so the
+    # shuffle still cannot bank a turn.)
+    assert shuffle > fastfall, (
+        "at iteration 0 the shuffle is merely second-worst; by the tightened "
+        "weights it is last", shuffle, fastfall
+    )
