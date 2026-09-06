@@ -9839,3 +9839,570 @@ class PivotCommandCfg(VelocityCommandCommandOnlyCfg):
 
     def build(self, env: ManagerBasedRlEnv) -> "PivotCommand":
         return PivotCommand(self, env)
+
+
+# --------------------------------------------------------------------------- #
+# JUMP — a hop in place: both feet off the floor together, land standing       #
+# --------------------------------------------------------------------------- #
+# Episodic skill, walk model, built on the velocity recipe (bow / pivot
+# pattern). Per-env memory (the both-feet-off clock, the launch stagger, the
+# apex potential, the flight and landing latches) is updated ONCE per env step
+# by `_jp_update`, keyed on `common_step_counter`, so every term below is
+# order-independent and zero-weight-safe. Fresh episodes re-arm everything.
+#
+# THE MEASUREMENTS THIS BLOCK IS BUILT ON (docs/research/jump-design.md, Part A;
+# scripted open loop under BAM on the walk model, 2430 schedules swept):
+#   * 3 cm is NOT reachable. The XL330's free-running speed (16.2 rad/s) times
+#     the leg's extension gain at take-off (0.024 m/rad) caps the take-off
+#     velocity at 0.39 m/s = a 7.7 mm ballistic rise. Torque has 8x of spare.
+#   * A hop DOES exist: both feet off for 60-80 ms, foot clearance 8-10 mm,
+#     trunk apex 0.1284-0.1307 m against a settled standing height of 0.1149 m,
+#     i.e. +13.5 to +15.8 mm. Peak tilt on landing 32.4 deg.
+#   * THE FARM TO DESIGN AGAINST IS A HEIGHT REWARD WITHOUT A CONTACT GATE. The
+#     trained runner (`run-v2`) reaches trunk z 0.1277 mid-stride — 81% of the
+#     best hop's apex — with both feet off the floor 0.5% of the time. Scored on
+#     the recorded trajectories, an UNGATED height stack ranks the runner first
+#     at 1665 against the hop's 616; gated on both feet off, the hop is first at
+#     422 against 288-320 for every parked or planted alternative.
+#   * A tall STATIC park is worth +2.9 mm. A dynamic one (the runner's stride
+#     bounce) is worth +12.7. So the gate has to be CONTACT, not height and not
+#     stillness.
+#
+# WHAT EACH TERM IS FOR, in one line each (the full table is in the cfg
+# docstring):
+#   `jp_flight_reward`  the hop itself, gated on BOTH feet off and paid by
+#                       clearance — the term the whole recipe turns on.
+#   `jp_apex_reward`    potential-based height, advancing ONLY while airborne:
+#                       a stride bounce banks nothing.
+#   `jp_land_bonus`     one shot, conditioned on a PRIOR genuine flight.
+#   `jp_load_reward`    the first rung of the gradient, capped by an 0.8 s
+#                       window and killed permanently at the first flight.
+#   `jp_stagger_penalty` "both feet together", measured at the launch.
+#   `jp_drift_penalty`  a hop in place, not a leap.
+#   `jp_alive_reward` / `jp_fall_penalty`  pivot v5's survival arithmetic,
+#                       re-gated from 15 deg to 25 deg because the measured hop
+#                       peaks at 32.4 deg of tilt on its own landing.
+
+JP_STAND_Z = 0.115           # measured settled standing trunk z (as bow/pivot)
+
+# The apex normaliser: 15 mm over standing, the best measured hop of any of the
+# 2430 scripted schedules (+15.8 mm, the one that falls). With W_APEX = 15.0
+# this makes the apex term pay exactly ONE POINT PER MILLIMETRE of rise, capped
+# at 15 — which is where the design note's `apex 13.5` for the textbook hop
+# (+13.5 mm) comes from.
+JP_APEX_M = 0.015
+
+# The flight clearance normaliser. Set from the MEASURED 8-10 mm flat-foot
+# clearance, so a real hop scores most of the term and a contact flicker scores
+# almost nothing. `airflip._af_airborne` in the lab normalises by 0.06 m, which
+# this body can never reach — that would make the term binary in practice.
+JP_CLEARANCE_M = 0.012
+
+# The crouch the load term prices, and the window it is allowed to pay in.
+# 0.030 m is the depth of the bow's crouch; the measured hop's crouch bottom is
+# 27 mm below standing. 0.8 s x 0.5/step caps the whole term at 20 points an
+# episode, against 100+ for the flight — a prelude, never a destination.
+JP_LOAD_DEPTH_M = 0.030
+JP_LOAD_WINDOW_S = 0.8
+
+# 25 deg, NOT the pivot's 15. The measured hop peaks at 32.4 deg of tilt on
+# landing, so a 15 deg gate would charge the hop for its own landing transient.
+# 25 deg still costs the measured hop ~9 points of the 300 — a self-limiting
+# nudge toward a cleaner landing, which is what it should be.
+JP_ALIVE_TILT_DEG = 25.0
+
+# The landing one-shot's gates. 15 deg is pivot v5's finish cone: "settled" is a
+# state the robot has to be over its feet in.
+JP_LAND_TILT_DEG = 15.0
+JP_LAND_SETTLE_S = 0.30      # ... measured from the END of the first flight
+JP_LAND_Z_TOL_M = 0.020      # |z - JP_STAND_Z|
+JP_LAND_VZ_TOL = 0.15        # m/s of residual vertical motion
+
+# "A genuine flight" = both feet off for at least two control steps. Anything
+# shorter is contact chatter (the same 40 ms line the bow's flicker exemption
+# draws). The measured hop's flight is 60-80 ms = 3-4 steps, so this admits
+# every real hop and no bounce. It gates the LANDING bonus only — `jp_flight`
+# itself needs no duration gate because it is paid by clearance.
+JP_FLIGHT_MIN_S = 0.04
+
+# The stagger tolerance is ONE control step, deliberately loose: the ticket asks
+# for "both feet leave the floor together" and the measured hop's feet leave
+# within one step of each other. Tighter is bow v3's mistake — a tolerance
+# below the error the current policy can hold deletes the gradient instead of
+# sharpening it.
+JP_STAGGER_TOL_STEPS = 1.0
+JP_STAGGER_SAT_STEPS = 4.0
+
+# A hop in place: 5 cm of travel saturates the drift cost (the bow uses 10 cm;
+# a hop travels less than a bow does).
+JP_DRIFT_SAT_M = 0.05
+
+# The head, exactly as bow v7 leaves it: yaw and roll priced against HOME at a
+# 0.5 rad tolerance (the head may still act as the policy's clock), and a
+# bounded cost on the speed of all four neck/head joints.
+JP_HEAD_STILL_JOINTS = BOW_HEAD_STILL_JOINTS   # (7, 8) head_yaw, head_roll
+JP_HEAD_STILL_STD = BOW_HEAD_STILL_STD         # 0.5 rad
+JP_HEAD_ALL_JOINTS = BOW_HEAD_ALL_JOINTS       # (5, 6, 7, 8)
+JP_HEAD_VEL_CAP = BOW_HEAD_VEL_CAP             # 4.0 rad/s
+
+# The foot SITES are the clearance probe. Measured on robot_walk.xml: the
+# left_foot / right_foot site sits 1.2 mm above the sole at HOME and 0.05 mm
+# above it at the STAND keyframe, so "site z above the terrain" IS the sole's
+# clearance to within a millimetre, and no stance offset is needed. (Slot 0 is
+# LEFT and slot 1 is RIGHT, the same order the contact sensor uses.)
+JP_FEET_SITE_CFG = SceneEntityCfg("robot", site_names=("left_foot", "right_foot"))
+
+
+def _jp_update(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    flight_min_s: float = JP_FLIGHT_MIN_S,
+    stagger_tol: float = JP_STAGGER_TOL_STEPS,
+    stagger_sat: float = JP_STAGGER_SAT_STEPS,
+) -> None:
+    """Tick the per-env jump memory exactly once per env step.
+
+    Buffers:
+      ``_jp_t``          episode time in seconds.
+      ``_jp_home``       trunk xy at episode start — what `jp_drift_penalty`
+                         measures against.
+      ``_jp_z``          trunk height above the terrain, and ``_jp_vz`` its
+                         finite-difference rate (zeroed on a fresh episode).
+      ``_jp_airborne``   BOTH feet off the floor this step. The gate the whole
+                         recipe turns on: `run-v2` reaches 81% of the hop's
+                         apex with a foot planted, so height alone is bought
+                         outright by a stride bounce.
+      ``_jp_air_s``      how long both feet have been off (resets on any
+                         contact).
+      ``_jp_foot_air``   per-foot air time in STEPS — the two numbers whose
+                         difference at the launch is the stagger.
+      ``_jp_clear``      min over the two feet of the foot site's height above
+                         the terrain, floored at 0: the flight's clearance.
+      ``_jp_touched``    both feet have touched down since the spawn. Every
+                         airborne test is ANDed with it, so the reset's free
+                         fall from the keyframe height is not a hop.
+      ``_jp_launched``   latched on the first step both feet are off.
+      ``_jp_stagger``    0..1, LATCHED at that launch:
+                         clip((|Δ last-contact step| - 1) / 4, 0, 1).
+      ``_jp_flew``       latched once both feet have been off for
+                         ``flight_min_s`` — "a genuine flight happened", the
+                         precondition for the landing bonus.
+      ``_jp_flight_end_t`` the time the FIRST genuine flight ended (both feet
+                         back down). Large until then.
+      ``_jp_apex``       the apex POTENTIAL: the running maximum of
+                         clip((z - JP_STAND_Z)/JP_APEX_M, 0, 1), advanced ONLY
+                         while airborne and frozen while grounded, so height
+                         reached with a foot on the floor is never banked.
+      ``_jp_prev_apex`` / ``_jp_apex_gain``  the previous value and this step's
+                         Δ — what `jp_apex_reward` pays. Potential-based:
+                         rising pays, holding pays zero, re-climbing pays zero.
+      ``_jp_landed`` / ``_jp_just_landed``  the landing latch and the single
+                         step it flipped on (the one-shot).
+
+    Thresholds are module constants rather than per-term parameters for the
+    reason `_bow_update` gives: the memory is memoised per env step, so the
+    first term to call in a step would otherwise fix them for all the others.
+    """
+    tick = int(env.common_step_counter)
+    if getattr(env, "_jp_tick", None) == tick:
+        return
+    n, dev = env.num_envs, env.device
+    if not hasattr(env, "_jp_apex"):
+        env._jp_t = torch.zeros(n, device=dev)
+        env._jp_home = torch.zeros(n, 2, device=dev)
+        env._jp_z = torch.full((n,), JP_STAND_Z, device=dev)
+        env._jp_prev_z = torch.full((n,), JP_STAND_Z, device=dev)
+        env._jp_vz = torch.zeros(n, device=dev)
+        env._jp_airborne = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_grounded = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_air_s = torch.zeros(n, device=dev)
+        env._jp_foot_air = torch.zeros(n, 2, device=dev)
+        env._jp_clear = torch.zeros(n, device=dev)
+        env._jp_touched = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_launched = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_stagger = torch.zeros(n, device=dev)
+        env._jp_flew = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_flight_end_t = torch.full((n,), 1.0e9, device=dev)
+        env._jp_apex = torch.zeros(n, device=dev)
+        env._jp_prev_apex = torch.zeros(n, device=dev)
+        env._jp_apex_gain = torch.zeros(n, device=dev)
+        env._jp_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_just_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+    env._jp_tick = tick
+
+    asset: Entity = env.scene[asset_cfg.name]
+    origin_z = env.scene.terrain.env_origins[:, 2]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    root_z = torch.nan_to_num(
+        asset.data.root_link_pos_w[:, 2] - origin_z, nan=0.0
+    )
+    foot_z = torch.nan_to_num(
+        asset.data.site_pos_w[:, feet_cfg.site_ids, 2], nan=0.0
+    ) - origin_z[:, None]                                # (B, 2) left, right
+    sensor = env.scene.sensors[sensor_name]
+    found = sensor.data.found[:, :2] > 0                 # (B, 2) left, right
+
+    # ── Re-arm on a fresh episode ───────────────────────────────────────────
+    fresh = env.episode_length_buf <= 1
+    env._jp_home = torch.where(fresh[:, None], root_xy, env._jp_home)
+    env._jp_prev_z = torch.where(fresh, root_z, env._jp_prev_z)
+    env._jp_air_s = torch.where(fresh, torch.zeros_like(env._jp_air_s),
+                                env._jp_air_s)
+    env._jp_foot_air = torch.where(
+        fresh[:, None], torch.zeros_like(env._jp_foot_air), env._jp_foot_air
+    )
+    env._jp_touched = env._jp_touched & ~fresh
+    env._jp_launched = env._jp_launched & ~fresh
+    env._jp_flew = env._jp_flew & ~fresh
+    env._jp_landed = env._jp_landed & ~fresh
+    env._jp_just_landed = env._jp_just_landed & ~fresh
+    env._jp_stagger = torch.where(fresh, torch.zeros_like(env._jp_stagger),
+                                  env._jp_stagger)
+    env._jp_flight_end_t = torch.where(
+        fresh, torch.full_like(env._jp_flight_end_t, 1.0e9),
+        env._jp_flight_end_t
+    )
+    env._jp_apex = torch.where(fresh, torch.zeros_like(env._jp_apex),
+                               env._jp_apex)
+    env._jp_prev_apex = torch.where(fresh, torch.zeros_like(env._jp_prev_apex),
+                                    env._jp_prev_apex)
+    env._jp_apex_gain = torch.where(fresh, torch.zeros_like(env._jp_apex_gain),
+                                    env._jp_apex_gain)
+
+    env._jp_t = env.episode_length_buf.to(torch.float32) * env.step_dt
+    env._jp_z = root_z
+    env._jp_vz = torch.where(
+        fresh, torch.zeros_like(root_z),
+        (root_z - env._jp_prev_z) / max(env.step_dt, 1e-6)
+    )
+    env._jp_prev_z = root_z
+
+    # ── Contact: the gate the whole recipe turns on ─────────────────────────
+    # THE SPAWN DROP IS NOT A HOP. The reset places the trunk at the keyframe
+    # height, where the soles sit ~13 mm above the floor, so the first few steps
+    # of every episode have both feet off — and without this latch that free
+    # fall would pay the full `jp_flight` term at a saturating clearance, arm
+    # the landing bonus without a hop, advance the apex potential through the
+    # drop AND switch `jp_load` off permanently at t = 0. Nothing counts until
+    # both feet have touched down at least once, exactly as the bow's
+    # `_bow_landed` gates its foot-lift cost.
+    env._jp_grounded = found.all(dim=1)
+    env._jp_touched = env._jp_touched | env._jp_grounded
+    airborne = (~found.any(dim=1)) & env._jp_touched
+    env._jp_airborne = airborne
+    env._jp_air_s = torch.where(
+        airborne, env._jp_air_s + env.step_dt, torch.zeros_like(env._jp_air_s)
+    )
+    env._jp_foot_air = torch.where(
+        found, torch.zeros_like(env._jp_foot_air), env._jp_foot_air + 1.0
+    )
+    env._jp_clear = torch.clamp(foot_z.min(dim=1).values, min=0.0)
+
+    # ── The launch, and how staggered it was ────────────────────────────────
+    # Measured on the FIRST step both feet are off: the gap between the two
+    # feet's last contact steps. Both feet leaving together reads 0.
+    launch = airborne & ~env._jp_launched
+    gap = (env._jp_foot_air[:, 0] - env._jp_foot_air[:, 1]).abs()
+    env._jp_stagger = torch.where(
+        launch,
+        torch.clamp((gap - stagger_tol) / max(stagger_sat, 1e-6), 0.0, 1.0),
+        env._jp_stagger,
+    )
+    env._jp_launched = env._jp_launched | airborne
+
+    # ── The genuine flight, and when it ended ───────────────────────────────
+    env._jp_flew = env._jp_flew | (env._jp_air_s + 1e-9 >= flight_min_s)
+    ended = env._jp_flew & env._jp_grounded & (env._jp_flight_end_t > 1.0e8)
+    env._jp_flight_end_t = torch.where(ended, env._jp_t, env._jp_flight_end_t)
+
+    # ── The apex potential: airborne-only, running max ──────────────────────
+    # THE anti-farm. `run-v2` reaches 0.1277 m of trunk height mid-stride with
+    # a foot planted — 81% of the best hop's apex — so a potential that
+    # advanced on the ground would be bought outright by a stride bounce
+    # (measured: 12.5 of the 15 points, for a policy that never leaves the
+    # floor). Frozen while grounded, a bounce banks exactly nothing, and the
+    # running max means a second hop is only worth what it adds to the first.
+    pot = torch.clamp((root_z - JP_STAND_Z) / max(JP_APEX_M, 1e-6), 0.0, 1.0)
+    env._jp_prev_apex = env._jp_apex
+    env._jp_apex = torch.where(
+        airborne, torch.maximum(env._jp_apex, pot), env._jp_apex
+    )
+    env._jp_apex_gain = env._jp_apex - env._jp_prev_apex
+
+    # ── The landing latch ───────────────────────────────────────────────────
+    upright = _pv_upright(env, asset_cfg, JP_LAND_TILT_DEG) > 0.5
+    settled = (
+        env._jp_flew
+        & env._jp_grounded
+        & upright
+        & (env._jp_t + 1e-9 >= env._jp_flight_end_t + JP_LAND_SETTLE_S)
+        & ((root_z - JP_STAND_Z).abs() < JP_LAND_Z_TOL_M)
+        & (env._jp_vz.abs() < JP_LAND_VZ_TOL)
+    )
+    env._jp_just_landed = settled & ~env._jp_landed
+    env._jp_landed = env._jp_landed | settled
+
+
+def jp_flight_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    clearance_m: float = JP_CLEARANCE_M,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step: THE HOP. Both feet off the floor, paid by clearance.
+
+    ``both_feet_off × clip(min(foot site z) / clearance_m, 0, 1)``.
+
+    THE GATE IS THE WHOLE TERM. The measured alternative — a trained runner's
+    stride bounce — reaches a trunk z of 0.1277 m, 81% of the best hop's apex,
+    with both feet off the floor for 0.5% of its steps. Scored on the recorded
+    trajectories with the contact gate REMOVED, that policy takes 1352 points of
+    this term against the hop's 306 and wins the whole stack 1665 to 616. With
+    the gate it takes zero. A height reward without a both-feet-off gate is
+    bought outright by walking, and no amount of weight tuning fixes that.
+
+    Paid by CLEARANCE rather than as a flat per-step bonus so a single step of
+    contact chatter (the sensor losing both feet for one frame during a hard
+    push) earns almost nothing, while a real 8-10 mm flight earns most of the
+    term. The 0.012 m normaliser is the measured flat-foot clearance of the
+    scripted hop; the lab's `airflip._af_airborne` uses 0.06 m, which this body
+    cannot reach at any schedule and which would make the term binary.
+
+    Not duration-gated: a hop this short (3-4 control steps) has no room for a
+    minimum-flight rule that is not also a rule against the hop."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    return env._jp_airborne.float() * torch.clamp(
+        env._jp_clear / max(clearance_m, 1e-6), 0.0, 1.0
+    )
+
+
+def jp_apex_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step: POTENTIAL-BASED height, credited only while AIRBORNE.
+
+    Pays Δ of the running maximum of ``clip((z - 0.115) / 0.015, 0, 1)``, where
+    the potential advances only on steps with both feet off the floor. The whole
+    climb from standing height to +15 mm is worth exactly 1.0 credit however it
+    is flown, so at weight 15.0 the term pays ONE POINT PER MILLIMETRE of apex,
+    capped at 15.
+
+    Potential-based, which is AGENTS.md's unfarmable shaping: rising pays,
+    holding pays zero, sinking and re-climbing pays zero, overshooting past
+    +15 mm pays zero. bow v2 is the counter-example this avoids — a per-step
+    height Gaussian gave it a COMPROMISE height (0.101 m) that collected partial
+    credit from both the crouch and the stand while never paying the
+    action-rate cost of moving, and it sat there for 3.5 s.
+
+    Airborne-only for the same reason `jp_flight_reward` is gated: the runner's
+    stride bounce reaches 81% of the hop's apex with a foot planted, and would
+    otherwise collect 12.5 of the 15 points for never leaving the floor."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    return torch.clamp(env._jp_apex_gain, min=0.0)
+
+
+def jp_land_bonus(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0/1, ONE step per episode: the hop was landed and settled.
+
+    Fires the first step at least ``JP_LAND_SETTLE_S`` (0.30 s) after the END of
+    the first genuine flight on which both feet are down, the trunk is within
+    ``JP_LAND_TILT_DEG`` (15 deg) of vertical and within
+    ``JP_LAND_Z_TOL_M`` (20 mm) of standing height, and |vz| is under
+    ``JP_LAND_VZ_TOL`` (0.15 m/s).
+
+    Conditioned on a PRIOR FLIGHT, so a robot that never leaves the floor cannot
+    collect it however nicely it stands; one-shot, so it cannot be farmed by
+    bouncing. Same shape as pivot v5's `pivot_complete` (+15, re-gated to 15 deg
+    of tilt) and the bow's `risen` (+10) — the finish is a milestone, never a
+    per-step "you are done", which is the jackpot AGENTS.md warns about.
+
+    The landing is also the half of this trick that the reward genuinely has to
+    teach: the same scripted schedule that lands and stays up at seed 0 falls in
+    5 of 6 other seeds, because the per-env battery voltage moves the launch by
+    ~10%. A feed-forward hop is repeatable; a feed-forward landing is not."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    return env._jp_just_landed.float()
+
+
+def jp_load_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    depth_m: float = JP_LOAD_DEPTH_M,
+    window_s: float = JP_LOAD_WINDOW_S,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 per step: LOAD THE LEGS — the first rung of the gradient.
+
+    ``clip((0.115 - z) / 0.030, 0, 1)`` while the episode is younger than
+    ``window_s`` (0.8 s) and NO flight has happened yet. From "stand still"
+    there is otherwise nothing at all in the stack pointing at a hop: the
+    flight, apex and landing terms are all zero until the feet leave the floor,
+    and the first attempt has to be paid for before it exists.
+
+    Two things stop this becoming bow v1's crouch-park (which "simply stayed
+    there — 0.088 m from 1.3 s all the way to 4.0 s") and bow v6's ("parked in
+    the full crouch and never rose"):
+      * the 0.8 s window caps the WHOLE term at 40 steps x 0.5 = 20 points an
+        episode, against 100+ for a flight;
+      * it switches off permanently at the first flight, so a crouch is only
+        ever worth anything as a PRELUDE.
+    A slewed-free ramp, not a jackpot: deeper pays more, continuously, and the
+    schedule of the crouch stays the policy's to discover."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    depth = torch.clamp((JP_STAND_Z - env._jp_z) / max(depth_m, 1e-6), 0.0, 1.0)
+    live = (env._jp_t < window_s) & ~env._jp_flew
+    return depth * live.float()
+
+
+def jp_stagger_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 cost (negative weight): the two feet did not leave TOGETHER.
+
+    ``clip((|Δ last-contact step| - 1) / 4, 0, 1)``, latched at the launch and
+    charged every step from the launch to the end of the episode — so a one-foot
+    hop pays for the rest of its episode rather than for the three frames it was
+    in the air, which is the only sizing at which it can compete with the
+    flight income it buys.
+
+    This is the ticket's own wording ("both feet leave the floor together") and
+    the failure it guards against is the most likely one: the cheapest route to
+    both-feet-off is one foot and then the other, which is what tippy-taps
+    already trains and what the runner does 95% of the time.
+
+    The tolerance is ONE control step, deliberately loose — the measured hop's
+    feet leave within one step of each other, and bow v3 is the standing lesson
+    that narrowing a tolerance below what the current policy can hold "does not
+    sharpen the gradient, it deletes it" (6 mm tolerances, 32 `collapsed` per
+    iteration against 4.6 `time_out`). Tighten only where a compromise pose
+    could farm the slack, and here it cannot."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    return env._jp_stagger * env._jp_launched.float()
+
+
+def jp_drift_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    saturate_m: float = JP_DRIFT_SAT_M,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 cost (negative weight): squared xy distance from the spawn point,
+    saturating at ``saturate_m`` (5 cm). A hop in place, not a leap.
+
+    The bow's `drift` shape at a tighter saturation, because a hop travels less
+    than a bow does."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    root_xy = torch.nan_to_num(asset.data.root_link_pos_w[:, :2], nan=0.0)
+    d2 = torch.sum(torch.square(root_xy - env._jp_home), dim=1)
+    return torch.clamp(d2 / max(saturate_m ** 2, 1e-9), 0.0, 1.0)
+
+
+def jp_head_still_reward(
+    env: ManagerBasedRlEnv,
+    joint_indices: tuple[int, ...] = JP_HEAD_STILL_JOINTS,
+    std: float = JP_HEAD_STILL_STD,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1: hold head_yaw and head_roll near HOME (= 0 rad), whole episode.
+
+    bow v4's lesson — "a joint you do not price is a joint the policy will
+    spend": head yaw and roll were unpriced and became a free counterweight on a
+    head that is 38% of the body mass. bow v5 pinned them at std 0.08 and the
+    always-on head-still income diluted the rise; v7's single variable was
+    exactly this tolerance, 0.08 -> 0.5 rad, so the head may still act as the
+    policy's clock within a bounded sweep. This starts at v7's number.
+
+    Reads no jump memory, so it does not tick `_jp_update` (the same reason
+    `pv_alive_reward` does not tick `_pv_update`): it is a pure function of two
+    joint angles, in every phase of the episode."""
+    asset: Entity = env.scene[asset_cfg.name]
+    idx = list(joint_indices)
+    pos = _servo_joint_pos(env, asset)[:, idx]
+    home = _servo_default_joint_pos(env, asset)[:, idx]
+    return torch.exp(-((pos - home) / max(std, 1e-6)) ** 2).mean(dim=-1)
+
+
+def jp_head_vel_penalty(
+    env: ManagerBasedRlEnv,
+    joint_indices: tuple[int, ...] = JP_HEAD_ALL_JOINTS,
+    vel_cap: float = JP_HEAD_VEL_CAP,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 BOUNDED cost (negative weight): how fast the head is moving.
+
+    The bow's form verbatim — mean over the four neck/head joints of
+    ``clamp((vel / vel_cap)**2, 0, 1)`` — because the argument is the same:
+    neck_pitch and head_pitch must be free to move, so only their SPEED can be
+    priced, and the cost must be BOUNDED. "An l2 on joint velocity has no
+    ceiling ... a cost like that driving the per-step total toward zero is
+    precisely the shape that taught bow v3 to fall over."
+
+    Reads no jump memory, so it does not tick `_jp_update`."""
+    asset: Entity = env.scene[asset_cfg.name]
+    idx = list(joint_indices)
+    vel = torch.nan_to_num(_servo_joint_vel(env, asset)[:, idx], nan=0.0)
+    return torch.clamp((vel / max(vel_cap, 1e-6)) ** 2, 0.0, 1.0).mean(dim=-1)
+
+
+def jp_alive_reward(
+    env: ManagerBasedRlEnv,
+    gate_tilt_above_deg: float = JP_ALIVE_TILT_DEG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """1.0 every step the episode is alive with the trunk within 25 deg of
+    vertical. Pivot v5's term, at pivot v5's weight, with ONE change: the gate.
+
+    Why it is here at all: pivot v3 ended every episode in `fell_over` (mean
+    length 43 of 200) and had never priced falling; v4 priced it at -20 and the
+    curve went the WRONG WAY monotonically — length 191 -> 77, falls 1.6 -> 47
+    per iteration, progress rising the whole way, "because a turn which falls at
+    ~0.9 s out-earns a careful one". v5's `alive +3.0` is what fixed it. Over
+    this task's 100 steps it is 300 points a fall forfeits, against everything a
+    hop can earn (~130). A constant: no shape, no pose to seek, nothing to farm.
+
+    Why 25 deg and not the pivot's 15: the best measured scripted hop peaks at
+    32.4 deg of tilt on its landing, so a 15 deg gate would charge the hop for
+    its own landing transient. At 25 deg the measured hop still gives up ~9 of
+    the 300 — a self-limiting nudge toward a cleaner landing rather than a tax
+    on hopping at all.
+
+    Thin delegation to `pv_alive_reward`: identical semantics, one place for
+    the subtlety (a constant times the upright mask, no task memory)."""
+    return pv_alive_reward(env, gate_tilt_above_deg, asset_cfg)
+
+
+def jp_fall_penalty(
+    env: ManagerBasedRlEnv,
+    term_names: tuple[str, ...] = ("fell_over",),
+) -> torch.Tensor:
+    """0/1 cost (negative weight): the episode ENDED in a fall this step.
+
+    Pivot v5's number (-100 at the cfg) and pivot v5's scoping: only
+    `fell_over` is named. A `nan_state` is a sim blow-up rather than something
+    the policy chose, `time_out` is the normal end of a 2 s episode, and this
+    cfg adds no behavioural termination of its own — in particular NO height
+    termination, because the hop's crouch bottoms at 0.088 m and the reachable
+    crouch floor is 0.061 m, both at or under the lab's 0.07 m fall height and
+    both under the bow's 0.060 m collapse line. The lab's `deep_squat` turns the
+    z-kill off for exactly this reason.
+
+    As in the pivot, the marker is the smaller half of the price: the larger
+    half is the `alive` income the remaining steps would have paid."""
+    return bow_termination_penalty(env, term_names=term_names)

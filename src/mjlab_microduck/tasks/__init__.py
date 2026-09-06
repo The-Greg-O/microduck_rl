@@ -95,7 +95,21 @@ from .microduck_pivot_env_cfg import (
     make_microduck_pivot_env_cfg,
     MicroduckPivotRlCfg,
 )
+from .microduck_jump_env_cfg import (
+    make_microduck_jump_env_cfg,
+    MicroduckJumpRlCfg,
+)
 from .backlash import make_backlash_variant
+
+# Jump — a hop in place: both feet off the floor together, land standing
+# (go-ducks skill, docket row 5). NOT in _BACKLASH_TASKS.
+register_mjlab_task(
+    task_id="Mjlab-Jump-Flat-MicroDuck",
+    env_cfg=make_microduck_jump_env_cfg(),
+    play_env_cfg=make_microduck_jump_env_cfg(play=True),
+    rl_cfg=MicroduckJumpRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
 
 # Bow — the play bow: dip, hold, rise, stand, feet planted (go-ducks skill)
 register_mjlab_task(
