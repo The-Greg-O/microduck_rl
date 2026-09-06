@@ -7959,7 +7959,7 @@ BOW_HEAD_JOINTS = (5, 6)
 #     a smoothness prior on the ramp and a wall on the thrash, and it can never
 #     run away far enough to make terminating attractive (v3's lesson (i)).
 BOW_HEAD_STILL_JOINTS = (7, 8)      # head_yaw, head_roll — held at HOME (= 0)
-BOW_HEAD_STILL_STD = 0.08           # rad, ~4.6 deg of allowed wobble
+BOW_HEAD_STILL_STD = 0.5            # rad, ~30 deg: the head is the clock (v7)
 BOW_HEAD_ALL_JOINTS = (5, 6, 7, 8)  # neck_pitch, head_pitch, head_yaw, head_roll
 BOW_HEAD_VEL_CAP = 4.0              # rad/s; the cost saturates here
 

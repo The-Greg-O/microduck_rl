@@ -8,6 +8,7 @@ import types
 import torch
 
 from mjlab_microduck.tasks import mdp as microduck_mdp
+from mjlab_microduck.tasks.mdp import BOW_HEAD_STILL_STD
 from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     W_HEAD_STILL,
     BOW_COLLAPSE_Z,
@@ -156,7 +157,7 @@ def test_head_still_and_head_vel_are_wired_to_the_right_joints():
     still = cfg.rewards["bow_head_still"]
     assert still.func is microduck_mdp.bow_head_still_reward
     assert tuple(still.params["joint_indices"]) == HEAD_STILL_JOINTS == (7, 8)
-    assert still.params["std"] == HEAD_STILL_STD == 0.08
+    assert still.params["std"] == HEAD_STILL_STD == BOW_HEAD_STILL_STD
     head_joints = tuple(cfg.rewards["bow_head"].params.get(
         "joint_indices", microduck_mdp.BOW_HEAD_JOINTS))
     assert head_joints == (5, 6)
@@ -392,8 +393,8 @@ def test_head_still_holds_yaw_and_roll_at_zero():
 
     assert at(0.02, 0.0) > 0.9, "a 1 deg wobble must not be punished"
     assert at(HEAD_STILL_STD, 0.0) < 0.75         # one std on one joint
-    assert at(0.3, 0.0) < 0.55, "17 deg of yaw is a head that is not aiming"
-    assert at(0.3, 0.3) < 0.05, "yaw AND roll off is the v4 failure"
+    assert at(2 * BOW_HEAD_STILL_STD, 2 * BOW_HEAD_STILL_STD) < 0.05, "two tolerances off on both joints is a head that is not aiming"
+    assert at(3 * BOW_HEAD_STILL_STD, 3 * BOW_HEAD_STILL_STD) < 0.05, "yaw AND roll well outside the tolerance is the v4 failure"
     assert at(1.5, 0.0) < 0.51, "head_yaw has +/-170 deg of range to abuse"
     # Symmetric: a bow is left/right symmetric and so is this term.
     assert math.isclose(at(0.3, 0.0), at(-0.3, 0.0), rel_tol=1e-6)
@@ -407,7 +408,7 @@ def test_head_still_holds_yaw_and_roll_at_zero():
         env.run_to(boundary)
         env._asset.data.joint_pos = torch.zeros(1, 14)
         assert still() > 0.99, boundary
-        assert at(0.3, 0.3) < 0.05, boundary
+        assert at(3 * BOW_HEAD_STILL_STD, 3 * BOW_HEAD_STILL_STD) < 0.05, boundary
     # …and the pitch pair it does NOT price is free to follow the ramp: a head
     # correctly bowed still collects the full still-reward.
     down = torch.zeros(1, 14)
@@ -951,7 +952,7 @@ def test_the_thrashing_head_now_loses():
     assert book["bow_head_still"] > 0.99 * W_HEAD_STILL * int(STAND_END_S / 0.02)
     # (not zero: a swinging head passes through centre twice a cycle and is
     #  paid for the instants it is there — the term is a Gaussian, not a latch)
-    assert thrash["bow_head_still"] < 0.10 * book["bow_head_still"]
+    assert thrash["bow_head_still"] < 0.60 * book["bow_head_still"]  # v7: the head may sweep within the tolerance by design; the thrash still loses on speed
     assert thrash["head_joint_vel"] < book["head_joint_vel"] < 0.0
     assert sum(book.values()) > sum(thrash.values())
 

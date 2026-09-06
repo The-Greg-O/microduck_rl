@@ -445,6 +445,16 @@ W_HEAD = 2.0          # head down, then lifted  (v1)
 # regressed to a half-crouch (dip 0.094 m, final 0.099): the always-on
 # head-still income diluted the rise. Weights only: rise progress 6 -> 12,
 # risen 5 -> 10, stand pose 3 -> 4, head still 2 -> 1.
+# v7 (2026-09-06, single variable): docs/research/bow-audit.md showed the
+# rise is feasible with the head pinned (Pollen's stander does it) and that
+# the v6 reward prefers v4's rise; v4's head-yaw sweep was the policy's CLOCK
+# (a feedforward actor with no time input), and pinning it to 5 degrees took
+# the clock away. Greg's decision: let the head be the clock within a
+# tolerance rather than fork the daemon for a phase signal. Only change:
+# BOW_HEAD_STILL_STD 0.08 -> 0.5 rad (about 30 degrees), speed still priced.
+# Prediction: it rises by ~2 s again with a bounded, slower head sweep; if it
+# parks, 0.5 rad is too small an integrator and the clock must come from the
+# daemon (option (a) on the daemon list).
 W_HEAD_STILL = 1.0    # THE v5 TERM. head_yaw and head_roll pinned to HOME for
                       # the whole episode. v4 bowed correctly and swung its head
                       # around violently while doing it — those two joints were
