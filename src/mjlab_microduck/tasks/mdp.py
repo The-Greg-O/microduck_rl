@@ -7905,6 +7905,12 @@ def hs_tilt_penalty(
 # unpriced. An unpriced joint on a head this heavy is a free counterweight. The
 # two new terms hold yaw and roll at HOME and cap how fast ANY of the four head
 # joints may move; nothing else about v4 changes.
+#
+# v8 adds `bow_stand_symmetry_penalty`. v7 rises — onto ONE LEG. Every other
+# stand-phase term reads the trunk, and the one that reads the legs is a MEAN
+# over ten of them, so a leg folded 88 deg at the knee cost the policy almost
+# nothing. The new term prices the left/right DIFFERENCE, in the model's own
+# mirrored sign convention; nothing else about v7 changes.
 
 BOW_DIP_END_S = 1.0
 BOW_HOLD_END_S = 2.0
@@ -8005,6 +8011,56 @@ BOW_RISE_PAY_END_S = 3.2      # … and stays open 0.2 s into the stand phase, s
 # full 25 credits for ~4 steps of flight (about 12 points of `foot_lift`), which
 # is the cheapest possible "rise". With it, hopping is strictly worse than
 # pushing up on two feet.
+
+# --------------------------------------------------------------------------- #
+# v8: THE STAND MUST BE ON TWO LEGS                                            #
+# --------------------------------------------------------------------------- #
+# bow-v7 rises. Measured in the lab sim over three seeds against the model's own
+# joint names, it rises ONTO ONE LEG: the trunk finishes at 0.117 m, the head
+# within 4 deg, and one leg stays folded underneath it — seeds 0 and 2 finish
+# with left hip_pitch -25 deg, knee -88 deg, ankle -67 deg away from the standing
+# pose while the right leg is within 3 deg of it; seed 1 splits the same way
+# mirrored. Pollen's stander recovers the pose in under a second at the handover,
+# so it is a STANCE problem, not a fall.
+#
+# Nothing in the v7 stack can see it. `bow_stand_pose_reward` is a MEAN over the
+# ten leg joints, so three folded joints out of ten still score 0.7 of the term,
+# and every other stand-phase term reads the TRUNK (height, pitch, uprightness),
+# which one folded leg does not disturb. The pose is cheap and it is invisible.
+#
+# `bow_stand_symmetry_penalty` is the term that sees it: the mean absolute
+# LEFT/RIGHT difference over the five leg-joint pairs, priced from
+# BOW_SYMMETRY_START_S (the last 0.4 s of the rise, so the stance is chosen ON
+# THE WAY UP rather than corrected once the stand phase opens) to the end.
+#
+# THE SIGN CONVENTION IS MEASURED, NOT GUESSED. The microduck's left and right
+# legs are mirrored in the model, not copied: HOME (microduck_constants.py) is
+# left_hip_roll -0.0873 / right +0.0873, left_hip_pitch -0.4579 / right +0.4579,
+# left_knee -0.0049 / right +0.0049, left_ankle +0.4530 / right -0.4530, and
+# hip_yaw 0 for both. tasks/symmetry.py's `_JOINT_SIGN` says the same thing for
+# the mirror loss this env trains with: ALL TEN leg entries carry -1, so the
+# reflection of a pose negates every leg DEVIATION as well as swapping the
+# sides. A left/right SYMMETRIC pose is therefore
+#     (pos_L - home_L) = -(pos_R - home_R)
+# for all five pairs, and the asymmetry of a pair is |rel_L + rel_R| — NOT
+# |rel_L - rel_R|, which would call a normal two-legged squat maximally
+# asymmetric and a scissored stance perfect. The mirror signs live in
+# BOW_LEG_PAIR_MIRROR_SIGN so the arithmetic reads as
+# `rel_L - mirror_sign · rel_R` and stays honest if a future model stops
+# mirroring a joint.
+BOW_LEG_PAIRS = ((0, 9), (1, 10), (2, 11), (3, 12), (4, 13))
+# hip_yaw, hip_roll, hip_pitch, knee, ankle — all five mirror with a sign flip.
+BOW_LEG_PAIR_MIRROR_SIGN = (-1.0, -1.0, -1.0, -1.0, -1.0)
+# The normaliser, in radians: the mean pair difference at which the cost
+# saturates. 0.5 rad ≈ 29 deg — well above the few degrees of left/right
+# difference any real stand carries, and well below the 36 deg mean difference
+# of the v7 ending, which therefore clamps at exactly 1.0.
+BOW_SYMMETRY_NORM = 0.5
+# Priced from the last 0.4 s of the rise. A cost that starts only at 3.0 s asks
+# the policy to UNFOLD a leg it has already committed to; starting at 2.6 s
+# prices the choice of stance while the rise is still being made, and the 0.4 s
+# overlap is the same shape as BOW_RISE_PAY_END_S's 0.2 s of grace.
+BOW_SYMMETRY_START_S = 2.6
 
 
 def _bow_update(
@@ -8393,6 +8449,70 @@ def bow_stand_pose_reward(
         target = target[:, joint_indices]
     match = torch.exp(-((pos - target) / std) ** 2).mean(dim=-1)
     return match * (env._bow_phase == BOW_PHASE_STAND).float()
+
+
+def bow_stand_symmetry_penalty(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    pairs: tuple[tuple[int, int], ...] = BOW_LEG_PAIRS,
+    mirror_signs: tuple[float, ...] = BOW_LEG_PAIR_MIRROR_SIGN,
+    norm: float = BOW_SYMMETRY_NORM,
+    start_s: float = BOW_SYMMETRY_START_S,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """0..1 BOUNDED cost (negative weight): the two legs disagree at the finish.
+
+    THE v8 TERM, and the thing v7 could not see. bow-v7 rises — and rises onto
+    ONE LEG: three seeds finish at 0.117 m with the head within 4 deg and one
+    leg still folded underneath (left hip_pitch -25 deg, knee -88 deg, ankle
+    -67 deg from the standing pose against a right leg within 3 deg, or the
+    mirror of that). `bow_stand_pose_reward` is a MEAN over ten leg joints, so
+    three folded joints out of ten still collect 0.7 of it, and every other
+    stand-phase term reads the TRUNK, which one folded leg does not move. The
+    one-legged stand was invisible to the whole stack and it was cheap.
+
+    The cost: the MEAN ABSOLUTE left/right difference over the five leg pairs
+    (hip_yaw, hip_roll, hip_pitch, knee, ankle), in radians, divided by ``norm``
+    and clamped to 1 — mean first, then normalise, then clamp, so one wildly
+    folded joint cannot be averaged away by four tidy ones and no single joint
+    can saturate the term on its own.
+
+    SIGN CONVENTION, measured on the model (see BOW_LEG_PAIRS above and
+    tasks/symmetry.py). The legs are MIRRORED, not copied: HOME is
+    left_hip_pitch -0.4579 / right +0.4579, left_ankle +0.4530 / right -0.4530,
+    and the symmetry table this env's mirror loss uses carries -1 on all ten leg
+    entries. So a symmetric pose has rel_L = -rel_R and the pair difference is
+        |rel_L - mirror_sign · rel_R| = |rel_L + rel_R|.
+    Written this way a normal two-legged squat — both knees flexed, raw values
+    of opposite sign — costs ZERO, which is the entire point: this term must
+    price the STANCE, never the crouch.
+
+    Gated on time (``t >= start_s``: the last 0.4 s of the rise plus the whole
+    stand phase), not on state — the same reason `bow_stand_pose_reward` is a
+    time window. Starting inside the rise prices the choice of stance while the
+    policy is still making it, instead of asking it to unfold a leg it has
+    already committed to.
+
+    BOUNDED, at most 1.0 per step and only over the last 1.4 s of the episode,
+    for the reason the head-velocity cost is bounded: an unbounded cost that
+    drives the per-step total toward zero is exactly the shape that taught
+    bow-v3 to fall over. At weight -3.0 the worst case is 210 points against a
+    textbook bow's ~2900 — enough to lose the one-legged stand by a wide margin,
+    nowhere near enough to make quitting look good."""
+    _bow_update(env, sensor_name, asset_cfg)
+    asset: Entity = env.scene[asset_cfg.name]
+    pos = _servo_joint_pos(env, asset)
+    rel = torch.nan_to_num(pos - _servo_default_joint_pos(env, asset), nan=0.0)
+    left = [int(l) for l, _ in pairs]
+    right = [int(r) for _, r in pairs]
+    sign = torch.tensor(
+        list(mirror_signs)[: len(pairs)], device=rel.device, dtype=rel.dtype
+    )
+    diff = torch.abs(rel[:, left] - sign * rel[:, right]).mean(dim=-1)
+    cost = torch.clamp(diff / max(norm, 1e-6), 0.0, 1.0)
+    # +1e-6, as in `bow_foot_lift_penalty`: `_bow_t` is a float32 multiple of
+    # step_dt, and step 130 lands at 2.5999999, a hair under a 2.6 s boundary.
+    return cost * (env._bow_t + 1e-6 >= start_s).float()
 
 
 def bow_termination_penalty(

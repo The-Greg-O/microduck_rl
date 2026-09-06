@@ -70,12 +70,15 @@ Forward kinematics on robot_walk.xml, feet flat:
     actually reached the crouch.
   * terminated: a flat cost on the two BEHAVIOURAL terminations. Ending the
     episode must never be the cheap way to stop paying (v3, below).
+  * stand_symmetry is the v8 term and the companion stand_pose needed: a MEAN
+    over ten leg joints cannot see one folded leg, so this prices the left/right
+    DIFFERENCE instead, in the model's own mirrored sign convention.
   * collapse termination: a trunk below BOW_COLLAPSE_Z is a collapse, not a
     bow — terminating stops the policy from farming the crouch reward's tail
     from a heap on the floor.
 
 ════════════════════════════════════════════════════════════════════════════
-THE HISTORY. Four trained runs, four different failures, one lesson each.
+THE HISTORY. Seven trained runs, seven different failures, one lesson each.
 ════════════════════════════════════════════════════════════════════════════
 
 ── v1 PARKED IN THE CROUCH ─────────────────────────────────────────────────
@@ -250,70 +253,143 @@ between them cover all four neck/head joints. Nothing else moves.
       against a still head's +2.0/step, so the v5 pair is NET POSITIVE income
       for a head that behaves and can never make quitting look good.
 
-THE ARITHMETIC (`tests/test_bow_cfg.py::test_the_four_strategies` and
-`::test_the_thrashing_head_now_loses`, real reward functions, all 200 steps,
-sums of weighted values before mjlab's ×dt — divide by 200 for wandb's
-`Episode_Reward` units). `thrash` is what v4 rendered: a textbook bow with the
-head also swinging at 2 Hz through ±1.5 rad of yaw and ±0.4 of roll.
+── v6 AND v7: THE HEAD IS THE CLOCK ────────────────────────────────────────
+v5 pinned the head — yaw and roll within a degree — and the bow regressed to a
+half-crouch (dip 0.094 m, finish 0.099): the always-on head-still income
+diluted the rise. v6 moved weights only (rise_progress 6 → 12, risen 5 → 10,
+stand_pose 3 → 4, head_still 2 → 1). It still would not finish the rise, and
+docs/research/bow-audit.md found why: v4's head-yaw sweep was the policy's
+CLOCK. The actor is feedforward with no time input, and the only integrator it
+had was its own head. v5 took the clock away. v7 gave it back within a
+tolerance — BOW_HEAD_STILL_STD 0.08 → 0.5 rad (~30°), speed still priced — and
+v7 bows: it dips to ~9 cm, rises, and finishes with the head within 4°.
 
-                   textbook     thrash  park@0.101  park@0.088  collapse@1.5s
-      bow_height      600.0      600.0       431.9       400.1        222.6
-      bow_pitch       400.0      400.0       288.8       269.7        150.0
-      bow_head        400.0      400.0       227.8       247.7        150.0
-      bow_head_still  400.0       30.9       400.0       400.0        150.0
-      head_joint_vel   -0.3      -38.9         0.0        -0.1         -0.1
-      bow_upright     400.0      400.0       400.0       400.0        150.0
-      stand_pose      153.0      153.0        85.7        62.0          0.0
-      rise_progress   150.0      150.0         0.0         0.0          0.0
-      risen             5.0        5.0         0.0         0.0          0.0
-      terminated        0.0        0.0         0.0         0.0        -20.0
-      track           200.0      200.0       200.0       200.0         75.0
-      ---------------------------------------------------------------------
-      TOTAL          2707.7     2300.0      2034.2      1979.4        877.5
-      per phase dip   587.9      486.2       534.6       587.9        587.9
-               hold   600.0      498.1       407.0       600.0        289.6
-               rise   751.7      649.8       534.5       443.3          0.0
-               stand  768.0      665.8       558.1       348.1          0.0
-      per step        13.54      11.50       10.17        9.90         4.39
+── v8: IT RISES ONTO ONE LEG ───────────────────────────────────────────────
+THE FINDING (bow-v7, lab sim, three seeds, measured against the model's own
+joint names). The bow ends STANDING at 0.117 m — and on ONE FOLDED LEG. Seeds
+0 and 2 finish with the left hip_pitch 25°, knee 88° and ankle 67° away from
+the standing pose while the right leg is within 3° of it; seed 1 is the same
+failure split the other way (knee L +49 / R −50, ankle L +32 / R −36 in the
+mirrored frame). Pollen's stander recovers the pose in under a second at the
+handover, so this is a STANCE problem, not a fall problem — but Greg's read of
+the rollout is the one that matters: "not a stable standing position".
 
-Read the `thrash` column top to bottom: it is IDENTICAL to the textbook bow in
-every v4 term, line for line. That is the bug, printed. The two v5 rows are the
-only place the stack can tell them apart, and they are worth 2.04/step of
-separation — 40× what `action_rate_l2` was charging the swing.
+WHY NOTHING IN v7 CHARGED FOR IT. `stand_pose` is a MEAN over the ten leg
+joints, so three folded joints out of ten still bank 0.7 of the term — 61
+points across the whole episode. Every other stand-phase term reads the TRUNK:
+`bow_height`, `bow_pitch`, `bow_upright`, `rise_progress` and `risen` all score
+the one-legged stand EXACTLY as they score a textbook one, because one folded
+leg under a trunk that is at the right height, level and nose-forward moves
+none of them. The one-legged finish was not a training accident; it was a pose
+the stack could not see and therefore did not price. This is v4's lesson in a
+new place: v4 spent the joints nothing named (head_yaw, head_roll); v7 spent
+the DIFFERENCE between two joints that were each individually named.
 
-The v4 ordering survives untouched: textbook > park@0.101 > park@0.088 >
-collapse, with collapse still under half the next-worst. Two things to note
-about the numbers rather than the order:
+THE FIX, one variable. `bow_stand_symmetry_penalty` (weight -3.0): a BOUNDED
+cost on the mean absolute left/right difference over the five leg-joint pairs
+(hip_yaw, hip_roll, hip_pitch, knee, ankle), normalised by 0.5 rad and clamped
+to 1, live from 2.6 s — the last 0.4 s of the rise, so the stance is priced
+while the policy is still choosing it, plus the whole stand phase. Nothing else
+changes: same weights, same tolerances, same gates, same phase machine.
 
-  * `bow_head_still` pays every well-behaved strategy the same +400, parked
-    ones included, so the RATIO of park to textbook rises (0.68 → 0.73) while
-    the MARGIN is unchanged at 728 points / 3.64 per step. The margin is what
-    a policy optimizes; the test asserts both, and says why.
-  * The thrashing bow still beats parking (2300 > 1979). That is deliberate,
-    and it is lesson (i) again — a bow with a bad head is a WORSE BOW, not a
-    failure, and pricing it below "never bowed at all" would be exactly the
-    inversion that made v3 quit. It loses 407 points to the clean bow, which is
-    more than half the gap between a clean bow and one that never rises.
+THE SIGN CONVENTION IS MEASURED, NOT GUESSED — and getting it backwards would
+invert the term. The microduck's legs are MIRRORED in the model, not copied:
+HOME (microduck_constants.py) is left_hip_roll −0.0873 / right +0.0873,
+left_hip_pitch −0.4579 / right +0.4579, left_knee −0.0049 / right +0.0049,
+left_ankle +0.4530 / right −0.4530, hip_yaw 0 for both; and
+tasks/symmetry.py's `_JOINT_SIGN` — the table the mirror loss THIS ENV TRAINS
+WITH uses — carries −1 on all ten leg entries. So the reflection of a pose
+negates every leg deviation as well as swapping the sides, a symmetric pose is
+    (pos_L − home_L) = −(pos_R − home_R)
+and a pair's asymmetry is |rel_L + rel_R|. The naive |rel_L − rel_R| would
+price a normal two-legged squat as MAXIMALLY asymmetric and a scissored stance
+as perfect. `tests/test_bow_cfg.py::test_stand_symmetry_is_wired_with_the_
+models_own_mirror_signs` asserts the pairing, the signs and the HOME values, so
+a future model that stops mirroring a joint fails the test rather than the run.
+
+Why bounded and why only 1.4 s: at most 1.0/step over 70 steps = 210 points
+against a textbook bow's 2714. Enough to lose the one-legged stand by 270
+points; nowhere near enough to drive the per-step total toward the value of
+quitting, which is lesson (i) and the reason v3 diverged.
+
+PREDICTION for the v8 run: the dip and the rise are UNCHANGED (nothing before
+2.6 s is touched — same 9 cm crouch, same trunk trajectory, same head clock),
+and the episode finishes with the two legs within 10° per pair. If instead the
+rise regresses, the cost has reached back too far and 2.6 s is the number to
+move before any weight is. If the stand goes symmetric but SHALLOW — both legs
+folded the same amount — the symmetry term is being satisfied by a squat and
+`stand_pose` is the term to raise, not this one.
+
+THE ARITHMETIC (`tests/test_bow_cfg.py::test_the_four_strategies`,
+`::test_the_thrashing_head_now_loses` and `::test_the_one_legged_bow_now_loses`
+— real reward functions, real cfg weights, all 200 steps, sums of weighted
+values before mjlab's ×dt; divide by 200 for wandb's `Episode_Reward` units).
+`one leg` is what v7 rendered: a textbook bow, term for term, that unfolds out
+of the crouch onto ONE leg and finishes standing on it. `thrash` is what v4
+rendered: a textbook bow with the head also swinging at 2 Hz through ±1.5 rad
+of yaw and ±0.4 of roll.
+
+                    textbook   one leg    thrash  park@.101  park@.088  collapse
+      bow_height       600.0     600.0     600.0      431.9      400.1     222.6
+      bow_pitch        400.0     400.0     400.0      288.8      269.7     150.0
+      bow_head         400.0     400.0     400.0      227.8      247.7     150.0
+      bow_head_still   200.0     200.0      93.9      200.0      200.0      75.0
+      head_joint_vel    -0.3      -0.3     -38.9        0.0       -0.1      -0.1
+      bow_upright      400.0     400.0     400.0      400.0      400.0     150.0
+      stand_pose       204.0     142.8     204.0      114.2       82.7       0.0
+      rise_progress    300.0     300.0     300.0        0.0        0.0       0.0
+      stand_symmetry     0.0    -209.0       0.0        0.0        0.0       0.0
+      risen             10.0      10.0      10.0        0.0        0.0       0.0
+      terminated         0.0       0.0       0.0        0.0        0.0     -20.0
+      track            200.0     200.0     200.0      200.0      200.0      75.0
+      -------------------------------------------------------------------------
+      TOTAL           2713.7    2443.4    2569.0     1862.7     1800.0     802.5
+      per phase dip    538.9     538.9     503.0      485.6      538.9     538.9
+               hold    550.0     550.0     513.8      357.0      550.0     263.6
+               rise    853.7     797.7     817.6      484.5      393.3       0.0
+               stand   771.0     556.8     734.6      535.6      317.8       0.0
+      per step         13.57     12.22     12.84       9.31       9.00      4.01
+
+Read the `one leg` column top to bottom, exactly as the `thrash` column was
+read for v5. Every trunk term is IDENTICAL to the textbook bow — height, pitch,
+uprightness, rise_progress, risen, and both head terms, line for line. That is
+the bug, printed: a folded leg under a level trunk at the right height moves
+NOTHING the v7 stack measures. `stand_pose` is the only pre-v8 term that even
+looks at the legs, and being a MEAN over ten of them it charges three folded
+joints just 61 points — 0.3 per step, against a 13.57/step bow. `stand_symmetry`
+is worth 209 of the 270-point separation; the term is the mechanism, the mean
+over ten joints was the loophole.
+
+The ordering is textbook > one leg > thrash > park@0.101 > park@0.088 >
+collapse. Three things to note about the numbers rather than the order:
+
+  * The one-legged bow LOSES 270 points but stays 581 ahead of the best park.
+    That is deliberate, and it is lesson (i): a bow that ends badly is a WORSE
+    BOW, not a failure, and pricing it below "never bowed at all" is exactly
+    the inversion that made v3 quit. It keeps every point its dip, hold and
+    rise honestly earn; it pays only for the stance.
+  * The cost is bounded at 210 points (1.0/step × 70 steps), which is 7.7% of a
+    textbook bow's take and a tenth of what quitting at 1.5 s forfeits. It can
+    lose a one-legged stand; it cannot make the exit look good.
+  * `stand_symmetry` reads 0.0 for the parks. They never rise, so their legs
+    stay in the symmetric crouch they dipped into — the term prices the STANCE,
+    never the crouch, and adds nothing to the case against parking (that case
+    is `rise_progress`'s, and it is worth 300 points).
 
 park@0.101 is v2's learned trajectory, park@0.088 is v1's (a textbook dip and
 hold, then frozen in the crouch — credited in full for the half of the bow it
 genuinely does), and collapse@1.5 s is a textbook bow that folds mid-hold and
-terminates.
+terminates. Collapse is +802, not negative: an episode that ends simply stops
+earning, and no sane penalty makes 1.5 s of an honest bow worth less than
+nothing. The -20 is insurance; the mechanism is the 125 steps of forfeited
+income (drop it and collapsing is still last by 977 points).
 
-The ORDER is the point, and it is the first version to get all of it right:
-textbook > park@0.101 > park@0.088 > collapse, with collapsing at less than
-half of the next-worst. Note what is NOT claimed: collapse is +728, not
-negative. An episode that ends simply stops earning, and no sane penalty makes
-1.5 s of an honest bow worth less than nothing. The -20 is insurance; the
-mechanism is the 125 steps of forfeited income (drop the -20 and collapse is
-still last by 830 points).
-
-Note also that the paper margin over the low park (1.46×) is THINNER than
-v3's (2.6×). That is deliberate. v3 bought its margin with costs that made
-quitting cheap, and the policy quit. What v4 has instead is a per-step
-GRADIENT: from the parked crouch, a step of climbing is worth strictly more
-than a step of staying, at every rate from a 0.005 m/s crawl to the 0.06 m/s
-cap, and the best-paid rate is the one that tracks the ramp
+The paper margin over the low park (1.51×) is THINNER than v3's (2.6×), on
+purpose. v3 bought its margin with costs that made quitting cheap and the
+policy quit. What this stack has instead is a per-step GRADIENT: from the
+parked crouch, a step of climbing is worth strictly more than a step of
+staying, at every rate from a 0.005 m/s crawl to the 0.06 m/s cap, and the
+best-paid rate is the one that tracks the ramp
 (`test_rising_out_of_the_crouch_pays_at_every_millimetre`). v1's stack had no
 such slope — that is why it sat at 0.088 m for 2.7 s.
 
@@ -339,12 +415,29 @@ WATCH FOR, in this order:
      own cost) and never approach -0.5. If it parks near that floor the head is
      saturating the cap every step, and the thing to check is whether some
      other term is paying MORE for the swing than this one charges.
+  7. `Episode_Reward/stand_symmetry`, the v8 tripwire, read TOGETHER with
+     `stand_pose`. A symmetric finish logs ~0.0; the v7 ending would log the
+     floor, -1.05 (= -3.0 × 70/200). Anything past about -0.3 while the trunk
+     terms are healthy is a leg still folded at the finish.
+       · symmetry near 0 AND `stand_pose` near its 4.0 weight = the v8 fix
+         landed: two legs, both at the standing pose.
+       · symmetry near 0 but `stand_pose` LOW = the term is being satisfied by
+         a symmetric SQUAT — both legs folded the same amount. Raise
+         W_STAND_POSE, never this weight; symmetry is doing its job.
+       · symmetry at the floor while `rise_progress` is healthy = it rises and
+         still picks a leg. The next move is BOW_SYMMETRY_START_S earlier (the
+         stance is being committed before the cost opens), not a bigger weight.
+       · `rise_progress` collapsing at the same time as this term arrives = the
+         cost reached too far back into the rise. Move the 2.6 s later before
+         touching anything else.
 
 Reward MASS check (AGENTS.md: compare mass, not weights, when regularizers are
-shared): the episode-average positive stack for a textbook bow is 13.5 (v4's
-11.5 plus the +2.0 of `bow_head_still`), still the same order as the velocity
-recipe's ~11 that the inherited regularizers were tuned against — with
-action_rate_l2 deliberately well below that scaling.
+shared): the episode-average positive stack for a textbook bow is 13.6, still
+the same order as the velocity recipe's ~11 that the inherited regularizers
+were tuned against — with action_rate_l2 deliberately well below that scaling.
+The v8 cost is bounded at 1.05/step averaged over the episode and only bites a
+finish that is already wrong, so it does not move that mass for a bow that
+works.
 """
 
 import math
@@ -429,6 +522,24 @@ assert HEAD_VEL_CAP > 5.0 * HEAD_RAMP_RATE
 
 _LEG_JOINTS = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
 
+# ── v8: the five LEFT/RIGHT leg pairs, and how the model mirrors them ────────
+# (0,9) hip_yaw, (1,10) hip_roll, (2,11) hip_pitch, (3,12) knee, (4,13) ankle.
+# The legs are MIRRORED in the model, not copied — HOME is left_hip_pitch
+# -0.4579 / right +0.4579, left_ankle +0.4530 / right -0.4530 — and
+# tasks/symmetry.py's `_JOINT_SIGN`, the table the mirror loss this env trains
+# with uses, carries -1 on all ten leg entries. So the symmetric condition on
+# the DEVIATION from HOME is rel_L = -rel_R, and a pair's asymmetry is
+# |rel_L + rel_R|. Getting this backwards would price a normal two-legged
+# squat as maximally asymmetric and a scissored stance as perfect.
+LEG_PAIRS = microduck_mdp.BOW_LEG_PAIRS
+LEG_PAIR_MIRROR_SIGN = microduck_mdp.BOW_LEG_PAIR_MIRROR_SIGN
+SYMMETRY_NORM = microduck_mdp.BOW_SYMMETRY_NORM      # 0.5 rad ≈ 29°, then clamp
+SYMMETRY_START_S = microduck_mdp.BOW_SYMMETRY_START_S  # 2.6 s
+assert SYMMETRY_START_S < RISE_END_S, "the cost must reach into the rise"
+assert [j for pair in LEG_PAIRS for j in pair] and sorted(
+    j for pair in LEG_PAIRS for j in pair
+) == sorted(_LEG_JOINTS), "the pairs must cover exactly the ten leg joints"
+
 # ── Reward weights ──────────────────────────────────────────────────────────
 # v1's stack verbatim, plus exactly three new terms (rise_progress, risen,
 # terminated) and two adjustments (stand_pose 2 -> 3, action_rate -0.2 ->
@@ -475,6 +586,18 @@ W_STAND_POSE = 4.0    # the finish, stand phase only. v1's 2.0 was too cheap to
                       # outbid the crouch; v2's 5.0 was raised without a path to
                       # the pose it pays for, so nothing collected it. 3.0 plus
                       # a gradient up (below) is the version that has both.
+W_STAND_SYMMETRY = -3.0  # THE v8 TERM, and the ONLY change from v7. Bounded
+                       # (≤1.0/step) and live only over the last 1.4 s: the mean
+                       # absolute left/right difference over the five leg pairs,
+                       # normalised by 0.5 rad. v7 rose onto ONE LEG on all
+                       # three seeds and no term in the stack could see it —
+                       # `stand_pose` is a MEAN over ten leg joints, so three
+                       # folded joints still bank 0.7 of it, and height, pitch
+                       # and uprightness all read the trunk, which one folded
+                       # leg does not move. Worst case 210 points against a
+                       # textbook bow's ~2900: enough to lose the one-legged
+                       # stand by 100+, far too small to make quitting cheap
+                       # (the v3 lesson).
 W_RISE_PROGRESS = 12.0 # THE v4 TERM. Potential-based Δ of a running-max trunk
                        # height over the rise window, rate-capped: the full 3 cm
                        # is worth 25 credits = 150 points however it is climbed,
@@ -637,6 +760,21 @@ def make_microduck_bow_env_cfg(
             "sensor_name": sensor_name,
             "joint_indices": _LEG_JOINTS,   # head is bow_head's job
             "std": STAND_POSE_STD,          # tight: this IS the standing pose
+        },
+    )
+    # THE v8 TERM: the stand has to be on TWO legs. `stand_pose` above is a mean
+    # over the ten leg joints, so v7 could finish with one leg folded (knee 88°
+    # off HOME) and still bank 0.7 of it while every other stand-phase term —
+    # height, pitch, uprightness — reads only the trunk and notices nothing.
+    cfg.rewards["stand_symmetry"] = RewardTermCfg(
+        func=microduck_mdp.bow_stand_symmetry_penalty,
+        weight=W_STAND_SYMMETRY,
+        params={
+            "sensor_name": sensor_name,
+            "pairs": LEG_PAIRS,               # the five left/right leg pairs
+            "mirror_signs": LEG_PAIR_MIRROR_SIGN,  # all -1: the legs mirror
+            "norm": SYMMETRY_NORM,            # 0.5 rad ≈ 29° saturates the cost
+            "start_s": SYMMETRY_START_S,      # 2.6 s: the last of the rise on
         },
     )
     # THE v4 TERM: a dense, potential-based gradient all the way up. Everything

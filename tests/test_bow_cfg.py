@@ -11,6 +11,11 @@ from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.mdp import BOW_HEAD_STILL_STD
 from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     W_HEAD_STILL,
+    W_STAND_SYMMETRY,
+    LEG_PAIRS,
+    LEG_PAIR_MIRROR_SIGN,
+    SYMMETRY_NORM,
+    SYMMETRY_START_S,
     BOW_COLLAPSE_Z,
     BOW_DIP_M,
     BOW_PITCH_RAD,
@@ -87,8 +92,8 @@ def test_gait_terms_gone_and_bow_terms_signed():
                 "track_linear_velocity", "track_angular_velocity"):
         assert cfg.rewards[pos].weight > 0, pos
     for cost in ("foot_lift", "terminated", "drift", "foot_slip",
-                 "head_joint_vel", "action_rate_l2", "dof_pos_limits",
-                 "self_collisions"):
+                 "head_joint_vel", "stand_symmetry", "action_rate_l2",
+                 "dof_pos_limits", "self_collisions"):
         assert cfg.rewards[cost].weight < 0, cost
     # v3's corridor credit and its two off-ramp costs are GONE: costs that make
     # a parked pose expensive also make TERMINATING cheap, and the v3 run took
@@ -187,6 +192,57 @@ def test_head_still_and_head_vel_are_wired_to_the_right_joints():
     steps = int(EPISODE_LENGTH_S / 0.02)
     assert abs(vel.weight) * steps < still.weight * steps
     assert still.weight + vel.weight > 0.0
+
+
+def test_stand_symmetry_is_wired_with_the_models_own_mirror_signs():
+    """v8. The signs here are the whole term: get them backwards and it prices
+    a normal two-legged squat as maximally asymmetric and a scissored stance as
+    perfect. They are read off the model, not guessed."""
+    cfg = make_microduck_bow_env_cfg()
+    term = cfg.rewards["stand_symmetry"]
+    assert term.func is microduck_mdp.bow_stand_symmetry_penalty
+    assert term.weight == W_STAND_SYMMETRY == -3.0
+    # Exactly the five left/right leg pairs, covering exactly the ten leg
+    # joints `stand_pose` averages over — no head joint is paired.
+    assert tuple(term.params["pairs"]) == LEG_PAIRS == (
+        (0, 9), (1, 10), (2, 11), (3, 12), (4, 13))
+    assert sorted(j for p in LEG_PAIRS for j in p) == sorted(_LEG_JOINTS)
+    assert set(j for p in LEG_PAIRS for j in p).isdisjoint(HEAD_VEL_JOINTS)
+    # THE SIGN CONVENTION. The legs are MIRRORED in the model, not copied:
+    # HOME carries opposite signs left/right, and tasks/symmetry.py's
+    # `_JOINT_SIGN` — the table this env's own mirror loss uses — carries -1 on
+    # all ten leg entries. So a symmetric pose has rel_L = -rel_R.
+    from mjlab_microduck.tasks.symmetry import _JOINT_PERM, _JOINT_SIGN
+    for k, (l, r) in enumerate(LEG_PAIRS):
+        assert _JOINT_PERM[l] == r and _JOINT_PERM[r] == l, (l, r)
+        assert _JOINT_SIGN[l] == _JOINT_SIGN[r] == LEG_PAIR_MIRROR_SIGN[k] == -1.0
+    from mjlab_microduck.robot.microduck_constants import HOME_FRAME
+    jp = HOME_FRAME.joint_pos
+    for a, b in ((r".*left_hip_roll.*", r".*right_hip_roll.*"),
+                 (r".*left_hip_pitch.*", r".*right_hip_pitch.*"),
+                 (r".*left_knee.*", r".*right_knee.*"),
+                 (r".*left_ankle.*", r".*right_ankle.*")):
+        assert math.isclose(jp[a], -jp[b], rel_tol=1e-9), (a, b)
+    assert jp[r".*hip_yaw.*"] == 0.0    # the one pair with a shared HOME
+    # 0.5 rad ≈ 29°: above the wobble of any real stand, below the 36° mean
+    # difference of the v7 ending (which therefore clamps at exactly 1.0).
+    assert term.params["norm"] == SYMMETRY_NORM == 0.5
+    # It reaches back into the rise, so the stance is priced while it is being
+    # CHOSEN rather than after the policy has committed to it.
+    assert term.params["start_s"] == SYMMETRY_START_S == 2.6
+    assert HOLD_END_S < SYMMETRY_START_S < RISE_END_S < STAND_END_S
+    # BOUNDED, and small: at most 1.0/step over the last 1.4 s. It must be able
+    # to lose the one-legged stand and unable to make quitting attractive —
+    # the v3 lesson, in an assertion.
+    live_steps = (EPISODE_LENGTH_S - SYMMETRY_START_S) / 0.02
+    worst = abs(term.weight) * live_steps
+    assert math.isclose(worst, 210.0), worst
+    assert worst < abs(cfg.rewards["terminated"].weight) * 200 * 0.5
+    # Level with `foot_lift` per step — a folded leg at the finish is as bad as
+    # a foot off the floor — but live for 70 steps against foot_lift's 200, so
+    # its worst-case episode bill is a third of the hardest per-step rule's.
+    assert term.weight == cfg.rewards["foot_lift"].weight
+    assert worst < 0.5 * abs(cfg.rewards["foot_lift"].weight) * 200
 
 
 def test_collapse_termination_added():
@@ -353,6 +409,125 @@ def test_stand_pose_pays_only_in_the_stand_phase():
     assert pose() == 1.0
     env._asset.data.joint_pos = torch.full((1, 14), 0.5)   # folded, not standing
     assert pose() < 0.1
+
+
+# ── v8: the measured v7 ending, in the model's own joint numbers ────────────
+# bow-v7, lab sim, three seeds. The bow ends STANDING at 0.117 m with the head
+# within 4 deg — and on ONE FOLDED LEG. Degrees away from the standing pose:
+_V7_SEED0_LEFT = {2: -25.0, 3: -88.0, 4: -67.0}   # hip_pitch, knee, ankle
+_V7_SEED0_RIGHT = {11: 0.0, 12: 0.0, 13: 0.0}     # the other leg, within 3 deg
+# Seed 1 is the same failure split across both legs — knee L +49 / R -50, ankle
+# L +32 / R -36, quoted in the MIRRORED (physical) frame in which a symmetric
+# pose reads as equal numbers. In the model's RAW joint coordinates the right
+# leg's sign flips, so those are raw L +49 / R +50 and L +32 / R +36: both
+# knees driven the SAME raw way, which is what a scissored stance looks like
+# once the mirror is undone.
+_V7_SEED1_LEFT = {3: 49.0, 4: 32.0}
+_V7_SEED1_RIGHT = {12: 50.0, 13: 36.0}
+
+
+def _pose(env, degrees):
+    """Put the servo joints at the given HOME-relative offsets, in degrees.
+
+    The fake asset's `default_joint_pos` is all zeros, so joint_pos IS the
+    deviation from HOME that `bow_stand_symmetry_penalty` measures."""
+    q = torch.zeros(1, 14)
+    for j, deg in degrees.items():
+        q[0, j] = math.radians(deg)
+    env._asset.data.joint_pos = q
+
+
+def test_stand_symmetry_sees_the_one_legged_stand_v7_could_not():
+    """v8, THE term. bow-v7 rises and finishes standing at 0.117 m — on one
+    leg, on all three seeds, with the other folded 88 deg at the knee. Nothing
+    in the v7 stack charged a penny for it: `stand_pose` is a MEAN over ten leg
+    joints (three folded joints still bank 0.7 of it) and height, pitch and
+    uprightness all read the TRUNK, which one folded leg does not move."""
+    env = _FakeEnv()
+    cost = lambda: float(
+        microduck_mdp.bow_stand_symmetry_penalty(env, **_cfg_params("stand_symmetry"))[0])
+    env.run_to(STAND_END_S)
+
+    # A robot standing at HOME on two legs owes nothing.
+    _pose(env, {})
+    assert cost() == 0.0
+
+    # …and neither does a DEEP but symmetric squat. In the model the legs are
+    # mirrored, so a symmetric crouch has raw joint values of OPPOSITE sign
+    # left/right; this term must price the STANCE, never the crouch.
+    _pose(env, {2: 20.0, 3: 40.0, 4: 20.0, 11: -20.0, 12: -40.0, 13: -20.0})
+    assert cost() == 0.0, "a two-legged squat is symmetric, not a violation"
+
+    # The v7 ending, seeds 0 and 2: one leg folded, the other at the pose.
+    _pose(env, {**_V7_SEED0_LEFT, **_V7_SEED0_RIGHT})
+    seed0 = cost()
+    assert math.isclose(seed0, 1.0), seed0
+    # It is clamped, not merely large: the raw mean difference is 36 deg
+    # against a 29 deg (0.5 rad) normaliser.
+    raw = sum(abs(math.radians(d)) for d in _V7_SEED0_LEFT.values()) / len(LEG_PAIRS)
+    assert math.isclose(math.degrees(raw), 36.0, abs_tol=0.1), math.degrees(raw)
+    assert raw > SYMMETRY_NORM
+
+    # Seed 1, the split, in the model's raw coordinates — also fully charged.
+    _pose(env, {**_V7_SEED1_LEFT, **_V7_SEED1_RIGHT})
+    assert math.isclose(cost(), 1.0)
+
+    # Mirror the failure (fold the RIGHT leg instead) and it costs exactly the
+    # same. A bow is left/right symmetric and so is its penalty.
+    _pose(env, {11: -25.0, 12: -88.0, 13: -67.0})
+    assert math.isclose(cost(), seed0)
+
+
+def test_stand_symmetry_is_bounded_linear_and_cheap_for_a_real_stand():
+    env = _FakeEnv()
+    cost = lambda: float(
+        microduck_mdp.bow_stand_symmetry_penalty(env, **_cfg_params("stand_symmetry"))[0])
+    env.run_to(STAND_END_S)
+
+    # A couple of degrees of left/right difference — what any real stand
+    # carries — is nearly free. The term prices a folded leg, not a wobble.
+    _pose(env, {2: 2.0, 3: 2.0, 4: 2.0})
+    wobble = cost()
+    assert wobble < 0.05, wobble
+    # …0.13 points a step at weight -3.0, about 9 points over the whole window,
+    # against the 210 a folded leg costs. Linear, so there is no dead band to
+    # hide a small list in either — just a price proportional to the crime.
+    assert abs(W_STAND_SYMMETRY) * wobble < 0.15
+
+    # Below the clamp it is LINEAR in the difference: half the fold, half the
+    # cost, so there is a gradient to follow all the way back to a two-legged
+    # stance (and no cliff for a policy that is nearly there).
+    half = {j: d / 2.0 for j, d in _V7_SEED0_LEFT.items()}
+    quarter = {j: d / 4.0 for j, d in _V7_SEED0_LEFT.items()}
+    _pose(env, quarter)
+    c1 = cost()
+    _pose(env, half)
+    c2 = cost()
+    assert 0.0 < c1 < c2 < 1.0
+    assert math.isclose(c2, 2.0 * c1, rel_tol=1e-5)
+
+    # And it saturates: twice the v7 fold costs no more than the v7 fold, so
+    # no single joint blowing up can dominate the episode (the v3 lesson —
+    # an unbounded cost is how a stack teaches a policy to quit).
+    _pose(env, {j: 2.0 * d for j, d in _V7_SEED0_LEFT.items()})
+    assert cost() == 1.0
+
+
+def test_stand_symmetry_is_silent_before_the_end_of_the_rise():
+    """A time window, not a state gate — the same shape as `stand_pose`. It
+    opens 0.4 s BEFORE the stand phase so the stance is priced while the policy
+    is still choosing it, not after it has committed to a folded leg."""
+    env = _FakeEnv()
+    cost = lambda: float(
+        microduck_mdp.bow_stand_symmetry_penalty(env, **_cfg_params("stand_symmetry"))[0])
+    _pose(env, {**_V7_SEED0_LEFT, **_V7_SEED0_RIGHT})
+    for t in (0.5, DIP_END_S, 1.5, HOLD_END_S, 2.4, SYMMETRY_START_S - 0.02):
+        env.run_to(t)
+        assert cost() == 0.0, f"the dip and most of the rise are unpriced ({t}s)"
+    env.run_to(SYMMETRY_START_S)
+    assert math.isclose(cost(), 1.0), "it opens inside the rise"
+    env.run_to(STAND_END_S)
+    assert math.isclose(cost(), 1.0)
 
 
 def test_head_target_goes_down_then_up():
@@ -561,7 +736,13 @@ def test_risen_tolerance_is_one_centimetre():
 
 # ── the ramp, and the three strategies measured against it ──────────────────
 
-_CROUCH_LEGS = {2: 0.25, 3: 0.5, 4: 0.25, 11: 0.25, 12: 0.5, 13: 0.25}
+# A SYMMETRIC crouch, in the model's raw joint coordinates. The legs are
+# mirrored, not copied (HOME is left_hip_pitch -0.4579 / right +0.4579), so the
+# right leg's raw offsets carry the OPPOSITE sign — this is what
+# tasks/symmetry.py's `_JOINT_SIGN` says and it is what the v8 symmetry penalty
+# measures. Every other term here reads |pos - HOME| per joint, so the flipped
+# signs leave every pre-v8 number in this file untouched.
+_CROUCH_LEGS = {2: 0.25, 3: 0.5, 4: 0.25, 11: -0.25, 12: -0.5, 13: -0.25}
 
 
 def _legs(depth_frac):
@@ -598,6 +779,24 @@ def _park_low(t):
     if t <= HOLD_END_S:
         return _textbook(t)
     return (BOW_Z, BOW_PITCH_RAD, microduck_mdp.BOW_HEAD_DOWN, _legs(1.0))
+
+
+def _one_leg(t):
+    """WHAT BOW-V7 ACTUALLY DID, on all three seeds: a textbook bow — right
+    dip, right hold, right head, a full rise back to standing height with both
+    feet planted — that finishes ON ONE FOLDED LEG.
+
+    The trunk trajectory is the textbook one, term for term. Only the LEGS
+    diverge, unfolding out of the symmetric crouch into the measured v7 ending
+    (left hip_pitch -25 deg, knee -88 deg, ankle -67 deg from HOME against a
+    right leg at HOME) across the rise, exactly as the rendered rollout does."""
+    z, nose_down, head, legs = _textbook(t)
+    u = min(max(t - HOLD_END_S, 0.0), 1.0)          # 0 at the crouch, 1 standing
+    end = {j: math.radians(d) for j, d in _V7_SEED0_LEFT.items()}
+    end.update({j: math.radians(d) for j, d in _V7_SEED0_RIGHT.items()})
+    blended = {j: legs.get(j, 0.0) * (1.0 - u) + end.get(j, 0.0) * u
+               for j in set(legs) | set(end)}
+    return z, nose_down, head, blended
 
 
 def _drive(env, traj):
@@ -824,6 +1023,9 @@ def _episode(traj, terminate_s=None):
             "rise_progress": w("rise_progress") * float(
                 microduck_mdp.bow_rise_progress_reward(
                     env, **_cfg_params("rise_progress"))[0]),
+            "stand_symmetry": w("stand_symmetry") * float(
+                microduck_mdp.bow_stand_symmetry_penalty(
+                    env, **_cfg_params("stand_symmetry"))[0]),
             "risen": w("risen") * float(microduck_mdp.bow_risen_bonus(env)[0]),
             "terminated": w("terminated") * float(
                 microduck_mdp.bow_termination_penalty(env, **_cfg_params("terminated"))[0]),
@@ -910,6 +1112,62 @@ def test_the_four_strategies():
                 (("book", book_t), ("high", high_t), ("low", low_t))}
     assert per_step["book"] > per_step["low"] + 3.0, per_step
     assert per_step["book"] > per_step["high"] + 3.0, per_step
+
+
+def test_the_one_legged_bow_now_loses():
+    """The v8 thesis, measured against the strategy it was written to beat.
+
+    bow-v7 bows and rises — and finishes standing on ONE leg, on all three
+    seeds. Like v4's thrashing head, that is not a training accident: it is
+    what the v7 stack paid for. `stand_pose` is a MEAN over ten leg joints, so
+    a leg folded 88 deg at the knee still banks 0.7 of the term, and every
+    other stand-phase term — height, pitch, uprightness, rise_progress, risen —
+    reads the TRUNK, which one folded leg does not move."""
+    book, _ = _episode(_textbook)
+    one, _ = _episode(_one_leg)
+    steps = int(STAND_END_S / 0.02)
+
+    # 1. UNDER THE v7 STACK IT IS ALMOST FREE. Every trunk term scores the
+    #    one-legged bow exactly as it scores the textbook one …
+    for k in book:
+        if k in ("stand_pose", "stand_symmetry"):
+            continue
+        assert math.isclose(book[k], one[k], abs_tol=1e-6), k
+    assert one["rise_progress"] == book["rise_progress"]   # it really did rise
+    assert one["risen"] == book["risen"]                   # …and it got up
+    #    … and the one term that CAN see the legs charges it only the three
+    #    folded joints out of ten, i.e. 30% of a term worth 4.0/step.
+    assert math.isclose(one["stand_pose"], 0.7 * book["stand_pose"], rel_tol=1e-3)
+    v7_gap = sum(v for k, v in book.items() if k != "stand_symmetry") - sum(
+        v for k, v in one.items() if k != "stand_symmetry")
+    assert v7_gap < 100.0, ("v7 could not see a folded leg", v7_gap)
+
+    # 2. …and the v8 term is what separates them. Bounded, so it charges the
+    #    ceiling: 1.0/step over the 70 steps from 2.6 s, minus the ramp in.
+    assert book["stand_symmetry"] == 0.0, "a symmetric bow owes nothing"
+    assert one["stand_symmetry"] < 0.0
+    worst = W_STAND_SYMMETRY * (STAND_END_S - SYMMETRY_START_S) / 0.02
+    assert worst < one["stand_symmetry"] < 0.9 * worst, one["stand_symmetry"]
+
+    # 3. THE REQUIREMENT: the one-legged bow now loses to the textbook bow by
+    #    more than 100 points — Greg's "not a stable standing position" priced.
+    book_t, one_t = sum(book.values()), sum(one.values())
+    assert book_t - one_t > 100.0, (book_t, one_t)
+    assert book_t - one_t > 2.5 * v7_gap, "the new term is the mechanism"
+
+    # 4. …and it still WINS against everything that did not bow. It rose, it
+    #    got its trunk back to standing height, and half a stance is not a
+    #    failure — pricing an imperfect bow below "never bowed at all" is
+    #    exactly the inversion that made v3 quit (lesson (i)).
+    high, _ = _episode(_park_high)
+    low, _ = _episode(_park_low)
+    dead, _ = _episode(_collapse, terminate_s=1.5)
+    high_t, low_t, dead_t = (sum(x.values()) for x in (high, low, dead))
+    assert one_t > high_t > low_t > dead_t, (one_t, high_t, low_t, dead_t)
+    assert one_t - low_t > 400.0, (one_t, low_t)
+    # The ordering, in one line: textbook > one leg > high park > low park >
+    # collapse, and the per-step gap the policy optimizes.
+    assert (book_t - one_t) / steps > 0.5, (book_t - one_t) / steps
 
 
 def _thrash(t):
