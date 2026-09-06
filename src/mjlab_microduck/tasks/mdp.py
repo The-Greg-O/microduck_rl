@@ -7697,14 +7697,17 @@ def hs_tilt_penalty(
 #     gates the head LIFT so the head is at HOME at t=0, down at the hold, and
 #     lifted at the finish (head target = s·down + r·up).
 #
-# v3 makes the height ramp (`_bow_target_z`) the single thing everything else
-# is measured against: the height Gaussian tracks it, `bow_phase_match_reward`
-# pays a credit per phase for staying inside a 1 cm corridor around it, and
-# `bow_not_dipped_penalty` / `bow_not_risen_penalty` charge being on the wrong
-# side of it in the dip/hold and rise/stand windows respectively. The point is
-# that NO STATIC HEIGHT is right for long: v1 parked at the crouch and v2 at a
-# compromise 0.101 m, and both were profitable under a stack that only ever
-# asked "how close are you to this phase's pose?".
+# The height ramp (`_bow_target_z`) is the one thing every height-sensitive term
+# measures against, so there is a single source of truth for the trajectory.
+#
+# v4's addition is `bow_rise_progress_reward`: a POTENTIAL-BASED term on trunk
+# height, modelled exactly on `hs_progress_reward`. v1/v2/v3 all priced the rise
+# by where the trunk IS (a Gaussian on the ramp, a corridor latch, an off-ramp
+# cost); none of them paid for the act of GOING UP, so a policy one centimetre
+# into a rise it had not finished collected nothing for that centimetre. The
+# progress term pays Δ of a running-max potential, which means a partial rise is
+# worth exactly its fraction of the whole — a gradient the policy can follow all
+# the way from the crouch to the stand.
 
 BOW_DIP_END_S = 1.0
 BOW_HOLD_END_S = 2.0
@@ -7743,42 +7746,33 @@ BOW_FLICKER_S = 0.04        # airborne shorter than this is a contact flicker,
                             # not a hop: a rise that unweights a heel for a
                             # frame must not be priced as a foot lift.
 
-# ── v3: the ramp is the contract ────────────────────────────────────────────
-# Everything below prices the trunk against the SLEWED target `_bow_target_z`
-# rather than against a phase's end pose, so a static height is wrong almost
-# everywhere and there is no compromise to park on.
-#
-# `_bow_on_ramp` / BOW_MATCH_TOL — the trunk is ON the ramp within 1 cm.
-# `bow_phase_match_reward` pays one credit per PHASE, and only if the trunk was
-# on the ramp for EVERY step of that phase (see `_bow_update`). A per-step
-# version of the same 1 cm window would be farmable: the ramp sweeps 3 cm in
-# 1 s, so it passes within 1 cm of ANY parked height for 0.67 s of the dip and
-# again for 0.67 s of the rise — 66 free steps per episode for standing still.
-BOW_MATCH_TOL = 0.01
-# The spawn (`reset_base` pose_range z = 0.12–0.13) lands 0.5–1.5 cm above the
-# ramp's start, so the first steps of the dip are a drop, not a tracking error:
-# the phase latch ignores them. By 0.3 s the ramp is at 0.106 m and the natural
-# standing equilibrium is 0.115 m, so from there on the latch means "you are
-# actually going down".
-BOW_MATCH_GRACE_S = 0.3
-
-# The two symmetric "wrong side of the ramp" costs. Both measure against
-# `_bow_target_z`, never against a fixed height, so a trunk ON the ramp is free
-# in both windows and the costs can never fight the trajectory they are meant
-# to enforce:
-#   not_dipped   0.8 → 2.0 s, charged while z > target + band  (parked HIGH)
-#   not_risen    2.5 → end,   charged while z < target - band  (parked LOW)
-# One centimetre of forgiveness (the same tolerance as `risen`), then a 5 mm
-# linear slope to full cost: more than 1.5 cm off the ramp on the wrong side is
-# charged in full. The slope keeps a gradient across exactly the band the
-# compromise pose lives in (0.095–0.105); below/above it the pull comes from
-# `bow_stand_pose_reward`, the height Gaussian and the `risen` one-shot.
-BOW_OFF_RAMP_BAND = 0.01
-BOW_OFF_RAMP_SLOPE = 0.005
-BOW_NOT_DIPPED_START_S = 0.8   # commit to the crouch by here …
-BOW_NOT_DIPPED_END_S = 2.0     # … and the cost is off again for the rise
-BOW_NOT_RISEN_START_S = 2.5    # committed to coming back up by here
-BOW_TIME_RAMP_S = 0.1          # both costs fade in over 0.1 s (slope, no cliff)
+# ── v4: pay for the CLIMB, not for the height ───────────────────────────────
+# `_bow_rise_pot` is the progress potential: the running MAXIMUM of the trunk
+# height, clamped to [BOW_CROUCH_Z, BOW_STAND_Z], over the rise window. Exactly
+# the shape of happy-spin's `_hs_yaw`:
+#   * running max  → sinking back down and re-climbing cannot be paid twice;
+#   * clamped low  → diving below the crouch buys no extra runway (and the
+#                    clamp is at the crouch target, which is also where the
+#                    ramp puts the trunk at t = 2 s, so a correct bow starts
+#                    the window with the full 3 cm of headroom and nothing
+#                    deeper adds any);
+#   * clamped high → overshooting past the standing height pays nothing.
+# `bow_rise_progress_reward` pays Δ of it, normalised by BOW_RISE_RATE_CAP so
+# the WHOLE rise is worth the same fixed total however fast it is executed
+# (0.030 m / (0.06 m/s · 0.02 s) = 25.0 unweighted credits), and capped at 1.0
+# per step so a violent leap buys nothing extra. Potential-based, so holding
+# still pays exactly zero — this is the AGENTS.md shaping that is unfarmable.
+BOW_RISE_RATE_CAP = 0.06      # m/s; ≥ the 0.03 m/s the 1 s ramp itself asks for
+BOW_RISE_PAY_START_S = 2.0    # = BOW_HOLD_END_S: the rise window opens …
+BOW_RISE_PAY_END_S = 3.2      # … and stays open 0.2 s into the stand phase, so
+                              # a policy that is still 5 mm short at 3.0 s is
+                              # paid for finishing rather than told to give up.
+# Progress is paid only while BOTH FEET ARE PLANTED, but the potential updates
+# regardless: height gained while airborne is permanently FORFEITED, never
+# re-earnable on landing. Without that, a hop through 0.115 m would latch the
+# full 25 credits for ~4 steps of flight (about 12 points of `foot_lift`), which
+# is the cheapest possible "rise". With it, hopping is strictly worse than
+# pushing up on two feet.
 
 
 def _bow_update(
@@ -7789,19 +7783,26 @@ def _bow_update(
     Holds the phase and the two blends, the SLEWED height target every other
     term measures against, the episode's home xy, whether the spawn has touched
     down, the PER-FOOT airborne clock (for the flicker exemption in
-    `bow_foot_lift_penalty`), the per-phase ramp-tracking latch, and the two
-    rise latches:
+    `bow_foot_lift_penalty`), the rise PROGRESS POTENTIAL, and the two rise
+    latches:
 
       ``_bow_target_z``   the height ramp, stand → crouch → stand. Single
-                          source of truth: the height reward, both "wrong side
-                          of the ramp" costs and the phase latch all use it.
-      ``_bow_phase_ok``   True while the trunk has been within
-                          ``BOW_MATCH_TOL`` of the ramp for every step of the
-                          CURRENT phase (after the spawn grace). Re-armed at
-                          each phase change.
-      ``_bow_phase_credit`` 1.0 on the single step a phase ENDS with its latch
-                          intact (and on the episode's last step for the stand
-                          phase) — what `bow_phase_match_reward` pays.
+                          source of truth for every height-sensitive term.
+      ``_bow_planted``    both feet in contact this step.
+
+      ``_bow_rise_pot``   the PROGRESS POTENTIAL of the rise: the running
+                          maximum of the trunk height clamped to
+                          [``BOW_CROUCH_Z``, ``BOW_STAND_Z``] over the rise
+                          window, tracking the clamped height itself outside
+                          it. Monotone inside the window by construction, so a
+                          sink-and-reclimb cannot be paid twice and overshoot
+                          past standing pays nothing.
+      ``_bow_prev_rise_pot`` the previous step's potential → the progress term
+                          pays Δ, which is potential-based: the whole rise is
+                          worth the same total however it is executed, and
+                          holding still pays 0.
+      ``_bow_rise_gain``  that Δ, already zeroed outside the window — what
+                          `bow_rise_progress_reward` normalises and pays.
 
       ``_bow_dipped``     latched once the trunk has actually reached the
                           crouch band — so "risen" can only be earned by a
@@ -7832,10 +7833,10 @@ def _bow_update(
         env._bow_risen = torch.zeros(n, dtype=torch.bool, device=dev)
         env._bow_just_risen = torch.zeros(n, dtype=torch.bool, device=dev)
         env._bow_target_z = torch.full((n,), BOW_STAND_Z, device=dev)
-        env._bow_on_ramp = torch.zeros(n, dtype=torch.bool, device=dev)
-        env._bow_phase_ok = torch.ones(n, dtype=torch.bool, device=dev)
-        env._bow_phase_credit = torch.zeros(n, device=dev)
-        env._bow_prev_phase = torch.zeros(n, dtype=torch.long, device=dev)
+        env._bow_planted = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._bow_rise_pot = torch.full((n,), BOW_STAND_Z, device=dev)
+        env._bow_prev_rise_pot = torch.full((n,), BOW_STAND_Z, device=dev)
+        env._bow_rise_gain = torch.zeros(n, device=dev)
     env._bow_tick = tick
 
     asset: Entity = env.scene[asset_cfg.name]
@@ -7851,9 +7852,10 @@ def _bow_update(
     env._bow_dipped[fresh] = False
     env._bow_risen[fresh] = False
     env._bow_just_risen[fresh] = False
-    env._bow_phase_ok[fresh] = True
-    env._bow_phase_credit[fresh] = 0.0
-    env._bow_prev_phase[fresh] = BOW_PHASE_DIP
+    env._bow_rise_pot[fresh] = torch.clamp(
+        root_z[fresh], BOW_CROUCH_Z, BOW_STAND_Z
+    )
+    env._bow_prev_rise_pot[fresh] = env._bow_rise_pot[fresh]
 
     t = env.episode_length_buf.to(torch.float32) * env.step_dt
     env._bow_t = t
@@ -7877,6 +7879,7 @@ def _bow_update(
     sensor = env.scene.sensors[sensor_name]
     found = sensor.data.found[:, :2] > 0
     planted = found.all(dim=1)
+    env._bow_planted = planted
     env._bow_landed |= planted
 
     # Per-foot airborne clock: reset on every touch, integrated while in the
@@ -7894,36 +7897,22 @@ def _bow_update(
     env._bow_just_risen = reached & ~env._bow_risen
     env._bow_risen = env._bow_risen | reached
 
-    # The per-phase ramp latch. A phase is CREDITED only if the trunk never
-    # left the ±BOW_MATCH_TOL corridor around the ramp while that phase ran, so
-    # arriving early, lagging behind and parking at a compromise height all pay
-    # exactly nothing (a parked trunk fails the corridor at every phase's first
-    # step). The credit lands on the single step the phase ends — one payment
-    # per phase, four per episode, unfarmable.
-    #
-    # Every credit is also gated on ``_bow_dipped``, for the same reason the
-    # `risen` one-shot is: without it a robot that simply stood at BOW_STAND_Z
-    # for four seconds would collect the STAND phase's credit, since holding
-    # the standing height IS what that phase's ramp asks for. The gate costs a
-    # real bow nothing — the dip corridor at t = 1 s (|z - 0.085| <= 1 cm)
-    # already implies the crouch band (z <= 0.095) that latches `_bow_dipped`.
-    env._bow_on_ramp = (root_z - env._bow_target_z).abs() <= BOW_MATCH_TOL
-    changed = env._bow_phase != env._bow_prev_phase
-    env._bow_prev_phase = env._bow_phase
-    earned = env._bow_phase_ok & env._bow_dipped
-    env._bow_phase_credit = torch.where(
-        changed, earned.float(), torch.zeros_like(env._bow_phase_credit)
+    # The rise PROGRESS POTENTIAL (v4). Outside the window it simply tracks the
+    # clamped trunk height, so it is armed at whatever height the policy brings
+    # into the window: a robot that never dipped arms at BOW_STAND_Z and can
+    # never earn a thing, while a correct bow arms at BOW_CROUCH_Z with the full
+    # 3 cm of runway. Inside the window it is a running MAXIMUM, so sinking back
+    # down and re-climbing cannot be paid twice.
+    z_clamped = torch.clamp(root_z, BOW_CROUCH_Z, BOW_STAND_Z)
+    in_window = (t >= BOW_RISE_PAY_START_S) & (t <= BOW_RISE_PAY_END_S)
+    env._bow_prev_rise_pot = env._bow_rise_pot
+    env._bow_rise_pot = torch.where(
+        in_window, torch.maximum(env._bow_rise_pot, z_clamped), z_clamped
     )
-    env._bow_phase_ok = env._bow_phase_ok | changed          # re-arm for the new phase
-    checking = t >= BOW_MATCH_GRACE_S                        # the spawn drop is free
-    env._bow_phase_ok &= env._bow_on_ramp | ~checking
-    # The stand phase has no successor to end it: pay it on the episode's last
-    # step instead.
-    last_step = t >= (BOW_STAND_END_S - 1e-6)
-    env._bow_phase_credit = torch.where(
-        last_step,
-        env._bow_phase_credit + (env._bow_phase_ok & env._bow_dipped).float(),
-        env._bow_phase_credit,
+    env._bow_rise_gain = torch.where(
+        in_window,
+        env._bow_rise_pot - env._bow_prev_rise_pot,
+        torch.zeros_like(env._bow_rise_pot),
     )
 
 
@@ -7949,52 +7938,74 @@ def _bow_root_z(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg) -> torch.Tens
 def bow_height_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
-    std: float = 0.006,
+    std: float = 0.02,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """0..1: Gaussian on trunk z against the SLEWED height ramp
     stand → crouch → stand (`_bow_update`'s ``_bow_target_z``). Constant-rate,
     so diving early pays nothing.
 
-    The std is the v3 fix's first half. v2 used 2 cm, which paid a trunk parked
-    at 0.101 m — halfway between the 0.085 crouch and the 0.115 stand — 0.53 of
-    the maximum against the crouch target AND 0.61 against the stand target; the
-    run's log shows this term averaging 0.71 for a robot that never moved. At
-    6 mm the same compromise scores 0.001 and 0.004: there is no height that is
-    "nearly right" for two phases at once any more, only the ramp."""
+    2 cm, as in v1 — the run that actually learned the dip. v3 tightened this to
+    6 mm to starve the v2 compromise pose, and the policy responded by
+    terminating instead: a std narrower than the tracking error the policy can
+    currently achieve is a term with no gradient anywhere except at the answer.
+    The wide Gaussian is what taught the descent in the first place; what was
+    missing was never a sharper target but a reason to keep climbing, which is
+    `bow_rise_progress_reward`'s job."""
     _bow_update(env, sensor_name, asset_cfg)
     return torch.exp(-((_bow_root_z(env, asset_cfg) - env._bow_target_z) / std) ** 2)
 
 
-def bow_phase_match_reward(
+def bow_rise_progress_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
+    rate_cap: float = BOW_RISE_RATE_CAP,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0/1, at most ONE per phase (four per episode): the trunk stayed within
-    ``BOW_MATCH_TOL`` of the slewed ramp for the WHOLE of a phase.
+    """0..1 per step: POTENTIAL-BASED progress up out of the crouch.
 
-    Paid on the step the phase ends. Being ahead of the ramp, behind it, or
-    parked at a compromise height all pay zero — the latch is cleared by a
-    single off-corridor step (see `_bow_update`), so this is the term that says
-    "follow the trajectory", not "be somewhere plausible on average"."""
+    Pays Δ(rise potential)/(``rate_cap`` · dt) while both feet are planted — the
+    same construction as `hs_progress_reward`, and the term v1–v3 were missing.
+    Every previous version priced the rise by WHERE THE TRUNK IS: a Gaussian on
+    the ramp, a corridor latch, a cost for being below it. All three are worth
+    ~nothing to a policy one centimetre into a rise it has not finished, so the
+    gradient out of the crouch was flat and the crouch was a stable optimum.
+    Here a centimetre of climb is paid a centimetre's worth, always.
+
+    The properties come from the potential (`_bow_update`), not from gates:
+      * holding still pays 0 (Δ = 0) — nothing to camp on;
+      * sinking and re-climbing pays nothing the second time (running max);
+      * climbing past ``BOW_STAND_Z`` pays nothing (clamped);
+      * a robot that never crouched has no runway (the potential arms at its own
+        height when the window opens), so this cannot be earned by standing.
+    The rate cap makes the total invariant to speed: the whole 3 cm is worth
+    0.030/(0.06·0.02) = 25.0 credits whether it takes 0.5 s or 1.2 s, and going
+    faster than the cap simply throws credits away. That is the AGENTS.md "no
+    jackpots" rule applied to a rise — there is no violent shortcut.
+
+    Gated on both feet planted, with the potential still updating while
+    airborne, so a hop that carries the trunk to standing height FORFEITS the
+    progress it flew through instead of collecting it on landing."""
     _bow_update(env, sensor_name, asset_cfg)
-    return env._bow_phase_credit
+    rate = torch.clamp(
+        env._bow_rise_gain / max(rate_cap * env.step_dt, 1e-6), 0.0, 1.0
+    )
+    return rate * env._bow_planted.float()
 
 
 def bow_pitch_reward(
     env: ManagerBasedRlEnv,
     sensor_name: str = "feet_ground_contact",
     pitch_rad: float = BOW_PITCH_RAD,
-    std: float = 0.05,
+    std: float = 0.12,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """0..1: Gaussian on trunk pitch against the SLEWED nose-down ramp
     (0 → -pitch_rad → 0). Nose-down is what makes a crouch read as a bow.
 
-    std 0.05 rad ≈ 3°, tight against a 10° target: v2's 0.12 rad paid a trunk
-    frozen at 4° nose-down 0.46 at the hold and 0.71 at the stand, which is
-    most of the term for a pitch that never moved (its log average was 0.70)."""
+    0.12 rad ≈ 7°, comfortably under the 10° target — v1's value. v3's 0.05 was
+    tighter than the pitch error a policy still learning the dip can hold, and
+    a Gaussian that narrow reads as flat everywhere but the answer."""
     _bow_update(env, sensor_name, asset_cfg)
     asset: Entity = env.scene[asset_cfg.name]
     target = -pitch_rad * env._bow_blend
@@ -8007,7 +8018,7 @@ def bow_head_reward(
     down_deltas: tuple[float, ...] = BOW_HEAD_DOWN,
     up_deltas: tuple[float, ...] = BOW_HEAD_UP,
     joint_indices: tuple[int, ...] = BOW_HEAD_JOINTS,
-    std: float = 0.10,
+    std: float = 0.30,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """0..1: per-joint Gaussian on [neck_pitch, head_pitch] against
@@ -8015,10 +8026,9 @@ def bow_head_reward(
     the rise and stand. Mean (not product) keeps gradient alive when one joint
     is off, as in head_pose_tracking.
 
-    std 0.10 rad against deltas of 0.25–0.35 rad: at v2's 0.30 a head that
-    never left HOME still scored 0.61 on average, because 0.30 was as wide as
-    the motion being asked for. A std must be smaller than the amplitude it is
-    supposed to be measuring."""
+    0.30 rad, as in v1: the head is a 38%-of-body-mass lever on a servo with
+    real tracking lag, and v3's 0.10 priced lag the policy cannot escape
+    (AGENTS.md: price only the escapable part of an error)."""
     _bow_update(env, sensor_name, asset_cfg)
     asset: Entity = env.scene[asset_cfg.name]
     idx = list(joint_indices)
@@ -8057,25 +8067,22 @@ def bow_stand_pose_reward(
     sensor_name: str = "feet_ground_contact",
     joint_indices: Optional[list] = None,
     std: float = 0.12,
-    stand_z: float = BOW_STAND_Z,
-    height_std: float = 0.01,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """0..1: joint pose-match to HOME TIMES a height match to ``stand_z``, PAID
-    ONLY IN THE STAND PHASE.
+    """0..1: tight Gaussian pose-match to HOME, PAID ONLY IN THE STAND PHASE.
 
     A time window, not a state gate — the policy cannot park in it early, and
     it is what makes the episode end in a clean stand instead of leaving the
     robot folded once the height ramp is satisfied.
 
-    MULTIPLICATIVE by AGENTS.md's rule for goal states: standing is legs at
-    HOME *and* the trunk back at standing height, and either deficiency must
-    collapse the term. The additive v2 version leaked badly — four of the ten
-    leg joints (hip_yaw, hip_roll) sit at HOME in any sagittal crouch, so their
-    mean floors at 0.4, and a trunk parked 1.4 cm low still collected 0.79 of
-    a term weighted 5.0. The height factor's std is deliberately looser than
-    `bow_height_reward`'s (1 cm, not 6 mm) so the composite still has a visible
-    gradient for a policy that finishes a centimetre short."""
+    ADDITIVE (v1's form), not v3's product with a height factor. The height is
+    already priced twice in the stand phase — by `bow_height_reward`'s Gaussian
+    on the ramp and by `bow_rise_progress_reward` paying the climb — and a
+    product of the two collapses to ~0 for a policy that finishes a centimetre
+    short, which deletes the gradient exactly where the last mile of the rise
+    lives. Six of the ten leg joints leave HOME in any sagittal crouch, so the
+    additive form still separates a folded robot (~0.4) from a standing one
+    (1.0) by a factor of 2.5."""
     _bow_update(env, sensor_name, asset_cfg)
     asset: Entity = env.scene[asset_cfg.name]
     pos = _servo_joint_pos(env, asset)
@@ -8084,60 +8091,36 @@ def bow_stand_pose_reward(
         pos = pos[:, joint_indices]
         target = target[:, joint_indices]
     match = torch.exp(-((pos - target) / std) ** 2).mean(dim=-1)
-    height = torch.exp(-((_bow_root_z(env, asset_cfg) - stand_z) / height_std) ** 2)
-    return match * height * (env._bow_phase == BOW_PHASE_STAND).float()
+    return match * (env._bow_phase == BOW_PHASE_STAND).float()
 
 
-def _bow_off_ramp_cost(
+def bow_termination_penalty(
     env: ManagerBasedRlEnv,
-    high: bool,
-    band: float,
-    slope: float,
-    start_s: float,
-    end_s: Optional[float],
-    ramp_s: float,
-    asset_cfg: SceneEntityCfg,
+    term_names: tuple[str, ...] = ("collapsed", "fell_over"),
 ) -> torch.Tensor:
-    """Shared body of `bow_not_dipped_penalty` / `bow_not_risen_penalty`.
+    """0/1 cost (negative weight): the episode ENDED in a fall this step.
 
-    0..1 cost: how far the trunk is on the WRONG SIDE of the slewed ramp
-    (``high``: above it = has not gone down; otherwise: below it = has not come
-    back up), times a time window that fades in over ``ramp_s`` at ``start_s``
-    and switches off at ``end_s``. Measuring against the ramp — not against a
-    fixed crouch/stand height — is what keeps these costs from ever fighting
-    the trajectory: a trunk ON the ramp pays zero in both windows."""
-    z = _bow_root_z(env, asset_cfg)
-    err = (z - env._bow_target_z) if high else (env._bow_target_z - z)
-    off = torch.clamp((err - band) / max(slope, 1e-6), 0.0, 1.0)
-    window = torch.clamp((env._bow_t - start_s) / max(ramp_s, 1e-6), 0.0, 1.0)
-    if end_s is not None:
-        window = window * (env._bow_t < end_s).float()
-    return off * window
+    v3's lesson, in one term. Under v3 the stack charged a parked pose about
+    3.5 per step, and an episode that ends collects nothing at all from then
+    on — so falling over was the cheap exit, and the policy took it: the final
+    log showed ``Episode_Termination/collapsed`` at 31.8 per iteration against
+    4.6 time-outs, mean episode length 97 of 200, and action std 1.26. Whatever
+    else the stack does, the terminal state has to be the WORST outcome
+    available, not a way to stop paying.
 
-
-def bow_not_dipped_penalty(
-    env: ManagerBasedRlEnv,
-    sensor_name: str = "feet_ground_contact",
-    band: float = BOW_OFF_RAMP_BAND,
-    slope: float = BOW_OFF_RAMP_SLOPE,
-    start_s: float = BOW_NOT_DIPPED_START_S,
-    end_s: float = BOW_NOT_DIPPED_END_S,
-    ramp_s: float = BOW_TIME_RAMP_S,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """0..1 cost (negative weight): still standing tall through the dip/hold.
-
-    The mirror image of `bow_not_risen_penalty`. Charged from ``start_s`` to
-    ``end_s`` while the trunk is more than ``band`` ABOVE the ramp, saturating
-    ``slope`` further up. This is the half of the v3 fix that makes the
-    compromise pose lose in the FIRST half of the episode too: v2's stack
-    charged nothing for failing to go down, so a trunk parked at 0.101 m paid
-    only for failing to come back up — and, at v2's 2 cm band, not even that
-    (its `not_risen` averaged -0.0003)."""
-    _bow_update(env, sensor_name, asset_cfg)
-    return _bow_off_ramp_cost(
-        env, True, band, slope, start_s, end_s, ramp_s, asset_cfg
-    )
+    Reads the named termination terms individually rather than
+    ``mdp.is_terminated`` so a NaN-guard termination (a sim blow-up, not a
+    behavioural failure) is not charged to the policy. Terminations are computed
+    before rewards in ``ManagerBasedRlEnv.step``, so the flag is this step's."""
+    dones = None
+    for name in term_names:
+        if name not in env.termination_manager.active_terms:
+            continue
+        term = env.termination_manager.get_term(name)
+        dones = term if dones is None else (dones | term)
+    if dones is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return dones.float()
 
 
 def bow_foot_lift_penalty(
@@ -8185,35 +8168,6 @@ def bow_risen_bonus(
     and more of the episode is spent collecting it."""
     _bow_update(env, sensor_name, asset_cfg)
     return env._bow_just_risen.float()
-
-
-def bow_not_risen_penalty(
-    env: ManagerBasedRlEnv,
-    sensor_name: str = "feet_ground_contact",
-    band: float = BOW_OFF_RAMP_BAND,
-    slope: float = BOW_OFF_RAMP_SLOPE,
-    start_s: float = BOW_NOT_RISEN_START_S,
-    end_s: Optional[float] = None,
-    ramp_s: float = BOW_TIME_RAMP_S,
-    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
-) -> torch.Tensor:
-    """0..1 cost (negative weight): still down through the rise and the finish.
-
-    Charged from ``start_s`` (half-way through the rise) to the end of the
-    episode while the trunk is more than ``band`` BELOW the ramp, saturating
-    ``slope`` further down — a slope out of the crouch, not a cliff: five
-    millimetres higher always pays strictly less.
-
-    v2 measured this against a fixed ``stand_z - 2 cm`` instead of the ramp,
-    which had two failures at once. It could not start before the stand phase
-    without punishing a policy that was correctly still on its way up, and its
-    dead band ended at 0.095 m — so the 0.101 m the policy actually parked at
-    was FREE. Against the ramp both problems go away: the cost is zero for a
-    trunk that is where the trajectory says it should be, at every instant."""
-    _bow_update(env, sensor_name, asset_cfg)
-    return _bow_off_ramp_cost(
-        env, False, band, slope, start_s, end_s, ramp_s, asset_cfg
-    )
 
 
 def bow_drift_penalty(

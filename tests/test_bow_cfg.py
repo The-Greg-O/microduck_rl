@@ -10,6 +10,7 @@ import torch
 from mjlab_microduck.tasks import mdp as microduck_mdp
 from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     BOW_COLLAPSE_Z,
+    BOW_DIP_M,
     BOW_PITCH_RAD,
     BOW_Z,
     DIP_END_S,
@@ -18,18 +19,14 @@ from mjlab_microduck.tasks.microduck_bow_env_cfg import (
     HEAD_STD,
     HEIGHT_STD,
     HOLD_END_S,
-    MATCH_GRACE_S,
-    MATCH_TOL,
-    NOT_DIPPED_END_S,
-    NOT_DIPPED_START_S,
-    NOT_RISEN_START_S,
-    OFF_RAMP_BAND,
-    OFF_RAMP_SLOPE,
     PITCH_STD,
+    RISE_CREDITS,
     RISE_END_S,
+    RISE_PAY_END_S,
+    RISE_PAY_START_S,
+    RISE_RATE_CAP,
     RISEN_TOL,
     STAND_END_S,
-    STAND_POSE_HEIGHT_STD,
     STAND_POSE_STD,
     STAND_Z,
     _LEG_JOINTS,
@@ -79,34 +76,63 @@ def test_gait_terms_gone_and_bow_terms_signed():
                  "upright", "head_pose_bias"):
         assert gone not in cfg.rewards, gone
     for pos in ("bow_height", "bow_pitch", "bow_head", "bow_upright",
-                "stand_pose", "phase_match", "risen", "track_linear_velocity",
-                "track_angular_velocity"):
+                "stand_pose", "rise_progress", "risen",
+                "track_linear_velocity", "track_angular_velocity"):
         assert cfg.rewards[pos].weight > 0, pos
-    for cost in ("foot_lift", "not_dipped", "not_risen", "drift", "foot_slip",
+    for cost in ("foot_lift", "terminated", "drift", "foot_slip",
                  "action_rate_l2", "dof_pos_limits", "self_collisions"):
         assert cfg.rewards[cost].weight < 0, cost
-    # Feet planted stays the hardest PER-STEP rule inside the corridor …
+    # v3's corridor credit and its two off-ramp costs are GONE: costs that make
+    # a parked pose expensive also make TERMINATING cheap, and the v3 run took
+    # that exit (collapsed 31.8/iteration against 4.6 time-outs).
+    for gone in ("phase_match", "not_dipped", "not_risen"):
+        assert gone not in cfg.rewards, gone
+    # Feet planted is still the hardest per-step rule …
     assert cfg.rewards["foot_lift"].weight <= -3.0
     assert cfg.rewards["foot_lift"].weight < cfg.rewards["drift"].weight
-    # … but v3 deliberately makes being off the ramp cost MORE than it: a
-    # frozen pose has to lose, and v2 proved that a cheap "failure to move"
-    # cost simply gets ignored (its not_risen logged -0.0003).
-    assert cfg.rewards["not_dipped"].weight == cfg.rewards["not_risen"].weight
-    assert cfg.rewards["not_risen"].weight <= -5.0
-    assert cfg.rewards["not_risen"].weight < cfg.rewards["foot_lift"].weight
+    # … but ending the episode in a heap is far worse than any per-step cost.
+    assert cfg.rewards["terminated"].weight <= -20.0
+    assert cfg.rewards["terminated"].weight < 5 * cfg.rewards["foot_lift"].weight
+    assert cfg.rewards["terminated"].params["term_names"] == (
+        "collapsed", "fell_over")
     # foot_slip must not stay command-gated at a pinned ~zero command.
     assert cfg.rewards["foot_slip"].params["command_threshold"] < 0.0
-    # Smoothness is 10x lighter than v2: it taxed a robot that stood still
-    # 0.71/step, which is more than the whole dip is worth.
+    # Smoothness is fixed and light: the trick IS motion.
     assert -0.05 <= cfg.rewards["action_rate_l2"].weight < 0.0
-    # Survival income is halved so it cannot fund parking.
-    assert cfg.rewards["bow_upright"].weight == 1.0
-    assert cfg.rewards["track_linear_velocity"].weight == 0.25
-    # Every std is smaller than the motion it measures.
-    assert cfg.rewards["bow_height"].params["std"] == HEIGHT_STD == 0.006
-    assert HEIGHT_STD < (STAND_Z - BOW_Z) / 2
-    assert cfg.rewards["bow_pitch"].params["std"] == PITCH_STD < BOW_PITCH_RAD / 2
-    assert cfg.rewards["bow_head"].params["std"] == HEAD_STD < 0.25
+    # v1's survival income is restored — v3 halved it and the policy responded
+    # by ending episodes, not by working harder.
+    assert cfg.rewards["bow_upright"].weight == 2.0
+    assert cfg.rewards["track_linear_velocity"].weight == 0.5
+    # v1's tolerances are restored too: wide enough to have a gradient for the
+    # policy that exists, not the one we wish existed.
+    assert cfg.rewards["bow_height"].params["std"] == HEIGHT_STD == 0.02
+    assert cfg.rewards["bow_pitch"].params["std"] == PITCH_STD == 0.12
+    assert cfg.rewards["bow_head"].params["std"] == HEAD_STD == 0.30
+    assert cfg.rewards["stand_pose"].params["std"] == STAND_POSE_STD
+    # The stand-phase pose is ADDITIVE (v1's form): no height factor to
+    # multiply it to zero a centimetre short of standing.
+    assert "stand_z" not in cfg.rewards["stand_pose"].params
+    assert "height_std" not in cfg.rewards["stand_pose"].params
+
+
+def test_rise_progress_is_wired_and_normalised():
+    """A full rise is worth a fixed total, whatever speed it happens at."""
+    cfg = make_microduck_bow_env_cfg()
+    term = cfg.rewards["rise_progress"]
+    assert term.func is microduck_mdp.bow_rise_progress_reward
+    assert term.params["rate_cap"] == RISE_RATE_CAP == 0.06
+    # The cap must not be BELOW the rate the ramp itself asks for, or tracking
+    # the ramp would throw credits away.
+    assert RISE_RATE_CAP >= BOW_DIP_M / (RISE_END_S - HOLD_END_S)
+    assert RISE_CREDITS == 25.0
+    assert math.isclose(RISE_CREDITS, BOW_DIP_M / (RISE_RATE_CAP * 0.02))
+    # RISE_CREDITS is quoted per 20 ms control step; if the control rate ever
+    # moves, the "150 points for a full rise" arithmetic moves with it.
+    assert math.isclose(cfg.decimation * cfg.sim.mujoco.timestep, 0.02)
+    # The window opens with the rise and closes a little after it, so a policy
+    # that is still finishing at 3.0 s is paid for finishing.
+    assert RISE_PAY_START_S == HOLD_END_S == 2.0
+    assert RISE_END_S < RISE_PAY_END_S < STAND_END_S
 
 
 def test_collapse_termination_added():
@@ -158,6 +184,22 @@ class _FakeScene:
         return self._asset
 
 
+class _FakeTerminations:
+    """Just enough of mjlab's TerminationManager for the termination penalty."""
+
+    def __init__(self, n):
+        self.active_terms = ["fell_over", "out_of_terrain_bounds", "nan_state",
+                             "collapsed"]
+        self._dones = {k: torch.zeros(n, dtype=torch.bool)
+                       for k in self.active_terms}
+
+    def get_term(self, name):
+        return self._dones[name]
+
+    def fire(self, name):
+        self._dones[name][:] = True
+
+
 class _FakeEnv:
     def __init__(self, n=1):
         self.num_envs = n
@@ -175,6 +217,7 @@ class _FakeEnv:
                 joint_pos=torch.zeros(n, 14),
                 default_joint_pos=torch.zeros(n, 14)))
         self.scene = _FakeScene(n, sensor, asset)
+        self.termination_manager = _FakeTerminations(n)
         self._sensor, self._asset = sensor, asset
 
     def tick(self, contacts=(1, 1)):
@@ -227,7 +270,7 @@ def test_targets_follow_the_slewed_ramp():
     # Diving to the crouch immediately pays a fraction of staying on the
     # ramp — being ahead of the slew is not worth it (no jackpot).
     env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
-    assert h() < 0.01
+    assert h() < 0.15, "being 3 cm ahead of the slew pays a small fraction"
     env.run_to(HOLD_END_S)           # ... but at the hold it is the target
     assert h() > 0.99
     # A level trunk scores in the stand phase; nose-down scores at the hold.
@@ -452,135 +495,166 @@ def _off_ramp(env, high):
     return float(fn(env, **_cfg_params("not_dipped" if high else "not_risen"))[0])
 
 
-def test_the_compromise_height_scores_nothing_anywhere():
-    """(a) of the v3 fix, and the whole reason v2 froze at 0.101 m.
+def test_rise_progress_is_potential_based():
+    """Holding pays nothing; the same climb cannot be sold twice.
 
-    Under v2's 2 cm std that height scored 0.53 against the crouch target and
-    0.61 against the stand target — most of a 4.0-weighted term, collected by a
-    robot that never moved. Every phase must now price it at ~zero, and both
-    off-ramp costs must charge it."""
+    This is the term v1-v3 did not have, and the reason all three parked: every
+    other term in the stack prices WHERE THE TRUNK IS, so a policy one
+    centimetre into an unfinished rise collected nothing at all for that
+    centimetre."""
+    prog = lambda e: float(microduck_mdp.bow_rise_progress_reward(e)[0])
+
+    # 1. A robot that never dips can never earn it: the potential arms at
+    #    whatever height it brings into the window, and standing arms it full.
     env = _FakeEnv()
-    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, 0.101]])
-    env.run_to(HOLD_END_S - 0.02)          # the last step of the hold
-    at_hold = float(microduck_mdp.bow_height_reward(env, std=HEIGHT_STD)[0])
-    assert _off_ramp(env, high=True) == 1.0, "parked high must lose the hold"
-    env.run_to(STAND_END_S)
-    at_stand = float(microduck_mdp.bow_height_reward(env, std=HEIGHT_STD)[0])
-    assert _off_ramp(env, high=False) > 0.5, "parked low must lose the stand"
-    assert at_hold < 0.01 and at_stand < 0.03, (at_hold, at_stand)
+    total = sum((env.tick(), prog(env))[1]
+                for _ in range(int(STAND_END_S / env.step_dt)))
+    assert total == 0.0, "standing tall for four seconds must pay nothing"
 
-
-def test_off_ramp_costs_never_charge_a_trunk_on_the_ramp():
-    """Both costs measure against the SLEWED ramp, not a fixed height — which
-    is what let v2's `not_risen` log -0.0003 while the policy sat at 0.101, and
-    what would otherwise punish a policy correctly half-way through its rise."""
-    env = _FakeEnv()
-    for _ in range(int(STAND_END_S / env.step_dt)):
-        _drive(env, _textbook)
-        assert _off_ramp(env, high=True) == 0.0, float(env._bow_t[0])
-        assert _off_ramp(env, high=False) == 0.0, float(env._bow_t[0])
-
-
-def test_off_ramp_costs_are_slopes_in_the_right_windows():
-    def at(z):
-        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
-        env.common_step_counter += 1          # same t, new height
-        microduck_mdp._bow_update(
-            env, "feet_ground_contact", microduck_mdp._DEFAULT_ASSET_CFG)
-
-    # not_dipped: silent before 0.8 s even for a trunk that never moved …
-    env = _FakeEnv()
-    env.run_to(NOT_DIPPED_START_S - 0.1)
-    assert _off_ramp(env, high=True) == 0.0, "must not tax the first 0.8 s"
-    env.run_to(HOLD_END_S - 0.02)
-    assert _off_ramp(env, high=True) == 1.0, "1.5 cm above the ramp = full cost"
-    # … a slope, not a cliff: every millimetre down pays strictly less …
-    costs = []
-    for z in (STAND_Z, 0.101, 0.098, BOW_Z + OFF_RAMP_BAND, BOW_Z):
-        at(z)
-        costs.append(_off_ramp(env, high=True))
-    assert costs == sorted(costs, reverse=True), costs
-    assert costs[-1] == 0.0 and costs[-2] < 1e-4, "1 cm of the ramp is free"
-    assert 0.0 < costs[2] < 1.0, "then a 5 mm slope to the full cost"
-    # … and it switches off again for the rise.
-    env.run_to(NOT_DIPPED_END_S)
-    at(STAND_Z)
-    assert _off_ramp(env, high=True) == 0.0, "the rise is not the dip's window"
-
-    # not_risen: silent before 2.5 s, then charged while the trunk is BELOW.
+    # 2. Sitting in the crouch for the whole rise pays nothing either — Delta is
+    #    zero for a potential that does not move.
     env = _FakeEnv()
     env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
-    env.run_to(NOT_RISEN_START_S - 0.1)
-    assert _off_ramp(env, high=False) == 0.0, "must not tax the bow itself"
-    env.run_to(STAND_END_S)
-    assert _off_ramp(env, high=False) == 1.0
-    costs = []
-    for z in (BOW_Z, 0.098, 0.101, STAND_Z - OFF_RAMP_BAND, STAND_Z):
-        at(z)
-        costs.append(_off_ramp(env, high=False))
-    assert costs == sorted(costs, reverse=True), costs
-    assert costs[0] == 1.0 and costs[-1] == 0.0 and costs[-2] < 1e-4
-    assert math.isclose(costs[2], 0.8, abs_tol=1e-5), "0.101 pays 0.8, not 0"
-    assert math.isclose(OFF_RAMP_SLOPE, 0.005)
+    total = sum((env.tick(), prog(env))[1]
+                for _ in range(int(STAND_END_S / env.step_dt)))
+    assert total == 0.0, "parking in the crouch must pay nothing"
 
-
-def test_phase_match_needs_the_whole_phase_on_the_ramp():
-    """(c): four credits per episode, and none of them buyable with a pose."""
+    # 3. A bow that rises collects the credits, and only inside the window.
     env = _FakeEnv()
-    credits = 0.0
-    for _ in range(int(STAND_END_S / env.step_dt)):
-        _drive(env, _textbook)
-        credits += float(microduck_mdp.bow_phase_match_reward(env)[0])
-    assert credits == 4.0, "tracking the ramp earns one credit per phase"
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    assert prog(env) == 0.0, "nothing is owed for the crouch itself"
+    earned, z = 0.0, BOW_Z
+    while z < STAND_Z - 1e-9:                    # 1 mm per step = 0.05 m/s
+        z = min(z + 0.001, STAND_Z)
+        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+        env.tick()
+        earned += prog(env)
+    assert math.isclose(earned, RISE_CREDITS, rel_tol=1e-5), earned
 
-    def frozen_credits(z):
+    # 4. Climbing past the standing height is free, and sinking back down and
+    #    re-climbing is not paid a second time.
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, STAND_Z + 0.02]])
+    env.tick()
+    assert prog(env) == 0.0, "overshoot past standing pays nothing"
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.tick()
+    again = 0.0
+    for k in range(1, 31):
+        env._asset.data.root_link_pos_w = torch.tensor(
+            [[0.0, 0.0, BOW_Z + 0.001 * k]])
+        env.tick()
+        again += prog(env)
+    assert again == 0.0, "a running maximum cannot sell the same climb twice"
+
+
+def test_rise_progress_total_is_invariant_to_speed():
+    """Rate-capped Delta of a potential: the whole rise is worth the same total
+    at any speed up to the cap, and going faster than the cap throws credits
+    away. That is AGENTS.md's 'no jackpots' rule applied to a rise."""
+    def climb(per_step):
         env = _FakeEnv()
-        return sum(
-            (_drive(env, _frozen(z)),
-             float(microduck_mdp.bow_phase_match_reward(env)[0]))[1]
-            for _ in range(int(STAND_END_S / env.step_dt)))
+        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+        env.run_to(HOLD_END_S)
+        earned, z = 0.0, BOW_Z
+        while (float(env.episode_length_buf[0]) * env.step_dt
+               < RISE_PAY_END_S - 1e-9):
+            z = min(z + per_step, STAND_Z)
+            env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+            env.tick()
+            earned += float(microduck_mdp.bow_rise_progress_reward(env)[0])
+        return earned
 
-    # No static height earns anything: not the compromise the v2 policy froze
-    # at, not the spawn height, and not standing still at STAND_Z — the last
-    # one is on the ramp for the whole stand phase, which is why the credit is
-    # gated on having actually reached the crouch.
-    for z in (STAND_Z, 0.101, 0.127):
-        assert frozen_credits(z) == 0.0, f"a trunk frozen at {z} earns nothing"
-    # A trunk frozen in the crouch earns the ONE phase it really does hold —
-    # the hold — and none of the other three. That is v1's whole score.
-    assert frozen_credits(BOW_Z) == 1.0
+    cap_per_step = RISE_RATE_CAP * 0.02              # 1.2 mm/step
+    slow = climb(0.0005)     # 0.025 m/s — uses the whole 1.2 s window
+    mid = climb(0.001)       # 0.050 m/s — done in 0.6 s
+    at_cap = climb(cap_per_step)
+    for got in (slow, mid, at_cap):
+        assert math.isclose(got, RISE_CREDITS, rel_tol=1e-5), got
+    # Twice the cap: half the credits are clipped away (12 capped steps plus a
+    # 1.2 mm remainder, so 13.0 rather than exactly 12.5).
+    assert climb(2 * cap_per_step) == 13.0
 
 
-def test_phase_match_forgives_the_spawn_drop_only():
-    """The spawn lands 0.5–1.5 cm above the ramp (`reset_base` z = 0.12–0.13):
-    that drop is free, tracking errors after MATCH_GRACE_S are not."""
-    assert MATCH_GRACE_S == 0.3 and MATCH_TOL == 0.01
+def test_rise_progress_forfeits_what_a_hop_flies_through():
+    """The potential updates while airborne but the PAYMENT is gated on both
+    feet planted, so a hop through standing height banks nothing and can never
+    re-earn it. Without that, ~4 steps of flight (about 12 points of foot_lift)
+    would buy the full 150-point rise."""
     env = _FakeEnv()
-    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, 0.127]])
-    env.run_to(MATCH_GRACE_S - 0.02)
-    assert bool(env._bow_phase_ok[0]) is True, "the spawn drop must be free"
-    _drive(env, _textbook)
-    assert bool(env._bow_phase_ok[0]) is True
-    _drive(env, lambda t: (_ramp(t)[0] + MATCH_TOL + 0.002, 0.0, (0.0, 0.0), {}))
-    assert bool(env._bow_phase_ok[0]) is False, "1.2 cm off the ramp clears it"
-    # One bad step costs the whole phase …
-    while float(env.episode_length_buf[0]) * env.step_dt < DIP_END_S - 1e-9:
-        _drive(env, _textbook)
-    assert float(microduck_mdp.bow_phase_match_reward(env)[0]) == 0.0
-    # … and the next phase re-arms clean.
-    _drive(env, _textbook)
-    assert int(env._bow_phase[0]) == microduck_mdp.BOW_PHASE_HOLD
-    assert bool(env._bow_phase_ok[0]) is True, "each phase starts clean"
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    earned = 0.0
+    for k in range(1, 31):                       # ballistic through the rise …
+        env._asset.data.root_link_pos_w = torch.tensor(
+            [[0.0, 0.0, BOW_Z + 0.001 * k]])
+        env.tick(contacts=(0, 0))
+        earned += float(microduck_mdp.bow_rise_progress_reward(env)[0])
+    assert earned == 0.0, "no progress pay while airborne"
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.tick(contacts=(1, 1))                    # … and land back in the crouch
+    for k in range(1, 31):
+        env._asset.data.root_link_pos_w = torch.tensor(
+            [[0.0, 0.0, BOW_Z + 0.001 * k]])
+        env.tick(contacts=(1, 1))
+        earned += float(microduck_mdp.bow_rise_progress_reward(env)[0])
+    assert earned == 0.0, "height flown through is forfeited, not banked"
 
 
-def _episode(traj):
-    """Every bow reward term summed over the 200 steps of one episode, weighted
-    as the cfg weights them (before mjlab's x dt). Returns (terms, phases)."""
+def test_rise_progress_window_closes():
+    env = _FakeEnv()
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(RISE_PAY_END_S)
+    late = 0.0
+    for k in range(1, 31):
+        env._asset.data.root_link_pos_w = torch.tensor(
+            [[0.0, 0.0, BOW_Z + 0.001 * k]])
+        env.tick()
+        late += float(microduck_mdp.bow_rise_progress_reward(env)[0])
+    assert late == 0.0, "rising after 3.2 s is not what the trick asks for"
+
+
+def test_termination_penalty_charges_only_the_behavioural_terminations():
+    env = _FakeEnv()
+    pen = lambda: float(microduck_mdp.bow_termination_penalty(env)[0])
+    env.tick()
+    assert pen() == 0.0
+    env.termination_manager.fire("nan_state")
+    assert pen() == 0.0, "a sim blow-up is not something the policy chose"
+    env.termination_manager.fire("collapsed")
+    assert pen() == 1.0
+    env2 = _FakeEnv()
+    env2.termination_manager.fire("fell_over")
+    assert float(microduck_mdp.bow_termination_penalty(env2)[0]) == 1.0
+    # A term the env does not have must not raise (the base cfg owns the names).
+    assert float(microduck_mdp.bow_termination_penalty(
+        env2, term_names=("nope",))[0]) == 0.0
+
+
+def _collapse(t):
+    """A textbook bow that gives up and folds at 1.5 s. Given every point it
+    could possibly earn on the way down, so the comparison is honest."""
+    if t < 1.5 - 1e-9:
+        return _textbook(t)
+    return BOW_COLLAPSE_Z - 0.001, BOW_PITCH_RAD, microduck_mdp.BOW_HEAD_DOWN, _legs(1.0)
+
+
+def _episode(traj, terminate_s=None):
+    """Every bow reward term summed over one episode, weighted as the cfg
+    weights them (before mjlab's x dt). An episode that TERMINATES stops
+    collecting at `terminate_s` — which is the whole point of the comparison:
+    v3's stack made that silence cheaper than the pose it was pricing.
+
+    Returns (terms, phases)."""
     env = _FakeEnv()
     w = lambda n: _CFG.rewards[n].weight
     terms, phases = {}, {}
     for _ in range(int(STAND_END_S / env.step_dt)):
         _drive(env, traj)
+        t = float(env._bow_t[0])
+        dead = terminate_s is not None and t >= terminate_s - 1e-9
+        if dead:
+            env.termination_manager.fire("collapsed")
         step = {
             "bow_height": w("bow_height") * float(
                 microduck_mdp.bow_height_reward(env, **_cfg_params("bow_height"))[0]),
@@ -592,69 +666,149 @@ def _episode(traj):
                 microduck_mdp.bow_upright_reward(env, **_cfg_params("bow_upright"))[0]),
             "stand_pose": w("stand_pose") * float(
                 microduck_mdp.bow_stand_pose_reward(env, **_cfg_params("stand_pose"))[0]),
-            "phase_match": w("phase_match") * float(
-                microduck_mdp.bow_phase_match_reward(env)[0]),
+            "rise_progress": w("rise_progress") * float(
+                microduck_mdp.bow_rise_progress_reward(
+                    env, **_cfg_params("rise_progress"))[0]),
             "risen": w("risen") * float(microduck_mdp.bow_risen_bonus(env)[0]),
-            "not_dipped": w("not_dipped") * float(
-                microduck_mdp.bow_not_dipped_penalty(env, **_cfg_params("not_dipped"))[0]),
-            "not_risen": w("not_risen") * float(
-                microduck_mdp.bow_not_risen_penalty(env, **_cfg_params("not_risen"))[0]),
+            "terminated": w("terminated") * float(
+                microduck_mdp.bow_termination_penalty(env, **_cfg_params("terminated"))[0]),
             # Standing still and level pays every strategy the same: both track
-            # terms at ~1.0. Counted for all three so the totals are honest.
+            # terms at ~1.0. Counted for all of them so the totals are honest.
             "track": 2 * _CFG.rewards["track_linear_velocity"].weight,
         }
         for k, v in step.items():
             terms[k] = terms.get(k, 0.0) + v
         ph = int(env._bow_phase[0])
         phases[ph] = phases.get(ph, 0.0) + sum(step.values())
+        if dead:
+            break                     # a terminated episode collects nothing more
     return terms, phases
 
 
-def test_the_three_strategies():
-    """The v3 arithmetic on the real reward functions (module docstring).
+def test_the_four_strategies():
+    """The v4 arithmetic on the real reward functions (module docstring).
 
-    A textbook bow must beat BOTH parked poses by a wide margin, and each park
-    must be NEGATIVE in the phases its parking violates — which is exactly what
-    v2's stack failed at: it paid the frozen 0.101 m pose 7.15 per step."""
+    Three things have to be true at once, and v1-v3 each got only two:
+      1. the textbook bow is the argmax;
+      2. parking in the crouch — the v1 policy — loses clearly;
+      3. COLLAPSING is the worst outcome of the four, so the escape hatch v3
+         taught the policy to take is closed."""
     book, book_ph = _episode(_textbook)
-    high, high_ph = _episode(_park_high)
+    high, _ = _episode(_park_high)
     low, low_ph = _episode(_park_low)
-    book_t, high_t, low_t = (sum(x.values()) for x in (book, high, low))
+    dead, _ = _episode(_collapse, terminate_s=1.5)
+    book_t, high_t, low_t, dead_t = (
+        sum(x.values()) for x in (book, high, low, dead))
     steps = int(STAND_END_S / 0.02)
 
-    # 1. The textbook bow wins by a wide margin against both.
-    assert book_t > 2000, book_t
-    assert book_t > 8 * high_t, (book_t, high_t)
-    assert book_t > 2.5 * low_t, (book_t, low_t)
-    # It is the only one that collects the completion terms at all …
-    assert book["phase_match"] == 4 * _CFG.rewards["phase_match"].weight
+    # 1. The textbook bow wins, and it is the only strategy that collects the
+    #    rise at all.
+    assert book_t > max(high_t, low_t, dead_t)
+    assert math.isclose(book["rise_progress"],
+                        RISE_CREDITS * _CFG.rewards["rise_progress"].weight,
+                        rel_tol=1e-5), book["rise_progress"]
     assert book["risen"] == _CFG.rewards["risen"].weight
-    assert high["phase_match"] == 0.0 and high["risen"] == 0.0
-    assert low["risen"] == 0.0
-    # … and a trunk on the ramp is never charged by either off-ramp cost.
-    assert book["not_dipped"] == 0.0 and book["not_risen"] == 0.0
+    assert book["terminated"] == 0.0
+    for other in (high, low, dead):
+        assert other["rise_progress"] == 0.0
+        assert other["risen"] == 0.0
 
-    # 2. Parking high (the v2 optimum) is charged from both sides and BLEEDS in
-    #    the hold and in the stand: the pose that used to be the argmax now
-    #    loses money for every step it is held.
-    assert high["not_dipped"] < -250 and high["not_risen"] < -200
-    assert high_ph[microduck_mdp.BOW_PHASE_HOLD] < 0.0
-    assert high_ph[microduck_mdp.BOW_PHASE_STAND] < 0.0
-    assert high_t / steps < 1.5, "v2 paid this same pose 7.15 per step"
-
-    # 3. Parking low (the v1 optimum) keeps what its dip and hold honestly earn
-    #    — those two phases are worth exactly what the textbook's are — and
-    #    loses the whole second half.
+    # 2. Parking in the crouch (v1's behaviour) keeps what its dip and hold
+    #    honestly earn — those two phases are worth exactly the textbook's —
+    #    and loses the entire second half.
     assert math.isclose(low_ph[microduck_mdp.BOW_PHASE_DIP],
                         book_ph[microduck_mdp.BOW_PHASE_DIP], rel_tol=1e-6)
-    assert low_ph[microduck_mdp.BOW_PHASE_STAND] < 0.0
-    assert (low_ph[microduck_mdp.BOW_PHASE_RISE]
-            + low_ph[microduck_mdp.BOW_PHASE_STAND]) < 0.0
+    assert math.isclose(low_ph[microduck_mdp.BOW_PHASE_HOLD],
+                        book_ph[microduck_mdp.BOW_PHASE_HOLD], rel_tol=1e-6)
+    assert low_t < 0.7 * book_t, (low_t, book_t)
+    # Every park stays POSITIVE overall: a half-done trick is worth less than a
+    # whole one, but it must never be worth less than quitting (that inversion
+    # is precisely what v3 built, and the policy quit).
+    assert low_t > 0.0 and high_t > 0.0
 
-    # 4. Neither park comes close to the standing finish's pay.
-    for parked in (high_ph, low_ph):
-        assert parked[microduck_mdp.BOW_PHASE_STAND] < 0.2 * book_ph[
-            microduck_mdp.BOW_PHASE_STAND]
+    # 3. Collapsing is the WORST of the four, by a wide margin. It does not go
+    #    negative — an episode that ends simply stops earning, and no plausible
+    #    penalty makes 1.5 s of an honest bow worth less than nothing — but it
+    #    is barely half of the next-worst strategy, which is the whole point.
+    assert dead_t == min(book_t, high_t, low_t, dead_t), dead_t
+    assert dead_t < 0.5 * min(book_t, high_t, low_t), (dead_t, low_t)
+    assert dead["terminated"] == _CFG.rewards["terminated"].weight
+    # The -20 is insurance, not the mechanism: what makes quitting lose is that
+    # it forfeits 125 steps of income. Remove the penalty and it must STILL be
+    # the worst — v3's failure was that it was not.
+    assert dead_t - dead["terminated"] < min(book_t, high_t, low_t)
+
+    # 4. The margins, per step, in wandb's Episode_Reward units. The textbook
+    #    bow leads the low park by 3.6/step and the high park by 3.4/step —
+    #    thinner than v3's paper margins, and deliberately so: v3 bought its
+    #    margins with costs that made quitting cheap. The mechanism here is the
+    #    per-step GRADIENT out of the crouch (rise_progress), not the size of
+    #    the gap at the end.
+    per_step = {k: v / steps for k, v in
+                (("book", book_t), ("high", high_t), ("low", low_t))}
+    assert per_step["book"] > per_step["low"] + 3.0, per_step
+    assert per_step["book"] > per_step["high"] + 3.0, per_step
+
+
+def test_rising_out_of_the_crouch_pays_at_every_millimetre():
+    """The v4 thesis, measured: from the parked crouch, EVERY step of climbing
+    is worth strictly more than staying put — which was never true before.
+
+    v1 parked at 0.088 m and stayed for 2.7 s. Under v1's stack the marginal
+    step of rising bought only the difference between two Gaussians; here it
+    also banks progress credits that can never be taken back."""
+    def marginal(rise_per_step):
+        """Total pay over the rise window for climbing at this rate from the
+        crouch, minus what staying in the crouch would have paid."""
+        got = []
+        for per_step in (0.0, rise_per_step):
+            env = _FakeEnv()
+            env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+            env.run_to(HOLD_END_S)
+            total, z = 0.0, BOW_Z
+            while (float(env.episode_length_buf[0]) * env.step_dt
+                   < RISE_PAY_END_S - 1e-9):
+                z = min(z + per_step, STAND_Z)
+                env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+                env.tick()
+                total += (
+                    _CFG.rewards["rise_progress"].weight * float(
+                        microduck_mdp.bow_rise_progress_reward(
+                            env, **_cfg_params("rise_progress"))[0])
+                    + _CFG.rewards["bow_height"].weight * float(
+                        microduck_mdp.bow_height_reward(
+                            env, **_cfg_params("bow_height"))[0]))
+            got.append(total)
+        return got[1] - got[0]
+
+    # Positive at every rate from the very slowest crawl to the rate cap:
+    # there is no speed at which starting to rise is worse than staying put.
+    rates = (0.0001, 0.0002, 0.0005, 0.001, 0.0012)
+    gains = [marginal(r) for r in rates]
+    assert all(g > 0.0 for g in gains), gains
+    # And the best-paid rate is the one that TRACKS THE RAMP (0.6 mm/step =
+    # 0.03 m/s), not the fastest — the progress money is speed-invariant, so
+    # the height Gaussian is free to price the schedule. Rising faster than the
+    # ramp buys nothing extra, which is AGENTS.md's "no jackpots" again.
+    best = rates[gains.index(max(gains))]
+    assert best == 0.0005, (rates, gains)
+    assert gains[-1] < max(gains), "sprinting up overshoots the height ramp"
+    # A tenth of the climb is worth about a tenth of the progress money, which
+    # is the property none of v1-v3 had: partial credit for a partial rise.
+    tenth = 0.1 * BOW_DIP_M
+    env = _FakeEnv()
+    env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, BOW_Z]])
+    env.run_to(HOLD_END_S)
+    banked, z = 0.0, BOW_Z
+    while z < BOW_Z + tenth - 1e-9:
+        z += 0.0005
+        env._asset.data.root_link_pos_w = torch.tensor([[0.0, 0.0, z]])
+        env.tick()
+        banked += _CFG.rewards["rise_progress"].weight * float(
+            microduck_mdp.bow_rise_progress_reward(
+                env, **_cfg_params("rise_progress"))[0])
+    full = RISE_CREDITS * _CFG.rewards["rise_progress"].weight
+    assert math.isclose(banked, 0.1 * full, rel_tol=1e-5), (banked, full)
 
 
 def test_drift_cost_grows_and_saturates():
