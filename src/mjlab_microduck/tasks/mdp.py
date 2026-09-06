@@ -9877,6 +9877,10 @@ class PivotCommandCfg(VelocityCommandCommandOnlyCfg):
 #   `jp_apex_reward`    potential-based height, advancing ONLY while airborne:
 #                       a stride bounce banks nothing.
 #   `jp_land_bonus`     one shot, conditioned on a PRIOR genuine flight.
+#   `jp_rise_reward`    v3: potential-based rise-progress AFTER that landing,
+#                       because v2 parked on the EDGE of the landing band
+#                       (0.097 m against a standing 0.115) — the last 2 cm was
+#                       the one stretch of the manoeuvre nothing paid for.
 #   `jp_load_reward`    the first rung of the gradient, capped by an 0.8 s
 #                       window and killed permanently at the first flight.
 #   `jp_stagger_penalty` "both feet together", measured at the launch.
@@ -9919,6 +9923,21 @@ JP_LAND_TILT_DEG = 15.0
 JP_LAND_SETTLE_S = 0.30      # ... measured from the END of the first flight
 JP_LAND_Z_TOL_M = 0.020      # |z - JP_STAND_Z|
 JP_LAND_VZ_TOL = 0.15        # m/s of residual vertical motion
+
+# v3's single variable: the RISE POTENTIAL, which prices the last 2 cm the
+# landing bonus does not. `jp_land_bonus` pays its one shot anywhere within
+# JP_LAND_Z_TOL_M (20 mm) of JP_STAND_Z, so a trunk at 0.095 m qualifies — and
+# jump-v2 duly rose to exactly the band's edge (0.097-0.098 m against a standing
+# 0.115-0.120) and PARKED there for the remaining 1.7 s, because after the
+# landing nothing paid for the last 2 cm while rising still cost action rate.
+# That is bow v2's compromise pose at the edge of a tolerance, one term later.
+# The lower bound IS the bottom of the landing band (JP_STAND_Z minus the
+# tolerance) and the span IS the tolerance, so the potential runs from "the
+# cheapest pose that collects the bonus" to "standing".
+JP_RISE_LO_M = 0.095
+JP_RISE_SPAN_M = 0.020
+assert abs((JP_RISE_LO_M + JP_RISE_SPAN_M) - JP_STAND_Z) < 1e-9
+assert abs(JP_RISE_SPAN_M - JP_LAND_Z_TOL_M) < 1e-9
 
 # "A genuine flight" = both feet off for at least two control steps. Anything
 # shorter is contact chatter (the same 40 ms line the bow's flicker exemption
@@ -10006,6 +10025,17 @@ def _jp_update(
                          rising pays, holding pays zero, re-climbing pays zero.
       ``_jp_landed`` / ``_jp_just_landed``  the landing latch and the single
                          step it flipped on (the one-shot).
+      ``_jp_rise``       v3's potential: clip((z - 0.095)/0.020, 0, 1), the
+                         previous step's value, and ``_jp_rise_gain`` this
+                         step's Δ — what `jp_rise_reward` pays, and ONLY after
+                         the first genuine flight has ended.
+      ``_jp_rise_live``  whether ``_jp_flight_used`` was already closed at the
+                         END of the previous step. The rise Δ is paid against
+                         it rather than against the latch itself, so the step
+                         the flight ends pays nothing and the potential simply
+                         tracks: without it the first paid Δ would be the drop
+                         from the apex to the landing, and the hop would be
+                         charged for coming back down.
 
     Thresholds are module constants rather than per-term parameters for the
     reason `_bow_update` gives: the memory is memoised per env step, so the
@@ -10037,6 +10067,10 @@ def _jp_update(
         env._jp_apex_gain = torch.zeros(n, device=dev)
         env._jp_landed = torch.zeros(n, dtype=torch.bool, device=dev)
         env._jp_just_landed = torch.zeros(n, dtype=torch.bool, device=dev)
+        env._jp_rise = torch.zeros(n, device=dev)
+        env._jp_prev_rise = torch.zeros(n, device=dev)
+        env._jp_rise_gain = torch.zeros(n, device=dev)
+        env._jp_rise_live = torch.zeros(n, dtype=torch.bool, device=dev)
     env._jp_tick = tick
 
     asset: Entity = env.scene[asset_cfg.name]
@@ -10066,6 +10100,13 @@ def _jp_update(
     env._jp_flight_used = env._jp_flight_used & ~fresh
     env._jp_landed = env._jp_landed & ~fresh
     env._jp_just_landed = env._jp_just_landed & ~fresh
+    env._jp_rise_live = env._jp_rise_live & ~fresh
+    env._jp_rise = torch.where(fresh, torch.zeros_like(env._jp_rise),
+                               env._jp_rise)
+    env._jp_prev_rise = torch.where(fresh, torch.zeros_like(env._jp_prev_rise),
+                                    env._jp_prev_rise)
+    env._jp_rise_gain = torch.where(fresh, torch.zeros_like(env._jp_rise_gain),
+                                    env._jp_rise_gain)
     env._jp_stagger = torch.where(fresh, torch.zeros_like(env._jp_stagger),
                                   env._jp_stagger)
     env._jp_flight_end_t = torch.where(
@@ -10173,6 +10214,35 @@ def _jp_update(
     env._jp_just_landed = settled & ~env._jp_landed
     env._jp_landed = env._jp_landed | settled
 
+    # ── The rise potential: the last 2 cm (v3's single variable) ────────────
+    # `jp_land_bonus` pays anywhere within 20 mm of standing, so 0.095 m
+    # collects it — and jump-v2 rose to 0.097-0.098 m and PARKED there for the
+    # rest of the episode, on folded legs, because past the bonus nothing paid
+    # for the last 2 cm while rising still cost action rate. The band's edge is
+    # the argmax when the band is the only thing paying. So price the band
+    # itself, potential-based: rising pays, holding pays zero, sagging pays
+    # negative, and the whole 0.095 -> 0.115 climb is worth exactly 1.0 credit
+    # however it is walked up.
+    #
+    # LIVE ONLY AFTER THE FIRST GENUINE FLIGHT HAS ENDED, and measured against
+    # `_jp_rise_live` (the latch as it stood at the END of the previous step)
+    # rather than against `_jp_flight_used` itself. Two things that buys: the
+    # spawn drop and the crouch cannot bank anything, and the step the flight
+    # ends pays nothing, so the hop is never charged the drop from its own apex
+    # back to the floor. Before it is live the potential simply tracks the
+    # trunk, which is why the first paid Δ is a rise from the landing pose and
+    # not a jackpot from the spawn height.
+    rise_pot = torch.clamp(
+        (root_z - JP_RISE_LO_M) / max(JP_RISE_SPAN_M, 1e-6), 0.0, 1.0
+    )
+    env._jp_rise_gain = torch.where(
+        env._jp_rise_live, rise_pot - env._jp_prev_rise,
+        torch.zeros_like(rise_pot),
+    )
+    env._jp_prev_rise = rise_pot
+    env._jp_rise = rise_pot
+    env._jp_rise_live = env._jp_flight_used.clone()
+
 
 def jp_flight_reward(
     env: ManagerBasedRlEnv,
@@ -10279,6 +10349,52 @@ def jp_land_bonus(
     ~10%. A feed-forward hop is repeatable; a feed-forward landing is not."""
     _jp_update(env, sensor_name, feet_cfg, asset_cfg)
     return env._jp_just_landed.float()
+
+
+def jp_rise_reward(
+    env: ManagerBasedRlEnv,
+    sensor_name: str = "feet_ground_contact",
+    feet_cfg: SceneEntityCfg = JP_FEET_SITE_CFG,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """-1..1 per step: POTENTIAL-BASED rise-progress AFTER the landing.
+
+    Pays Δ of ``clip((z - 0.095) / 0.020, 0, 1)``, and only on steps where the
+    first genuine flight has already ENDED (``_jp_rise_live``, i.e.
+    ``_jp_flight_used`` as it stood at the end of the previous step). The whole
+    climb from the bottom of the landing band to standing height is worth
+    exactly 1.0 credit however it is walked up, so at weight 15.0 the term is
+    worth at most 15 points an episode — the same size as the landing bonus it
+    completes.
+
+    WHY IT EXISTS, which is the whole of v3. `jp_land_bonus` fires anywhere
+    within ``JP_LAND_Z_TOL_M`` (20 mm) of ``JP_STAND_Z``, so a trunk at 0.095 m
+    collects it. jump-v2 hopped correctly — one flight of 160-180 ms per
+    episode, trunk apex +13 mm, 0 falls in 8 lab episodes — and then landed on
+    FOLDED LEGS (trunk 0.039 m at 0.32 s), rose to 0.097-0.098 m and PARKED
+    THERE for the remaining 1.7 s, against a standing height of 0.115-0.120 m,
+    tilt 1 deg, no cycling. It had found the cheapest pose that still collects
+    the bonus: past the landing nothing in the stack paid for the last 2 cm,
+    and rising costs action rate. That is bow v2's lesson exactly — "a
+    compromise pose collecting partial credit while never paying the
+    action-rate cost of moving" — reappearing at the edge of a TOLERANCE rather
+    than in the middle of a Gaussian. A one-shot bonus with a band is a band the
+    policy will sit on the edge of; the fix is to price the band.
+
+    Potential-based, which is AGENTS.md's unfarmable shaping and the same shape
+    as `jp_apex`: rising pays, HOLDING PAYS ZERO (so parking at 0.097 earns the
+    2 mm it climbed and nothing per step thereafter), sagging pays negative, and
+    overshooting past standing height pays nothing. Unlike `jp_apex` the Δ is
+    NOT clamped at zero — a policy that rises and then folds back down must give
+    the credit back, or "rise, collect, sag" is a farm.
+
+    NOT a height Gaussian and NOT gated on being low. A Gaussian at 0.115 would
+    price the crouch and the apex as error, which is exactly why this recipe has
+    no `height_stand`; this term is dark for the whole of the hop and lights up
+    only once the episode's one flight is over, so the load, the push, the
+    flight and the apex are all unpriced by it."""
+    _jp_update(env, sensor_name, feet_cfg, asset_cfg)
+    return env._jp_rise_gain
 
 
 def jp_load_reward(

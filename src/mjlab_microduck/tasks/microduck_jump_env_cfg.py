@@ -66,7 +66,7 @@ together".
 standard of 4.0. The manoeuvre takes ~0.65 s end to end (0.20 s load, 0.06 s
 push, 0.06 s flight, 0.30 s settle), so a 4 s episode is 3.3 s of standing
 still. That matters twice: it doubles the `alive` income the hop has to compete
-against (600 instead of 300, against a hop's ~130) and it doubles the
+against (600 instead of 300, against a hop's ~145) and it doubles the
 wall-clock per rehearsal. If v1 needs more settling room, 3.0 s is the fallback
 — not 4.0.
 
@@ -91,7 +91,8 @@ one). Three places to get one, and this recipe uses the second:
 The half that IS delay-sensitive is the landing — a reflex on gyro and projected
 gravity, the two delayed channels. That is why the lab eval is read under the
 lab's 3-6 step observation delay as well as without it, and why a
-delay-widening knob is v3's variable, never v1's.
+delay-widening knob is a LATER version's variable, never v1's. (It has not been
+needed yet: v2 and v3 both fall over the landing POSE, not its timing.)
 
 ── The reward stack ─────────────────────────────────────────────────────────
 Every `jp_*_penalty` returns a NON-NEGATIVE 0..1 cost and carries a NEGATIVE
@@ -105,7 +106,7 @@ asserts it; the run check is that every `Episode_Reward/<penalty>` is <= 0.
     monotonically (length 191 -> 77, falls 1.6 -> 47 per iteration, progress
     rising the whole way) because "a turn which falls at ~0.9 s out-earns a
     careful one". Over 100 steps this is 300 points a fall forfeits, against
-    everything a hop can earn (~130). The gate is 25 deg and not the pivot's 15
+    everything a hop can earn (~145). The gate is 25 deg and not the pivot's 15
     because the measured hop peaks at 32.4 deg on its own landing; 25 deg still
     costs it ~9 of the 300, which is the right size for a nudge.
   * `jp_flight` +25.0/step, GATED ON BOTH FEET OFF and ON THE FIRST GENUINE
@@ -137,6 +138,15 @@ asserts it; the run check is that every `Episode_Reward/<penalty>` is <= 0.
     Pivot v5's finish-upright jackpot and the bow's `risen` in the same shape.
     Conditioned on a prior flight so a duck that never leaves the floor cannot
     collect it; one-shot so it cannot be farmed by bouncing.
+  * `jp_rise` +15.0, POTENTIAL-BASED on `clip((z - 0.095)/0.020, 0, 1)`,
+    advancing only AFTER the first genuine flight has ended. v3's single
+    variable. `jp_land`'s band is 20 mm wide, so 0.095 m collects the bonus —
+    and v2 rose to exactly 0.097-0.098 and parked there, because past the
+    landing nothing paid for the last 2 cm while rising still costs action
+    rate. This prices the band: rising pays, holding pays zero, sagging pays
+    negative, and the whole 0.095 -> 0.115 climb is worth 15 points ONCE. Dark
+    for the entire hop (the load, the push, the flight and the apex are all
+    unpriced by it), so it is not a `height_stand` in disguise.
   * `jp_load` +0.5/step, only BEFORE the first flight and only in the FIRST
     0.8 s, `clip((0.115 - z)/0.030, 0, 1)`. The gradient's first rung: from
     "stand still" there is otherwise nothing at all pointing at a hop. Bow v1,
@@ -208,7 +218,8 @@ the bow's `collapsed` termination must NOT be copied across.
 
 ── Two arithmetic rules the stack obeys ─────────────────────────────────────
   * A FALL IS NEVER PROFITABLE. Everything a hop can earn (flight ~100 + apex 15
-    + land 15 = 130) is worth less than the `alive` income a fall forfeits (up
+    + land 15 + rise 15 = 145) is worth less than the `alive` income a fall
+    forfeits (up
     to 300) plus the -100. Pivot v5: "the decisive line is the alive income a
     fall forfeits, not the penalty".
   * ENDING THE EPISODE IS NEVER AN ESCAPE. Total per-step penalties are bounded
@@ -222,8 +233,10 @@ the bow's `collapsed` termination must NOT be copied across.
 ── The arithmetic: the stack scored over whole 2 s episodes ─────────────────
 Per-episode totals (mjlab's `Episode_Reward/x` x 100). The design note scored
 these on RECORDED trajectories (protocol step 2); the numbers below are what
-`tests/test_jump_cfg.py::test_the_arithmetic_hopping_wins` and
-`::test_the_pogo_now_loses_to_one_hop` measure by running the REAL reward
+`tests/test_jump_cfg.py::test_the_arithmetic_hopping_wins`,
+`::test_the_pogo_now_loses_to_one_hop` and (for v3's `jp_rise` column, in the
+v3 section below) `::test_parking_on_the_edge_of_the_landing_band_now_loses`
+measure by running the REAL reward
 functions over synthetic reconstructions of those same trajectories for all 100
 steps (protocol step 4: synthetic arithmetic is a sanity check on the ORDERING,
 never the reason to launch).
@@ -417,6 +430,124 @@ touching a weight. If it hops once and still falls on landing, the flight is
 fine and v3's variable is `jp_land`'s tolerance band, exactly as v1's verdict
 rule already said.
 
+── v2 HOPPED, AND THEN PARKED ON THE EDGE OF THE LANDING BAND ──────────────
+THE FINDING (jump-v2). The latch did its job and the hop is real: lab eval on
+8 episodes, 0 FALLS, ONE FLIGHT PER EPISODE OF 160-180 ms, trunk apex +13 mm.
+v1's pogo is gone and the ticket's manoeuvre exists.
+
+And then the duck LANDS ON FOLDED LEGS — trunk 0.039 m at 0.32 s — rises to
+0.097-0.098 m and PARKS THERE for the rest of the 2 s episode. Standing is
+0.115-0.120. Tilt 1 deg, no cycling, no attempt to get up: it simply stops
+2 cm short and stays.
+
+WHY, IN ONE LINE, and it is read straight off the stack rather than off the
+physics. `jp_land_bonus` pays its one shot when the trunk is within
+JP_LAND_Z_TOL_M (20 mm) of JP_STAND_Z (0.115), so 0.095 m qualifies. The policy
+rises to EXACTLY THE BAND'S EDGE, collects the +15, and stops — because nothing
+after the landing pays for the last 2 cm, and rising costs action rate. THIS IS
+THE BOW v2 LESSON, which this file already quotes twice: "a compromise pose
+that collected partial credit from both phases while never paying the
+action-rate cost of moving". v2 shows it arrives at the edge of a TOLERANCE
+just as readily as in the middle of a Gaussian. A one-shot bonus with a band is
+a band the policy will sit on the edge of.
+
+── v3: PAY FOR THE LAST TWO CENTIMETRES ────────────────────────────────────
+THE FIX, and it is the only change in this version: `jp_rise`, +15.0,
+POTENTIAL-BASED on p = clip((z - JP_RISE_LO_M) / JP_RISE_SPAN_M, 0, 1) =
+clip((z - 0.095)/0.020, 0, 1), paying (p_now - p_prev) per step and ONLY on
+steps where the first genuine flight has already ENDED. bow v4's sentence,
+applied to the half of the trick that still had no gradient: "the
+potential-based rise-progress term was the missing piece".
+
+Four details that are deliberate, not incidental:
+
+  * THE BAND IS `jp_land`'s BAND. 0.095 is the lowest trunk height that still
+    collects the landing bonus and 0.020 is the tolerance itself, so the
+    potential runs from "the cheapest pose that qualifies" to "standing". The
+    term prices exactly the slack the bonus leaves, and nothing else. (Asserted
+    in mdp.py: JP_RISE_LO_M + JP_RISE_SPAN_M == JP_STAND_Z.)
+  * IT IS DARK FOR THE WHOLE HOP. Gated on `_jp_flight_used` — the same latch
+    v2 added — so the spawn drop, the crouch, the push, the flight and the apex
+    are all unpriced by it. This is NOT the `height_stand` this recipe refuses
+    to carry: a duck that never leaves the floor earns zero of it however tall
+    it stands, and the crouch is never charged as error.
+  * THE STEP THE FLIGHT ENDS PAYS NOTHING, and before that p_prev merely tracks
+    p_now. Otherwise the first paid Δ would be the drop from the hop's own apex
+    back to the floor and the hop would be billed for landing — and, at spawn,
+    a jackpot from the keyframe height.
+  * THE Δ IS NOT CLAMPED AT ZERO, unlike `jp_apex`. Rising pays, holding pays
+    zero, sagging pays negative. A potential you can bank and then fold out of
+    would be the same farm in a third costume; giving it back means the episode
+    can never earn more than 1.0 x 15 = 15 POINTS, the same size as the landing
+    bonus it completes. Arriving must not out-earn getting there.
+
+NOTHING ELSE MOVES. No weight, no tolerance, no gate, no window, no
+termination. One variable.
+
+The strategy table with `jp_rise` live, measured by
+`tests/test_jump_cfg.py` running the REAL reward functions over the same
+synthetic reconstructions as the v1/v2 table above (so these are the synthetic
+totals, not the design note's recorded ones):
+
+  strategy                        steps  alive  flight  apex  land  rise  total
+  textbook hop (best, lands)        100    291   100.0  13.4  15.0   7.5  430.7
+  ...the SAME hop, parks at 0.097   100    291   100.0  13.4  15.0  -6.0  417.2
+  POGO, 6 hops, then settles        100    246   100.0  11.5  15.0   7.5  381.2
+  POGO, 6 hops, never settles       100    246   100.0  11.5     0   7.5  366.2
+  crouch-and-park that holds        100    300       0     0      0     0  320.0
+  stand still                       100    300       0     0      0     0  300.0
+  trained runner (stride bounce)    100    300       0     0      0     0  300.0
+  tallest stable park (+2.9 mm)     100    300       0     0      0     0  300.0
+  hop that lands and falls           50    120    52.5  15.0     0  -6.0   83.6
+  crouch-and-fall                    47    102       0     0      0     0    8.7
+
+THE TWO HOP ROWS ARE v3's, and they are the point of the version: the same
+trajectory, identical in every other term — same flight, same apex, same
+landing bonus — separated by 13.5 POINTS purely on where it settles. Under v2
+they scored the same, which is why v2 chose the low one.
+`test_parking_on_the_edge_of_the_landing_band_now_loses` asserts exactly that.
+
+PREDICTION FOR v3 (written before launch, per the protocol):
+
+  * `Episode_Reward/jp_rise` PER-STEP MEAN 0.10-0.15. The whole term is 15
+    points an episode over ~100 steps, so a policy that lands and stands all
+    the way up logs ~0.15 and one that keeps v2's park logs ~0.02. Below 0.05,
+    or NEGATIVE, means the duck is still folding after the landing and the
+    variable to look at next is `jp_land`'s 20 mm tolerance itself, not this
+    weight.
+  * `Episode_Reward/jp_land` STILL FIRING IN MOST EPISODES, 0.08-0.13 of 15.0,
+    i.e. v2's number unchanged. This term is the thing v3 is completing, not
+    replacing; if it collapses, the rise has made the landing pose harder to
+    reach and the two terms are fighting.
+  * `Episode_Reward/jp_flight` PER-STEP MEAN STILL UNDER 3 (of 25), v2's band.
+    Nothing in this version touches the flight latch, so a rise above it means
+    the policy has found a way to spend its one flight differently.
+  * `Episode_Termination/fell_over` STILL UNDER 1 PER ITERATION and mean
+    episode length ~100, i.e. v1's and v2's survival numbers unchanged. This
+    version adds no termination and touches neither `alive` nor `terminated`;
+    if length drops, standing up is costing falls and the honest read is that
+    the landing pose, not the reward, is the problem.
+  * LAB EVAL, 8 episodes, `render-rollout`, BAM + noise + DR: ONE FLIGHT PER
+    EPISODE (unchanged from v2), 0-1 FALLS OF 8, and — the thing this version
+    exists for — THE FINAL TRUNK HEIGHT OVER THE LAST 0.5 s WITHIN 8 mm OF
+    STANDING ON AT LEAST 6 OF 8 EPISODES, against v2's 97-98 mm park (17-22 mm
+    short) on 8 of 8.
+  * THE FAILURE MODE TO WATCH FOR is the compromise pose moving rather than
+    disappearing: a park at 0.107 instead of 0.097, halfway up, collecting half
+    the rise and stopping where the action-rate cost of the next centimetre
+    balances 7.5 points. If the contact sheet shows that, the answer is NOT
+    more weight on this term — it is that the landing pose itself (folded legs
+    at 0.039 m) is too deep to stand up from, and v4's variable is the landing,
+    not the rise.
+
+VERDICT RULE for v3. The run works if the lab eval shows the hop UNCHANGED —
+one flight, 40-100 ms, apex >= 8 mm, <= 1 fall of 8 — AND the duck finishes
+within 8 mm of standing on >= 6 of 8 episodes. If the hop degrades while the
+height improves, the rise is competing with the flight and the fix is to make
+it live only after `jp_land` has actually fired, not merely after the flight
+ended. If the height does not move at all, the 20 mm landing tolerance is the
+next variable.
+
 Open question carried from the design note: the head throw. 38% of the mass is
 in the head (`airflip._af_head_throw` exists for that reason), but a scripted
 +/-0.5 rad neck/head swing through the launch changed the apex by -2 to +1 mm —
@@ -460,6 +591,8 @@ ALIVE_TILT_DEG = microduck_mdp.JP_ALIVE_TILT_DEG  # 25, not the pivot's 15
 LAND_TILT_DEG = microduck_mdp.JP_LAND_TILT_DEG    # 15 — the finish cone
 LAND_SETTLE_S = microduck_mdp.JP_LAND_SETTLE_S    # 0.30 s after the flight ends
 FLIGHT_MIN_S = microduck_mdp.JP_FLIGHT_MIN_S      # 0.04 = "a genuine flight"
+RISE_LO_M = microduck_mdp.JP_RISE_LO_M        # 0.095 = the landing band's floor
+RISE_SPAN_M = microduck_mdp.JP_RISE_SPAN_M    # 0.020 = ...up to standing height
 DRIFT_SAT_M = microduck_mdp.JP_DRIFT_SAT_M        # 0.05 — a hop in place
 
 HEAD_STILL_JOINTS = microduck_mdp.JP_HEAD_STILL_JOINTS  # (7, 8) yaw, roll
@@ -488,6 +621,12 @@ W_APEX = 15.0        # potential-based, airborne-only. With APEX_M = 0.015 this
                      # is exactly one point per millimetre of apex, capped at 15.
 W_LAND = 15.0        # one shot, conditioned on a prior flight. Pivot v5's
                      # `pivot_complete` in the same shape and at the same size.
+W_RISE = 15.0        # v3's ONLY change. Potential-based over the landing band
+                     # itself, live only after the flight has ended: the whole
+                     # 0.095 -> 0.115 climb is worth 1.0, so the term is capped
+                     # at 15 — deliberately the SAME size as the bonus it
+                     # completes, because v2 collected that bonus at 0.097 and
+                     # parked. Rising has to be worth as much as arriving.
 W_LOAD = 0.5         # the first rung, capped at 20 points an episode by the
                      # 0.8 s window and killed at the first flight.
 W_STAGGER = -2.0     # "both feet together", one control step of tolerance.
@@ -622,6 +761,18 @@ def make_microduck_jump_env_cfg(
         weight=W_LAND,
         params={"sensor_name": sensor_name, "feet_cfg": feet()},
     )
+    # ...and the last 2 cm of it, which is v3's single variable. `jp_land`
+    # fires anywhere within 20 mm of standing, so 0.095 m collects it — and v2
+    # duly landed on folded legs (trunk 0.039 m at 0.32 s), rose to 0.097-0.098
+    # and PARKED there for the remaining 1.7 s, tilt 1 deg, no cycling, against
+    # a standing 0.115-0.120. Potential-based over that band, live only once
+    # the episode's one flight has ended: rising pays, holding pays zero,
+    # sagging pays negative, and the whole climb is worth 15 points once.
+    cfg.rewards["jp_rise"] = RewardTermCfg(
+        func=microduck_mdp.jp_rise_reward,
+        weight=W_RISE,
+        params={"sensor_name": sensor_name, "feet_cfg": feet()},
+    )
     # The first rung of the gradient — and the term most likely to be v2's
     # variable if the policy parks in the crouch instead of leaving the floor.
     cfg.rewards["jp_load"] = RewardTermCfg(
@@ -646,7 +797,7 @@ def make_microduck_jump_env_cfg(
     # is alive with the trunk within 25 deg of vertical. Nothing to farm — no
     # shaping, no pose to seek — so it can be this large without distorting the
     # ranking of anything done WHILE alive; it changes only the value of
-    # surviving to do it. 300 points over the episode, against a hop's ~130.
+    # surviving to do it. 300 points over the episode, against a hop's ~145.
     cfg.rewards["alive"] = RewardTermCfg(
         func=microduck_mdp.jp_alive_reward,
         weight=W_ALIVE,
