@@ -116,6 +116,12 @@ the physics of walk, standup, ground_pick and every `-Backlash-` twin at once
 and confound their comparisons. That is a robot-model change, not a task knob,
 so it belongs in its own round with its own A/B.
 
+UPDATE (go-grgs #44 / ADR 0011): the robot-model half of that blocker is gone —
+`add_shell.py` now puts world-collision primitives on the trunk, neck, head,
+thighs and shanks of the walk model, on their own `SHELL_COLLISION` cfg so only
+the walk tasks are affected. A box in front of an env is now a real wall the
+trunk can hit. The A/B round itself is still owed.
+
 Deliberate deviations from the transcribed recipe, and why:
   - `head_pose_bias` (+ its curriculum) is kept from the fork's velocity
     template. It is not in the GPU recipe, but it prices only the ESCAPABLE DC

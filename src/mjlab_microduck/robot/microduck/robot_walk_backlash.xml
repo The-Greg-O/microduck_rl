@@ -11,7 +11,7 @@
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
       </default>
       <default class="collision">
-        <geom group="3"/>
+        <geom group="3" contype="1" conaffinity="0"/>  <!-- world contact only: no robot-robot pair (add_shell.py) -->
       </default>
     </default>
   </default>
@@ -90,6 +90,17 @@
       <joint damping="0.01" frictionloss="0" armature="0.001" limited="true" range="-0.017453292519943295 0.017453292519943295" solreflimit="0.01 1" solimplimit="0.95 0.999 0.0001 0.5 2"/>
     </default>
   </default>
+  <!-- Shell injected by add_shell.py: world-collision primitives fitted
+       to each body's visual mesh extent minus a 3 mm margin.
+       contype 1 / conaffinity 0 = touches the world (default 1/1) and
+       NEVER another robot geom, so the self_collision subtree sensor
+       cannot see it. group 3 = the group the ToF rays are cast against.
+       Stripped at load by MICRODUCK_NO_SHELL=1. -->
+  <default>
+    <default class="shell">
+      <geom contype="1" conaffinity="0" group="3" density="0" rgba="0.9 0.45 0.1 0.3"/>
+    </default>
+  </default>
   <worldbody>
     <!-- Link trunk_base -->
     <body name="trunk_base" pos="0 0 0.12" quat="1 0 0 0" childclass="microduck">
@@ -116,6 +127,7 @@
       <geom type="mesh" class="visual" pos="0.004 -0 -0.0175785" quat="0.707107 -0 -0 0.707107" mesh="left_shell" material="left_shell_material"/>
       <!-- Part seeed_bearing__configuration__22x16x4_2 -->
       <geom type="mesh" class="visual" pos="0.006 -0.0175 -0.005" quat="1 -0 -0 0" mesh="seeed_bearing__configuration__22x16x4" material="seeed_bearing__configuration__22x16x4_material"/>
+      <geom name="shell_trunk" class="shell" type="box" pos="-0.007513 0.0002855 0.0057965" size="0.041271 0.0391135 0.0470325"/>
       <!-- Frame imu -->
       <site group="3" name="imu" pos="-0.021 6.64098e-05 -0.0146984" quat="1 -0 -0 -0"/>
       <!-- Link yaw2roll -->
@@ -158,6 +170,7 @@
             <geom type="mesh" class="visual" pos="0.022 0.0357771 -0.004" quat="0 0 -0 1" mesh="seeed_bearing__configuration__22x16x4" material="seeed_bearing__configuration__22x16x4_material"/>
             <!-- Part xl330_5 -->
             <geom type="mesh" class="visual" pos="0 -0 0.0125" quat="0.5 0.5 -0.5 0.5" mesh="xl330" material="xl330_material"/>
+            <geom name="shell_thigh_left" class="shell" type="capsule" fromto="0.003567 0.0107175 0.0216615 0.003567 0.0299305 0.0216615" size="0.0260825"/>
             <!-- Link leg -->
             <body name="leg" pos="0.022 0.0357771 -0.004" quat="0 0.707107 0.707107 0">
               <!-- Joint from upper_leg_left to leg -->
@@ -169,6 +182,7 @@
               <geom type="mesh" class="self_collision_only" pos="-0.022 0.0357771 0.0385" quat="0.5 0.5 0.5 -0.5" mesh="leg" material="leg_material"/>
               <!-- Part xl330_6 -->
               <geom type="mesh" class="visual" pos="-0 0.042 -0.0115" quat="0.5 -0.5 -0.5 -0.5" mesh="xl330" material="xl330_material"/>
+              <geom name="shell_shank_left" class="shell" type="capsule" fromto="0 -0.000138 -0.009611 0 0.041569 -0.009611" size="0.007"/>
               <!-- Link ankle_left -->
               <body name="ankle_left" pos="-0 0.042 -0.026" quat="0 -1 -0 0">
                 <!-- Joint from leg to ankle_left -->
@@ -205,6 +219,7 @@
         <geom type="mesh" class="visual" pos="-0 -0.05 0.0145" quat="0.5 0.5 -0.5 0.5" mesh="xl330" material="xl330_material"/>
         <!-- Part neck_2 -->
         <geom type="mesh" class="visual" pos="0.022 0.05 0.003" quat="0.5 0.5 0.5 -0.5" mesh="neck" material="neck_material"/>
+        <geom name="shell_neck" class="shell" type="capsule" fromto="0 -0.049569 0.01448 0 -0.000431 0.01448" size="0.007"/>
         <!-- Link neck_pitch -->
         <body name="neck_pitch" pos="-0 -0.05 0" quat="0 1 -0 -0">
           <!-- Joint from neck to neck_pitch -->
@@ -267,6 +282,7 @@
               <geom type="mesh" class="visual" pos="0.015435 -1.13778e-05 -0.06001" quat="0.5 -0.5 -0.5 0.5" mesh="pcb__raspberry_pi_zero_2_w" material="pcb__raspberry_pi_zero_2_w_material"/>
               <!-- Part speaker -->
               <geom type="mesh" class="visual" pos="0.01 -0.016786 0.0260226" quat="0.5 0.5 0.5 0.5" mesh="speaker" material="speaker_material"/>
+              <geom name="shell_head" class="shell" type="box" pos="0.008502 0.0002335 -0.023399" size="0.034162 0.0431835 0.063222"/>
               <!-- Frame head_camera -->
               <site group="3" name="head_camera" pos="0.0155 -9.13778e-05 -0.0733" quat="0.707107 -0 0.707107 0"/>
               <camera name="head_camera" pos="0.0155 -9.13778e-05 -0.0733" quat="0 0 -1 0"/>
@@ -320,6 +336,7 @@
             <geom type="mesh" class="visual" pos="-0 -0 -0.0425" quat="0.5 -0.5 0.5 0.5" mesh="upper_leg_right" material="upper_leg_right_material"/>
             <!-- Part xl330_14 -->
             <geom type="mesh" class="visual" pos="-0 -0 0.0125" quat="0.5 0.5 -0.5 0.5" mesh="xl330" material="xl330_material"/>
+            <geom name="shell_thigh_right" class="shell" type="capsule" fromto="-0.003567 0.010716 0.021661 -0.003567 0.029931 0.021661" size="0.026082"/>
             <!-- Link leg_2 -->
             <body name="leg_2" pos="-0.022 0.0357771 -0.004" quat="0 1 -0 -0">
               <!-- Joint from upper_leg_right to leg_2 -->
@@ -331,6 +348,7 @@
               <!-- Part leg_2 -->
               <geom type="mesh" class="visual" pos="-0.0357771 -0.022 0.0385" quat="0.707107 0 0.707107 -0" mesh="leg" material="leg_material"/>
               <geom type="mesh" class="self_collision_only" pos="-0.0357771 -0.022 0.0385" quat="0.707107 0 0.707107 -0" mesh="leg" material="leg_material"/>
+              <geom name="shell_shank_right" class="shell" type="capsule" fromto="-0.041569 0 -0.009611 0.000138 0 -0.009611" size="0.007"/>
               <!-- Link ankle_right -->
               <body name="ankle_right" pos="-0.042 0 -0.026" quat="0 -0.707107 -0.707107 0">
                 <!-- Joint from leg_2 to ankle_right -->
