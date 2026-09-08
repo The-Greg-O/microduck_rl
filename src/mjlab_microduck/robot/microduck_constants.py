@@ -1,3 +1,4 @@
+import dataclasses
 import os
 from pathlib import Path
 
@@ -49,29 +50,53 @@ assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {
 # (shell_trunk, shell_neck, shell_head, shell_shank_left/right — no thigh
 # primitive: see add_shell.py's header and the #44 refit, a thigh capsule left
 # a fallen robot's trunk 74 mm up and the stand policy could never recover)
-# so a policy can feel a wall, and gives the shell AND
-# the feet conaffinity 0: they touch the world (default contype/conaffinity
-# 1/1) and can never touch another robot geom, so the self_collision subtree
-# sensor cannot see them. MICRODUCK_NO_SHELL=1 strips the shell at load and
-# puts the feet back on conaffinity 1, reproducing the pre-shell model exactly.
-# Read once at import — reload this module if you change the env var in a test.
-NO_SHELL: bool = os.environ.get("MICRODUCK_NO_SHELL", "0") == "1"
+# so a policy can feel a wall.
+#
+# Contact bits on the robot — the pair set is EXACTLY the pre-shell one:
+#   bit 1 (=1)  the world (floor/walls/furniture/people are MuJoCo's 1/1)
+#   bit 2 (=2)  the export's `self_collision_only` class (2/2), untouched
+#   bit 4 (=4)  the two soles' own bit
+# shell = contype 1 / conaffinity 0 (world only, invisible to the
+# `self_collision` subtree sensor); feet = contype 1|4 = 5 / conaffinity 4, so
+# the sole-vs-sole pair the velocity/run tasks' -1.0 `self_collisions` penalty
+# prices is still there, while 1 & 4 == 0 keeps a foot from ever pairing with a
+# shell primitive.
+WORLD_BIT = 1
+FEET_BIT = 4
+SHELL_CONTYPE, SHELL_CONAFFINITY = WORLD_BIT, 0
+FEET_CONTYPE, FEET_CONAFFINITY = WORLD_BIT | FEET_BIT, FEET_BIT  # 5, 4
+
 SHELL_GEOM_PREFIX = "shell_"
+
+# THE ONE RULE, shared verbatim with add_shell.py, grgworld's
+# `paths.shell_enabled` and the lab's `walk_env.shell_enabled`: the shell is
+# stripped if and only if MICRODUCK_NO_SHELL is exactly the string "1". Nothing
+# else counts — not "true", not "yes", not "TRUE", not "0 ". Read FRESH every
+# time a walk spec or its collision cfg is built (never at import), so setting
+# the variable after `import mjlab_microduck` still takes effect and no test
+# needs importlib.reload.
+NO_SHELL_ENV_VAR = "MICRODUCK_NO_SHELL"
+
+
+def no_shell() -> bool:
+    """True iff MICRODUCK_NO_SHELL is exactly "1", read at the moment of asking."""
+    return os.environ.get(NO_SHELL_ENV_VAR, "0") == "1"
 
 
 def strip_shell(spec: mujoco.MjSpec) -> mujoco.MjSpec:
-    """Delete the shell geoms and give the feet their conaffinity back."""
+    """Delete the shell geoms and put the feet back on the pre-shell 1/1 mask."""
     for geom in list(spec.geoms):
         if geom.name.startswith(SHELL_GEOM_PREFIX):
             spec.delete(geom)
     for geom in spec.geoms:
         if geom.name.endswith("_collision"):
+            geom.contype = 1
             geom.conaffinity = 1
     return spec
 
 
 def _maybe_strip_shell(spec: mujoco.MjSpec) -> mujoco.MjSpec:
-    return strip_shell(spec) if NO_SHELL else spec
+    return strip_shell(spec) if no_shell() else spec
 
 
 def get_walk_spec() -> mujoco.MjSpec:
@@ -138,33 +163,58 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={".*": 0.0},
 )
 
+_FEET_EXPR = r"^(left|right)_foot_collision$"
+_SHELL_EXPR = r"^shell_.*"
+
 FULL_COLLISION = CollisionCfg(
     geom_names_expr=[".*_collision"],
-    condim={r"^(left|right)_foot_collision$": 3, ".*_collision": 1},
-    priority={r"^(left|right)_foot_collision$": 1},
-    friction={r"^(left|right)_foot_collision$": (1.0,)},
+    condim={_FEET_EXPR: 3, ".*_collision": 1},
+    priority={_FEET_EXPR: 1},
+    friction={_FEET_EXPR: (1.0,)},
 )
 
-# Shelled walk models only. CollisionCfg REWRITES contype/conaffinity on every
-# geom it matches (and disables every named geom it does not), so the XML's
-# conaffinity="0" is not enough — it has to be repeated here or mjlab would put
-# the feet back on 1 and delete the shell. conaffinity=0 on the whole matched
-# set is the ADR 0011 rule: world contact only, no robot-to-robot pair.
-# `.*_collision` keeps its condim/priority/friction table untouched; the shell
-# is a separate pattern so it never falls into the feet's rules or into the
+# Shelled walk models only — the SAME cfg as FULL_COLLISION (its condim /
+# priority / friction table is inherited via dataclasses.replace, never
+# retyped) plus the shell pattern and the bitmask.
+#
+# CollisionCfg REWRITES contype/conaffinity on every geom it matches (and
+# disables every named geom it does not), so the XML's masks are not enough —
+# they have to be repeated here or mjlab would put the feet back on 1/1 and
+# delete the shell. The numbers are add_shell.py's: shell 1/0 (world only,
+# invisible to the `self_collision` subtree sensor), feet 5/4 (world through
+# bit 1, each other through bit 4, never a shell primitive since 1 & 4 == 0).
+# `.*_collision` keeps the feet's condim/priority/friction rules; the shell is a
+# separate pattern so it never falls into them or into the
 # `feet_ground_contact` sensor's `^(left|right)_foot_collision$` match.
-SHELL_COLLISION = CollisionCfg(
-    geom_names_expr=[".*_collision", r"^shell_.*"],
-    contype=1,
-    conaffinity=0,
-    condim={r"^(left|right)_foot_collision$": 3, r"^shell_.*": 3, ".*_collision": 1},
-    priority={r"^(left|right)_foot_collision$": 1},
-    friction={r"^(left|right)_foot_collision$": (1.0,)},
+# NOTE: resolve_expr takes the FIRST matching pattern, so the feet entries must
+# stay ahead of the catch-alls.
+SHELL_COLLISION = dataclasses.replace(
+    FULL_COLLISION,
+    geom_names_expr=[".*_collision", _SHELL_EXPR],
+    contype={_FEET_EXPR: FEET_CONTYPE, ".*": SHELL_CONTYPE},
+    conaffinity={_FEET_EXPR: FEET_CONAFFINITY, ".*": SHELL_CONAFFINITY},
+    condim={_FEET_EXPR: 3, _SHELL_EXPR: 3, ".*_collision": 1},
 )
 
-# Under MICRODUCK_NO_SHELL=1 the spec has no shell geoms left, so the walk
-# models fall back to the pre-shell collision cfg byte for byte.
-WALK_COLLISION = FULL_COLLISION if NO_SHELL else SHELL_COLLISION
+
+class _WalkCollisionCfg(CollisionCfg):
+    """FULL_COLLISION or SHELL_COLLISION, decided when the entity is built.
+
+    MICRODUCK_NO_SHELL is read here rather than at import, at the same moment
+    `get_walk_spec` reads it (mjlab calls `spec_fn` and then `edit_spec` inside
+    `Entity.__init__`), so the spec and its collision cfg can never disagree:
+    with the shell stripped the spec has no `shell_*` geoms left, and the walk
+    models fall back to the pre-shell cfg byte for byte.
+    """
+
+    def resolve(self) -> CollisionCfg:
+        return FULL_COLLISION if no_shell() else SHELL_COLLISION
+
+    def edit_spec(self, spec: mujoco.MjSpec) -> None:
+        self.resolve().edit_spec(spec)
+
+
+WALK_COLLISION = _WalkCollisionCfg(geom_names_expr=list(SHELL_COLLISION.geom_names_expr))
 
 # -- Old actuator (XML position, MuJoCo built-in PD + friction) --
 # actuators = DelayedActuatorCfg(

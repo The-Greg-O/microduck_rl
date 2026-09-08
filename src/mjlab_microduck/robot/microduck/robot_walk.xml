@@ -11,7 +11,7 @@
         <geom type="mesh" contype="0" conaffinity="0" group="2"/>
       </default>
       <default class="collision">
-        <geom group="3" contype="1" conaffinity="0"/>  <!-- world contact only: no robot-robot pair (add_shell.py) -->
+        <geom group="3" contype="5" conaffinity="4"/>  <!-- world (bit 1) + the other foot (bit 4), never the shell (add_shell.py) -->
       </default>
     </default>
   </default>
@@ -83,8 +83,10 @@
        to each body's visual mesh extent minus a 3 mm margin.
        contype 1 / conaffinity 0 = touches the world (default 1/1) and
        NEVER another robot geom, so the self_collision subtree sensor
-       cannot see it. group 3 = the group the ToF rays are cast against.
-       Stripped at load by MICRODUCK_NO_SHELL=1. -->
+       cannot see it. The feet keep their own bit (5/4)
+       so the sole-vs-sole pair survives. group 3 = the group the ToF
+       rays are cast against.
+       Stripped at load by MICRODUCK_NO_SHELL=1 (the literal "1"). -->
   <default>
     <default class="shell">
       <geom contype="1" conaffinity="0" group="3" density="0" rgba="0.9 0.45 0.1 0.3"/>

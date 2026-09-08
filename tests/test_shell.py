@@ -7,21 +7,24 @@ cannot make a wrong shell pass.
 What is locked in:
   * containment — each primitive's AABB sits inside its body's visual-mesh AABB
     with at least the 3 mm margin on every side;
-  * the bitmask — over EVERY pair of robot geoms, no contact is possible except
-    between the two self_collision_only geoms that could already touch;
+  * the bitmask — over EVERY pair of robot geoms, the set of pairs MuJoCo could
+    ever produce is EXACTLY the pre-shell set: the shell adds none (it is
+    invisible to the `self_collision` subtree sensor) and removes none (the
+    soles keep their own bit 4, so sole-vs-sole still pairs and the velocity /
+    run tasks' -1.0 `self_collisions` penalty still has something to price);
   * the feet still contact the floor, and the `feet_ground_contact` sensor's
     geom pattern still matches exactly the two soles;
   * a wall in front of the trunk at distance d touches and at d + 2 cm does not;
   * REST HEIGHT — a robot dropped on each of its four sides settles as low as it
     did on the pre-shell ground-contact model, and never on a thigh (#44 refit);
   * every registered task's env cfg still builds and its robot spec compiles;
-  * MICRODUCK_NO_SHELL=1 reproduces the pre-shell geom set byte for byte.
+  * MICRODUCK_NO_SHELL=1 — and only the literal "1" — reproduces the pre-shell
+    geom set byte for byte, read late enough that setting it after import works.
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib
 import itertools
 import subprocess
 import sys
@@ -245,17 +248,26 @@ def test_each_shell_primitive_sits_inside_its_body_mesh_extent(walk_model):
 
 
 @pytest.mark.parametrize("model_fixture", ["walk_model", "walk_entity_model"])
-def test_no_robot_to_robot_pair_through_the_shell_or_the_feet(model_fixture, request):
+def test_no_robot_to_robot_pair_through_the_shell(model_fixture, request):
+    """No shell primitive can ever pair with another geom of the robot.
+
+    The only robot-internal pairs allowed are the ones that existed before the
+    shell: the `self_collision_only` geoms (2/2) among themselves, and the two
+    soles with each other (both 5/4, i.e. bit 4).
+    """
     model = request.getfixturevalue(model_fixture)
+    feet = {mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n) for n in FOOT_GEOMS}
     geoms = collidable_geoms(model)
     for a, b in itertools.combinations(geoms, 2):
         if not can_collide(model, a, b):
             continue
-        # the only robot-internal pairs left must be self_collision_only (2/2)
+        if {a, b} == feet:
+            continue
         for gid in (a, b):
             assert (model.geom_contype[gid], model.geom_conaffinity[gid]) == (2, 2), (
                 f"{geom_name(model, a) or a} and {geom_name(model, b) or b} can "
-                "collide, but only the self_collision_only geoms may"
+                "collide, but only the self_collision_only geoms and the two "
+                "soles may"
             )
 
 
@@ -267,24 +279,44 @@ def test_shell_and_feet_can_still_touch_the_world(model_fixture, request):
     for name in list(SHELL_GEOMS) + list(FOOT_GEOMS):
         gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
         assert gid >= 0, name
-        assert model.geom_contype[gid] & 1, f"{name} cannot touch the world"
-        assert model.geom_conaffinity[gid] == 0, f"{name} must have zero affinity"
+        assert model.geom_contype[gid] & C.WORLD_BIT, f"{name} cannot touch the world"
+    for name in SHELL_GEOMS:
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        assert (model.geom_contype[gid], model.geom_conaffinity[gid]) == (
+            C.SHELL_CONTYPE,
+            C.SHELL_CONAFFINITY,
+        ), f"{name} must be world-only (1/0)"
+    for name in FOOT_GEOMS:
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        assert (model.geom_contype[gid], model.geom_conaffinity[gid]) == (
+            C.FEET_CONTYPE,
+            C.FEET_CONAFFINITY,
+        ), f"{name} must keep the feet bit (5/4) or sole-vs-sole is lost"
 
 
-def test_self_collision_sensor_pairs_are_unchanged(walk_model, stripped_walk_model):
-    """The subtree self_collision sensor sees exactly what it saw before.
+def test_the_shell_changes_no_robot_geom_pair_at_all(walk_model, stripped_walk_model):
+    """The pair set of the shelled model IS the pre-shell pair set — exactly.
 
-    Its pairs are the self_collision_only geoms (trunk power_support, both
-    shanks). The shell adds nothing to that set. The ONE deliberate removal is
-    sole-vs-sole: ADR 0011 gives every world-colliding geom zero affinity, so a
-    foot can no longer kick the other foot (nor the other shin's capsule).
+    Nothing added: the shell (contype 1 / conaffinity 0) is invisible to the
+    velocity/run tasks' `self_collision` subtree sensor, whose pairs are the
+    `self_collision_only` geoms (trunk power_support, both shanks).
+
+    Nothing removed either. The first cut of the shell gave every
+    world-colliding geom of the robot conaffinity 0, which silently dropped the
+    sole-vs-sole pair — the only thing in the reward set that prices a policy
+    crossing or overlapping its feet (`feet_distance_penalty` in tasks/mdp.py
+    has no users, and the 2/2 geoms bottom out ~19 mm above the sole). The feet
+    now carry their own bit 4 instead, so that pair is back and no foot-shell
+    pair exists.
     """
     before = possible_robot_pairs(stripped_walk_model)
     after = possible_robot_pairs(walk_model)
 
-    assert not (after - before), f"the shell created new robot-robot pairs: {after - before}"
-    removed = before - after
-    assert removed == {tuple(sorted(FOOT_GEOMS))}, f"unexpected pair change: {removed}"
+    assert after == before, (
+        f"the shell changed the robot's pair set — added {after - before}, "
+        f"removed {before - after}"
+    )
+    assert tuple(sorted(FOOT_GEOMS)) in after, "sole-vs-sole must still be a pair"
 
     def self_collision_only(model, pairs):
         keys = geom_keys(model)
@@ -601,17 +633,28 @@ def test_the_walk_tasks_run_on_the_shelled_model():
     from mjlab.entity import Entity
     from mjlab.tasks.registry import list_tasks, load_env_cfg
 
+    # Compared BY NAME, never by identity against the module's attributes: a
+    # test that reloads microduck_constants would rebind C.get_walk_spec while
+    # the registry keeps the original function, making this test pass or fail
+    # depending on the order pytest happened to run in.
+    walk_spec_fns = {"get_walk_spec", "get_walk_backlash_spec"}
+
     seen = set()
     for task in list_tasks():
         robot = load_env_cfg(task).scene.entities.get("robot")
-        if robot is None or robot.spec_fn not in (C.get_walk_spec, C.get_walk_backlash_spec):
+        if robot is None or robot.spec_fn.__name__ not in walk_spec_fns:
             continue
         seen.add(task)
         model = Entity(robot).spec.compile()
         for name in SHELL_GEOMS:
             gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
             assert gid >= 0, f"{task}: {name} was dropped by the collision cfg"
-            assert model.geom_contype[gid] == 1 and model.geom_conaffinity[gid] == 0
+            assert model.geom_contype[gid] == C.SHELL_CONTYPE
+            assert model.geom_conaffinity[gid] == C.SHELL_CONAFFINITY
+        for name in FOOT_GEOMS:
+            gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+            assert model.geom_contype[gid] == C.FEET_CONTYPE
+            assert model.geom_conaffinity[gid] == C.FEET_CONAFFINITY
     assert seen, "no task loads the walk model any more"
 
 
@@ -630,43 +673,86 @@ def test_strip_switch_reproduces_the_pre_shell_geom_set(xml):
     )
     for name in FOOT_GEOMS:
         gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        assert model.geom_conaffinity[gid] == 1, "the feet must get their affinity back"
+        assert (model.geom_contype[gid], model.geom_conaffinity[gid]) == (1, 1), (
+            "the feet must get the pre-shell 1/1 mask back"
+        )
 
 
 def test_the_env_var_wires_all_the_way_to_the_built_robot(monkeypatch):
+    """MICRODUCK_NO_SHELL=1 set AFTER import still reaches the built robot.
+
+    No importlib.reload: `no_shell()` and `WALK_COLLISION.resolve()` both read
+    the environment when the entity is built, so the spec and its collision cfg
+    are decided together. (Reloading the module here used to rebind
+    C.get_walk_spec out from under the task registry, which made every test
+    that filtered tasks by spec_fn identity order-dependent.)
+    """
     from mjlab.entity import Entity
 
     monkeypatch.setenv("MICRODUCK_NO_SHELL", "1")
-    try:
-        mod = importlib.reload(C)
-        assert mod.NO_SHELL is True
-        assert mod.WALK_COLLISION is mod.FULL_COLLISION
-        model = Entity(mod.MICRODUCK_WALK_ROBOT_CFG).spec.compile()
-        assert model.ngeom == PRE_SHELL_NGEOM
-        assert geom_table_sha256(model) == PRE_SHELL_GEOM_SHA256
-        assert not [g for g in range(model.ngeom) if geom_name(model, g).startswith("shell_")]
-        for name in FOOT_GEOMS:
-            gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-            assert model.geom_conaffinity[gid] == 1
-    finally:
-        monkeypatch.delenv("MICRODUCK_NO_SHELL", raising=False)
-        importlib.reload(C)
-    assert C.NO_SHELL is False
+    assert C.no_shell() is True
+    assert C.WALK_COLLISION.resolve() is C.FULL_COLLISION
+    model = Entity(C.MICRODUCK_WALK_ROBOT_CFG).spec.compile()
+    assert model.ngeom == PRE_SHELL_NGEOM
+    assert geom_table_sha256(model) == PRE_SHELL_GEOM_SHA256
+    assert not [g for g in range(model.ngeom) if geom_name(model, g).startswith("shell_")]
+    for name in FOOT_GEOMS:
+        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        assert (model.geom_contype[gid], model.geom_conaffinity[gid]) == (1, 1)
+
+    monkeypatch.delenv("MICRODUCK_NO_SHELL")
+    assert C.no_shell() is False
+    assert C.WALK_COLLISION.resolve() is C.SHELL_COLLISION
+    shelled = Entity(C.MICRODUCK_WALK_ROBOT_CFG).spec.compile()
+    assert shelled.ngeom == PRE_SHELL_NGEOM + len(SHELL_GEOMS)
+
+
+@pytest.mark.parametrize("value", ["true", "yes", "on", "TRUE", "0", "", "11", " 1"])
+def test_only_the_literal_1_strips_the_shell(monkeypatch, value):
+    """One rule everywhere (fork, grgworld, lab): the literal "1", nothing else."""
+    monkeypatch.setenv("MICRODUCK_NO_SHELL", value)
+    assert C.no_shell() is False
+    assert C.get_walk_spec().compile().ngeom == PRE_SHELL_NGEOM + len(SHELL_GEOMS)
 
 
 # ── the injection script itself ──────────────────────────────────────────────
 
 
 def test_add_shell_is_idempotent(tmp_path):
-    """A second run must add nothing (the committed models are already shelled)."""
+    """A second run must add nothing (the committed models are already shelled).
+
+    Run on a COPY: if the script's `class="shell"` guard ever regresses it opens
+    the file for writing before anything asserts, and the tracked model — which
+    the lab and grgworld both load — would be silently double-shelled.
+    """
+    xml = tmp_path / C.MICRODUCK_WALK_XML.name
+    xml.write_bytes(C.MICRODUCK_WALK_XML.read_bytes())
+    before = xml.read_bytes()
+
     result = subprocess.run(
-        [sys.executable, str(ADD_SHELL), str(C.MICRODUCK_WALK_XML)],
+        [sys.executable, str(ADD_SHELL), str(xml)],
         capture_output=True,
         text=True,
     )
     assert result.returncode == 1
     assert "already contains a shell" in result.stdout
-    # and the file is untouched
-    assert mujoco.MjModel.from_xml_path(str(C.MICRODUCK_WALK_XML)).ngeom == PRE_SHELL_NGEOM + len(
-        SHELL_GEOMS
-    )
+    assert xml.read_bytes() == before, "a refused run must not touch the file"
+
+
+def test_add_shell_replace_is_a_byte_stable_round_trip(tmp_path):
+    """--replace on an already-shelled model reproduces it exactly.
+
+    This is what re-applies the shell to the committed robot_walk.xml, so a
+    round trip that is not byte-stable means the tracked model and a fresh
+    export have drifted apart.
+    """
+    for src in (C.MICRODUCK_WALK_XML, C.MICRODUCK_WALK_BACKLASH_XML):
+        xml = tmp_path / src.name
+        xml.write_bytes(src.read_bytes())
+        result = subprocess.run(
+            [sys.executable, str(ADD_SHELL), str(xml), "--replace"],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert xml.read_bytes() == src.read_bytes(), f"{src.name} is not round-trip stable"
