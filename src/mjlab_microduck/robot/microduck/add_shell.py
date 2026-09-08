@@ -5,8 +5,8 @@ The exported walk model touches the world through its two foot soles and
 nothing else, so a policy trained on it cannot feel a wall or a chair leg.
 This script adds one hand-fit primitive per major link:
 
-    trunk  box       neck   capsule    head   box
-    thigh  capsule   shank  capsule    (feet keep their sole meshes)
+    trunk  box       neck   capsule    head   capsule
+    shank  capsule   (feet keep their sole meshes; the THIGH gets nothing)
 
 and rewires the contact bitmask so those primitives touch the WORLD only:
 
@@ -25,11 +25,47 @@ Group 3 is the group the range grid and the ToF detector cast rays against
 (grgworld ``senses.py`` masks groups 0 and 3), so the shell is what another
 grg sees.
 
+THE THIGH CARRIES NO SHELL, AND THE HEAD IS A CAPSULE, NOT A BOX (#44 refit).
+The first cut of this script fitted a primitive to every major link, thighs and
+head included, and that model could not get back up: a grg that fell on its
+side came to rest on ``shell_head`` plus a thigh capsule with its trunk 74 mm
+off the floor against 37 mm on the old ground-contact model, so the stand
+policy never got its legs under it (grgworld #45: 1858 falls in a 2 h office
+day, the chain cycling fallen -> recovering -> fallen).
+
+The thigh AABB (73 x 77 x 58 mm) is dominated by the hip servo block, not by
+the leg, so the inscribed capsule came out r = 26.1 mm with only 19 mm of
+segment — a near-sphere, the fattest thing on the robot, and the leg had to
+fold through it. The head box, meanwhile, is a rectangular prism where the real
+head shell tapers, so its front-bottom corner propped the robot up nose-down.
+
+Settled trunk height after a 2 s limp drop onto each side, against the old
+ground-contact model (``robot_groundcontact.xml`` — the model grgworld used
+before the shell), measured by
+``tests/test_shell.py::test_a_fallen_robot_rests_as_low_as_before_the_shell``:
+
+    candidate                          left   right   back   front   (mm)
+    old ground-contact model           36.6    36.6   46.0    28.5
+    shell as first merged              73.6    73.5   48.7    43.9
+    (a) thigh box from the AABB        79.7    79.8   53.8    44.6
+    (b) thigh capsule @ shank radius   63.3    63.5   48.7    43.9
+    (c) NO thigh geom                  39.8    40.4   48.7    43.9
+    (c) + head capsule  <- CHOSEN      38.7    39.3   48.7    33.7
+
+(a) and (b) both leave the side rest 25-43 mm high, so the thigh has to go —
+which is also what the old ground-contact model did: it carried hip collision
+meshes but none on the thigh. With the thighs gone the front fall was still
+15 mm high on the head box; the inscribed capsule (the same fit rule the neck
+and shanks already use) brings it to +5 mm. The head still touches the floor in
+all four falls — the capsule is a smaller head, not a missing one.
+
 Sizes are fitted from the COMPILED visual-mesh AABB of each body, in that
 body's own local frame, shrunk by ``--margin`` (3 mm) on every side — see
 ``BODY_AABB`` below for the measured extents, and ``measure_body_visual_aabb``
 for the helper that produced them. ``--refit`` re-measures the file being
-processed instead of trusting the table (needs mujoco installed).
+processed instead of trusting the table (needs mujoco installed); ``--replace``
+strips an existing shell before injecting the new one, so re-fitting an
+already-shelled committed model is one command.
 
 Meant to run as the LAST post_import_command of an onshape-to-robot config
 (after add_backlash.py, see config_mjcf_walk.json / config_mjcf_walk_backlash.json)
@@ -37,7 +73,9 @@ but works standalone on any already-exported robot xml:
 
     python3 add_shell.py robot_walk.xml
 
-Idempotent: a second run detects its own ``class="shell"`` default and refuses.
+Idempotent: a second run detects its own ``class="shell"`` default and refuses
+(unless ``--replace`` is given, which strips first and then re-injects; that
+round-trip is byte-stable, so re-running it changes nothing).
 
 The shell can be stripped at load time with ``MICRODUCK_NO_SHELL=1`` — see
 ``microduck_constants.py`` (the geoms are deleted from the MjSpec and the feet
@@ -67,9 +105,10 @@ BODY_AABB: dict[str, tuple[tuple[float, float, float], tuple[float, float, float
     "neck": ((-0.010000, -0.059569, -0.000087), (0.010000, 0.009569, 0.029047)),
     # size 0.0743 x 0.0924 x 0.1324 — head shells, jaw, face, lens, pi
     "jaw_soft": ((-0.028660, -0.045950, -0.089621), (0.045664, 0.046417, 0.042823)),
-    # size 0.0734 x 0.0774 x 0.0582 — thigh bracket + rigidity plate + xl330s
-    "upper_leg_left": ((-0.033118, -0.018365, -0.007421), (0.040252, 0.059013, 0.050744)),
-    "upper_leg_right": ((-0.040252, -0.018366, -0.007421), (0.033118, 0.059013, 0.050743)),
+    # NO ENTRY for upper_leg_left / upper_leg_right: the thigh carries no shell.
+    # Its extent (0.0734 x 0.0774 x 0.0582 — thigh bracket + rigidity plate +
+    # xl330s) is the hip servo block, not the leg, and the near-sphere that fits
+    # inside it stopped the robot standing back up. See the header.
     # size 0.0200 x 0.0617 x 0.0330 — shank plate + ankle xl330 (axes swap L/R)
     "leg": ((-0.010000, -0.010138, -0.026087), (0.010000, 0.051569, 0.006865)),
     "leg_2": ((-0.051569, -0.010000, -0.026087), (0.010138, 0.010000, 0.006865)),
@@ -92,9 +131,7 @@ class ShellPart:
 SHELL_PARTS: tuple[ShellPart, ...] = (
     ShellPart("shell_trunk", "trunk_base", "box"),
     ShellPart("shell_neck", "neck", "capsule"),
-    ShellPart("shell_head", "jaw_soft", "box"),
-    ShellPart("shell_thigh_left", "upper_leg_left", "capsule"),
-    ShellPart("shell_thigh_right", "upper_leg_right", "capsule"),
+    ShellPart("shell_head", "jaw_soft", "capsule"),
     ShellPart("shell_shank_left", "leg", "capsule"),
     ShellPart("shell_shank_right", "leg_2", "capsule"),
 )
@@ -263,6 +300,43 @@ def patch_collision_default(lines: list[str]) -> bool:
     return False
 
 
+SHELL_BLOCK_START = "<!-- Shell injected by add_shell.py"
+PATCHED_COMMENT = "<!-- world contact only: no robot-robot pair (add_shell.py) -->"
+
+
+def strip_shell_lines(lines: list[str]) -> list[str]:
+    """Undo a previous run: drop the shell geoms, the `shell` default block and
+    the comment this script left on the `collision` default.
+
+    Leaves the file byte-identical to the pre-shell export apart from the
+    collision default's contype/conaffinity, which the re-injection rewrites
+    anyway. Used by --replace so a refit is one command instead of
+    "git checkout the export, then re-run".
+    """
+    out: list[str] = []
+    skipping = False
+    seen_shell_default = False
+    closes = 0
+    for line in lines:
+        if skipping:
+            if '<default class="shell">' in line:
+                seen_shell_default = True
+            if seen_shell_default and "</default>" in line:
+                closes += 1
+                if closes == 2:
+                    skipping = False
+            continue
+        if SHELL_BLOCK_START in line:
+            skipping = True
+            continue
+        if '<geom' in line and 'class="shell"' in line:
+            continue
+        if PATCHED_COMMENT in line:
+            line = line.replace(PATCHED_COMMENT, "").rstrip() + "\n"
+        out.append(line)
+    return out
+
+
 def insert_geoms(lines: list[str], geoms: dict[str, str]) -> list[str]:
     """Insert each body's shell geom after that body's last direct-child geom.
 
@@ -318,6 +392,12 @@ def main() -> int:
         help="re-measure the body extents from THIS file's compiled model "
         "instead of the BODY_AABB table (requires mujoco)",
     )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="strip an existing shell first, then inject the current one "
+        "(so a refit is one command on an already-shelled model)",
+    )
     args = parser.parse_args()
 
     aabb = BODY_AABB
@@ -334,8 +414,11 @@ def main() -> int:
         lines = f.readlines()
 
     if any('class="shell"' in line for line in lines):
-        print(f"[add_shell] {args.xml} already contains a shell — aborting.")
-        return 1
+        if not args.replace:
+            print(f"[add_shell] {args.xml} already contains a shell — aborting.")
+            return 1
+        lines = strip_shell_lines(lines)
+        print(f"[add_shell] stripped the existing shell from {args.xml} (--replace).")
 
     try:
         built = build_shell_geoms(aabb, args.margin)

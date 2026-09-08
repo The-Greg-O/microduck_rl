@@ -46,8 +46,10 @@ assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {
 
 # --- The shell (go-grgs ADR 0011 / docs/specs/shell.md) ----------------------
 # add_shell.py injects world-collision primitives into the walk models
-# (shell_trunk, shell_neck, shell_head, shell_thigh_left/right,
-# shell_shank_left/right) so a policy can feel a wall, and gives the shell AND
+# (shell_trunk, shell_neck, shell_head, shell_shank_left/right — no thigh
+# primitive: see add_shell.py's header and the #44 refit, a thigh capsule left
+# a fallen robot's trunk 74 mm up and the stand policy could never recover)
+# so a policy can feel a wall, and gives the shell AND
 # the feet conaffinity 0: they touch the world (default contype/conaffinity
 # 1/1) and can never touch another robot geom, so the self_collision subtree
 # sensor cannot see them. MICRODUCK_NO_SHELL=1 strips the shell at load and

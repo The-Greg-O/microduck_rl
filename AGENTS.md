@@ -85,9 +85,18 @@ Never launch a long run without one.
   (walk / groundcontact / rollers) so backlash A/B comparisons are unconfounded.
 - **The walk models carry a SHELL** (`add_shell.py`, last post-import command of
   `config_mjcf_walk*.json`, already applied to the committed
-  `robot_walk{,_backlash}.xml`): `shell_trunk/neck/head/thigh_*/shank_*`
-  primitives fitted to each body's visual-mesh extent minus 3 mm, in ray group
-  3, so a policy can feel a wall (go-grgs ADR 0011). Their bitmask is
+  `robot_walk{,_backlash}.xml`): `shell_trunk` (box), `shell_neck`,
+  `shell_head`, `shell_shank_left/right` (capsules), fitted to each body's
+  visual-mesh extent minus 3 mm, in ray group 3, so a policy can feel a wall
+  (go-grgs ADR 0011). **The thighs carry nothing and the head is a capsule, not
+  a box** — the #44 refit: the thigh's AABB is its hip servo block, so the
+  inscribed capsule was a near-sphere of radius 26 mm, and a grg that fell on
+  its side rested on it with its trunk 74 mm up against 37 mm on the old
+  ground-contact model, which no stand policy could recover from (grgworld #45,
+  1858 falls in a 2 h day). Rest height on all four sides is now within 5 mm of
+  the pre-shell model and locked by
+  `test_a_fallen_robot_rests_as_low_as_before_the_shell`; measure any new shell
+  primitive that way before adding it. Their bitmask is
   **contype 1 / conaffinity 0 — and so is the feet's**: they touch the world
   (default 1/1) and can never touch another robot geom, so the `self_collision`
   subtree sensor is unchanged (the `self_collision_only` 2/2 geoms keep their

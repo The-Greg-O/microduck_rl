@@ -156,7 +156,6 @@
             <geom type="mesh" class="visual" pos="0.022 0.0357771 -0.004" quat="0 0 -0 1" mesh="seeed_bearing__configuration__22x16x4" material="seeed_bearing__configuration__22x16x4_material"/>
             <!-- Part xl330_5 -->
             <geom type="mesh" class="visual" pos="0 -0 0.0125" quat="0.5 0.5 -0.5 0.5" mesh="xl330" material="xl330_material"/>
-            <geom name="shell_thigh_left" class="shell" type="capsule" fromto="0.003567 0.0107175 0.0216615 0.003567 0.0299305 0.0216615" size="0.0260825"/>
             <!-- Link leg -->
             <body name="leg" pos="0.022 0.0357771 -0.004" quat="0 0.707107 0.707107 0">
               <!-- Joint from upper_leg_left to leg -->
@@ -262,7 +261,7 @@
               <geom type="mesh" class="visual" pos="0.015435 -1.13778e-05 -0.06001" quat="0.5 -0.5 -0.5 0.5" mesh="pcb__raspberry_pi_zero_2_w" material="pcb__raspberry_pi_zero_2_w_material"/>
               <!-- Part speaker -->
               <geom type="mesh" class="visual" pos="0.01 -0.016786 0.0260226" quat="0.5 0.5 0.5 0.5" mesh="speaker" material="speaker_material"/>
-              <geom name="shell_head" class="shell" type="box" pos="0.008502 0.0002335 -0.023399" size="0.034162 0.0431835 0.063222"/>
+              <geom name="shell_head" class="shell" type="capsule" fromto="0.008502 0.0002335 -0.052459 0.008502 0.0002335 0.005661" size="0.034162"/>
               <!-- Frame head_camera -->
               <site group="3" name="head_camera" pos="0.0155 -9.13778e-05 -0.0733" quat="0.707107 -0 0.707107 0"/>
               <camera name="head_camera" pos="0.0155 -9.13778e-05 -0.0733" quat="0 0 -1 0"/>
@@ -313,7 +312,6 @@
             <geom type="mesh" class="visual" pos="-0 -0 -0.0425" quat="0.5 -0.5 0.5 0.5" mesh="upper_leg_right" material="upper_leg_right_material"/>
             <!-- Part xl330_14 -->
             <geom type="mesh" class="visual" pos="-0 -0 0.0125" quat="0.5 0.5 -0.5 0.5" mesh="xl330" material="xl330_material"/>
-            <geom name="shell_thigh_right" class="shell" type="capsule" fromto="-0.003567 0.010716 0.021661 -0.003567 0.029931 0.021661" size="0.026082"/>
             <!-- Link leg_2 -->
             <body name="leg_2" pos="-0.022 0.0357771 -0.004" quat="0 1 -0 -0">
               <!-- Joint from upper_leg_right to leg_2 -->

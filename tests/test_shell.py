@@ -12,6 +12,8 @@ What is locked in:
   * the feet still contact the floor, and the `feet_ground_contact` sensor's
     geom pattern still matches exactly the two soles;
   * a wall in front of the trunk at distance d touches and at d + 2 cm does not;
+  * REST HEIGHT — a robot dropped on each of its four sides settles as low as it
+    did on the pre-shell ground-contact model, and never on a thigh (#44 refit);
   * every registered task's env cfg still builds and its robot spec compiles;
   * MICRODUCK_NO_SHELL=1 reproduces the pre-shell geom set byte for byte.
 """
@@ -33,19 +35,29 @@ import mjlab_microduck.robot.microduck_constants as C
 
 ROBOT_DIR = Path(C.MICRODUCK_WALK_XML).parent
 SCENE_WALK_XML = ROBOT_DIR / "scene_walk.xml"
+# The PRE-SHELL reference for the rest-height test: scene.xml wraps
+# robot_groundcontact.xml, the model grgworld loaded before ticket #44 pointed
+# it at robot_walk.xml. Same floor, same STAND keyframe, so the two scenes are
+# directly comparable. (The strip switch is NOT the reference here: the walk
+# export's only world-colliding geoms are the two soles, so a stripped robot on
+# its side has nothing to land on and falls through the floor — measured at
+# -113 mm, not a rest height at all.)
+OLD_SCENE_XML = ROBOT_DIR / "scene.xml"
 ADD_SHELL = ROBOT_DIR / "add_shell.py"
 
 MARGIN = 0.003  # m — add_shell.py's DEFAULT_MARGIN
 
+# The thigh deliberately carries NO shell and the head is a capsule, not a box:
+# see add_shell.py's header and test_a_fallen_robot_rests_as_low_as_before.
 SHELL_GEOMS = {
     "shell_trunk": ("trunk_base", mujoco.mjtGeom.mjGEOM_BOX),
     "shell_neck": ("neck", mujoco.mjtGeom.mjGEOM_CAPSULE),
-    "shell_head": ("jaw_soft", mujoco.mjtGeom.mjGEOM_BOX),
-    "shell_thigh_left": ("upper_leg_left", mujoco.mjtGeom.mjGEOM_CAPSULE),
-    "shell_thigh_right": ("upper_leg_right", mujoco.mjtGeom.mjGEOM_CAPSULE),
+    "shell_head": ("jaw_soft", mujoco.mjtGeom.mjGEOM_CAPSULE),
     "shell_shank_left": ("leg", mujoco.mjtGeom.mjGEOM_CAPSULE),
     "shell_shank_right": ("leg_2", mujoco.mjtGeom.mjGEOM_CAPSULE),
 }
+
+THIGH_BODIES = ("upper_leg_left", "upper_leg_right")
 
 FOOT_GEOMS = ("left_foot_collision", "right_foot_collision")
 
@@ -417,6 +429,149 @@ def test_without_the_shell_the_same_wall_is_a_phantom(scene_model):
     model = spec.compile()
     pairs = _contact_pairs(model, _stand(model))
     assert not any("wall" in p[0] + p[1] for p in pairs)
+
+
+# ── rest height: a fallen grg must lie as low as it did before the shell ─────
+#
+# grgworld #45: with the shell as first merged, a grg that fell on its side came
+# to rest on shell_head plus a thigh capsule with its trunk 74 mm up (37 mm on
+# the old ground-contact model). The stand policy could never fold its legs
+# under a trunk that high, so the chain cycled fallen -> recovering -> fallen,
+# 1858 falls in a 2 h office day. This is that regression, at the model door.
+
+REST_TOL = 0.010  # m — the shelled model must settle within 10 mm of the old one
+DROP_SECONDS = 2.0
+DROP_LIFT = 0.03  # m of air under the lowest colliding point before letting go
+
+# free-joint rotations off STAND: (axis, angle). +90 deg of roll puts the robot
+# on its left side, -90 deg of pitch on its back.
+DROP_SIDES: dict[str, tuple[tuple[float, float, float], float]] = {
+    "left": ((1.0, 0.0, 0.0), np.pi / 2),
+    "right": ((1.0, 0.0, 0.0), -np.pi / 2),
+    "back": ((0.0, 1.0, 0.0), -np.pi / 2),
+    "front": ((0.0, 1.0, 0.0), np.pi / 2),
+}
+
+# Bodies the robot is ALLOWED to come to rest on. The old ground-contact model
+# lands on its head shells, its hips, its trunk battery and its soles; the shell
+# has no hip primitive, so the shelled model uses the trunk and the shanks
+# instead. `upper_leg_*` is absent on purpose — resting on a thigh is exactly
+# the failure this test exists to catch.
+RESTING_BODIES = frozenset(
+    {"jaw_soft", "trunk_base", "leg", "leg_2", "ankle_left", "ankle_right", "hip_l", "hip_l_2"}
+)
+
+
+def _settle_on_side(xml_path: Path, side: str) -> tuple[float, set[str], set[str]]:
+    """Drop the robot onto `side` with the servos LIMP and let it settle.
+
+    Limp = zero actuator gain and bias, i.e. no motor torque at all, so what the
+    robot comes to rest on is decided by its collision geometry and gravity and
+    by nothing else. Returns (trunk height, floor-contact geom names, the bodies
+    those geoms belong to).
+    """
+    model = mujoco.MjModel.from_xml_path(str(xml_path))  # fresh: we mutate it
+    model.actuator_gainprm[:, 0] = 0.0
+    model.actuator_biasprm[:, :] = 0.0
+
+    data = mujoco.MjData(model)
+    mujoco.mj_resetDataKeyframe(
+        model, data, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "STAND")
+    )
+    axis, angle = DROP_SIDES[side]
+    quat = np.zeros(4)
+    mujoco.mju_axisAngle2Quat(quat, np.array(axis), angle)
+    data.qpos[3:7] = quat
+
+    # lift it so DROP_LIFT of air sits under its lowest colliding point
+    mujoco.mj_forward(model, data)
+    lowest = min(
+        data.geom_xpos[g][2] - model.geom_rbound[g]
+        for g in range(model.ngeom)
+        if model.geom_bodyid[g] != 0 and (model.geom_contype[g] or model.geom_conaffinity[g])
+    )
+    data.qpos[2] += DROP_LIFT - lowest
+    data.qvel[:] = 0.0
+    data.ctrl[:] = 0.0
+
+    for _ in range(int(DROP_SECONDS / model.opt.timestep)):
+        mujoco.mj_step(model, data)
+
+    trunk = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "trunk_base")
+    on_floor = {
+        c.geom1 if geom_name(model, c.geom2) == "floor" else c.geom2
+        for c in data.contact[: data.ncon]
+        if "floor" in (geom_name(model, c.geom1), geom_name(model, c.geom2))
+    }
+    return (
+        float(data.xpos[trunk][2]),
+        {geom_name(model, g) for g in on_floor},
+        {body_name(model, g) for g in on_floor},
+    )
+
+
+@pytest.fixture(scope="module")
+def old_rest_heights() -> dict[str, float]:
+    """Settled trunk height per side on the PRE-SHELL ground-contact model."""
+    return {side: _settle_on_side(OLD_SCENE_XML, side)[0] for side in DROP_SIDES}
+
+
+@pytest.mark.parametrize("side", list(DROP_SIDES))
+def test_a_fallen_robot_rests_as_low_as_before_the_shell(side, old_rest_heights):
+    """Trunk height 2 s after a limp drop, shelled walk vs old ground-contact.
+
+    Measured (mm, trunk_base world z), old -> new:
+
+        side     old    new    delta
+        left     36.6   38.7   +2.1
+        right    36.6   39.3   +2.7
+        back     46.0   48.7   +2.7
+        front    28.5   33.7   +5.2
+
+    For the record, what the rejected fits gave on the two side falls (see
+    add_shell.py's header for the full table): the shell as first merged 73.6 /
+    73.5, a thigh box 79.7 / 79.8, a thigh capsule at the shank's radius 63.3 /
+    63.5 — all far outside the 10 mm the stand policy can work with.
+    """
+    old = old_rest_heights[side]
+    new, geoms, bodies = _settle_on_side(SCENE_WALK_XML, side)
+
+    assert abs(new - old) <= REST_TOL, (
+        f"fallen on its {side}, the shelled robot's trunk settles at "
+        f"{new * 1000:.1f} mm against {old * 1000:.1f} mm on the pre-shell "
+        f"ground-contact model ({(new - old) * 1000:+.1f} mm) — it is resting on "
+        f"{sorted(geoms)}, and a stand policy cannot get its legs under a trunk "
+        "held that high"
+    )
+
+
+@pytest.mark.parametrize("side", list(DROP_SIDES))
+def test_a_fallen_robot_never_rests_on_a_thigh(side):
+    """It comes down on head / trunk / shanks / soles — the parts that did before."""
+    _, geoms, bodies = _settle_on_side(SCENE_WALK_XML, side)
+    assert geoms, f"the robot dropped on its {side} is not touching the floor at all"
+    assert not (bodies & set(THIGH_BODIES)), (
+        f"fallen on its {side}, the robot is resting on a thigh: {sorted(geoms)}"
+    )
+    assert bodies <= RESTING_BODIES, (
+        f"fallen on its {side}, the robot is resting on {sorted(bodies - RESTING_BODIES)}, "
+        f"which the pre-shell model never came down on (contacts: {sorted(geoms)})"
+    )
+
+
+def test_the_thighs_carry_no_shell_primitive(walk_model):
+    """#44 refit: the thigh AABB is the hip servo block, so its inscribed capsule
+    was a near-sphere of radius 26.1 mm — the fattest thing on the robot, and the
+    leg had to fold through it. The old ground-contact model had hip collision
+    meshes and none on the thigh; the shell now matches that."""
+    for body in THIGH_BODIES:
+        bid = mujoco.mj_name2id(walk_model, mujoco.mjtObj.mjOBJ_BODY, body)
+        assert bid >= 0, body
+        assert not [
+            g
+            for g in range(walk_model.ngeom)
+            if walk_model.geom_bodyid[g] == bid and geom_name(walk_model, g).startswith("shell_")
+        ], f"{body} must carry no shell primitive"
 
 
 # ── every registered task still builds, on CPU ───────────────────────────────
