@@ -117,10 +117,27 @@ and confound their comparisons. That is a robot-model change, not a task knob,
 so it belongs in its own round with its own A/B.
 
 UPDATE (go-grgs #44 / ADR 0011): the robot-model half of that blocker is gone —
-`add_shell.py` now puts world-collision primitives on the trunk, neck, head,
-thighs and shanks of the walk model, on their own `SHELL_COLLISION` cfg so only
-the walk tasks are affected. A box in front of an env is now a real wall the
-trunk can hit. The A/B round itself is still owed.
+`add_shell.py` now puts FIVE world-collision primitives on the walk model, on
+their own `SHELL_COLLISION` cfg so only the walk tasks are affected:
+
+    shell_trunk  box       shell_neck   capsule    shell_head  capsule
+    shell_shank_left / shell_shank_right  capsules
+
+THE THIGHS CARRY NOTHING, deliberately, and the head is a capsule rather than
+the box the first cut used (#44 refit). The thigh AABB is dominated by the hip
+servo block (73 x 77 x 58 mm), so the capsule inscribed in it came out r =
+26.1 mm — a near-sphere, the fattest thing on the robot — and a grg that fell on
+its side came to rest on it with its trunk 74 mm off the floor against 37 mm on
+the pre-shell ground-contact model. No stand policy could fold its legs under a
+trunk held that high: grgworld #45, 1858 falls in a 2 h office day. Dropping the
+thigh brings the side rest to 39 mm and the head capsule brings the face-down
+rest from 44 mm to 34 mm; the full table is in `add_shell.py`'s header and the
+heights are locked by
+`tests/test_shell.py::test_a_fallen_robot_rests_as_low_as_before_the_shell`.
+
+So a box in front of an env is now a real wall the trunk, neck, head or a shank
+can hit — but NOT a thigh, and obstacle heights and any `wall_contact` cost must
+be sized against those five primitives only. The A/B round itself is still owed.
 
 Deliberate deviations from the transcribed recipe, and why:
   - `head_pose_bias` (+ its curriculum) is kept from the fork's velocity

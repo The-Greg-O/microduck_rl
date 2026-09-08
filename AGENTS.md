@@ -96,16 +96,30 @@ Never launch a long run without one.
   1858 falls in a 2 h day). Rest height on all four sides is now within 5 mm of
   the pre-shell model and locked by
   `test_a_fallen_robot_rests_as_low_as_before_the_shell`; measure any new shell
-  primitive that way before adding it. Their bitmask is
-  **contype 1 / conaffinity 0 — and so is the feet's**: they touch the world
-  (default 1/1) and can never touch another robot geom, so the `self_collision`
-  subtree sensor is unchanged (the `self_collision_only` 2/2 geoms keep their
-  bit). `SHELL_COLLISION` in `microduck_constants.py` must repeat that mask —
-  mjlab's `CollisionCfg` rewrites contype/conaffinity and disables every named
-  geom it doesn't match, so the XML alone is not enough. `MICRODUCK_NO_SHELL=1`
-  strips the shell at load and restores the feet, reproducing the pre-shell
-  model exactly (`tests/test_shell.py` locks all of it at the compiled-model
-  door). Name new world-collision geoms `shell_*`, never `*_collision`.
+  primitive that way before adding it. The bitmask uses three bits — 1 = the
+  world (whose geoms are MuJoCo's default 1/1), 2 = the export's
+  `self_collision_only` class, 4 = the two soles' own bit — so the **shell is
+  contype 1 / conaffinity 0** (world only) and the **feet are contype 1|4 = 5 /
+  conaffinity 4** (world, plus each other). The robot's pair set is therefore
+  EXACTLY the pre-shell one: the `self_collision` subtree sensor sees no shell,
+  and sole-vs-sole — the only pair the `self_collisions` penalty can price — is
+  still there. Do not give the feet conaffinity 0; that silently deletes the
+  penalty's last pair, and `test_the_shell_changes_no_robot_geom_pair_at_all`
+  fails if you do. `SHELL_COLLISION` in `microduck_constants.py` must repeat
+  both masks — mjlab's `CollisionCfg` rewrites contype/conaffinity and disables
+  every named geom it doesn't match, so the XML alone is not enough.
+  `MICRODUCK_NO_SHELL` strips the shell at load and restores the feet to 1/1,
+  reproducing the pre-shell model exactly. **Its one rule, identical in this
+  repo, grgworld and the lab: the variable strips the shell if and only if it is
+  the literal string `1`** — not `true`, not `yes`, not `TRUE`. This repo reads
+  it fresh inside `no_shell()` every time a walk spec or its collision cfg is
+  built (never at import), so setting it after `import mjlab_microduck` works
+  and no test needs `importlib.reload` — reloading that module rebinds
+  `get_walk_spec` out from under the task registry and makes any test that
+  filters tasks by `spec_fn` identity order-dependent, so compare by
+  `spec_fn.__name__`. (`tests/test_shell.py` locks all of it at the
+  compiled-model door.) Name new world-collision geoms `shell_*`, never
+  `*_collision`.
 
 ## Building a new env — the workflow
 

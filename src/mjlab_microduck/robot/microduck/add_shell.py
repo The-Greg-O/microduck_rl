@@ -8,18 +8,36 @@ This script adds one hand-fit primitive per major link:
     trunk  box       neck   capsule    head   capsule
     shank  capsule   (feet keep their sole meshes; the THIGH gets nothing)
 
-and rewires the contact bitmask so those primitives touch the WORLD only:
+and rewires the contact bitmask so those primitives touch the WORLD only,
+WITHOUT taking away the one robot-robot pair that was already there:
 
-    <default class="shell">   <geom contype="1" conaffinity="0" group="3"/>
-    <default class="collision">  ... conaffinity="0"   (the feet)
+    <default class="shell">      <geom contype="1" conaffinity="0" group="3"/>
+    <default class="collision">  <geom contype="5" conaffinity="4"/>  (the feet)
 
 MuJoCo pairs two geoms when ``contype1 & conaffinity2 || contype2 &
-conaffinity1``. With conaffinity 0 on every world-colliding geom of the robot
-(shell and feet alike) the shell touches the floor/walls/furniture/people
-(contype 1 vs the world's default conaffinity 1) and can never touch another
-part of the robot — so the velocity task's ``self_collision`` subtree sensor
-cannot see the shell, and a foot cannot kick the other shin's capsule. The
-``self_collision_only`` geoms (contype/conaffinity 2) are untouched.
+conaffinity1``. Three bits are in play on the robot:
+
+    bit 1 (=1)  the WORLD's bit — floor, walls, furniture, people, the ball
+                are MuJoCo's default 1/1
+    bit 2 (=2)  the export's ``self_collision_only`` class (2/2), untouched
+    bit 4 (=4)  the FEET's own bit
+
+so, with the shell at contype 1 / conaffinity 0 and the feet at contype
+1|4 = 5 / conaffinity 4:
+
+    shell  vs world  1 & 1 -> contact         (a policy can feel a wall)
+    foot   vs world  5 & 1 -> contact         (the soles still stand on it)
+    foot   vs foot   5 & 4 -> contact         (KEPT: the sole-vs-sole pair the
+                                               velocity task's -1.0
+                                               self_collisions penalty prices)
+    shell  vs foot   1 & 4 = 0, 5 & 0 = 0 -> none
+    shell  vs shell  1 & 0 -> none
+    shell/foot vs self_collision_only  1&2 / 5&2 / 2&0 / 2&4 = 0 -> none
+
+The pair set of the shelled model is therefore EXACTLY the pair set of the
+pre-shell export: the shell adds no robot-robot pair and removes none, so the
+velocity/run tasks' ``self_collision`` subtree sensor sees what it always saw
+and a foot still cannot be crossed over the other one for free.
 
 Group 3 is the group the range grid and the ToF detector cast rays against
 (grgworld ``senses.py`` masks groups 0 and 3), so the shell is what another
@@ -78,8 +96,11 @@ Idempotent: a second run detects its own ``class="shell"`` default and refuses
 round-trip is byte-stable, so re-running it changes nothing).
 
 The shell can be stripped at load time with ``MICRODUCK_NO_SHELL=1`` — see
-``microduck_constants.py`` (the geoms are deleted from the MjSpec and the feet
-get their conaffinity back, reproducing the pre-shell model exactly).
+``microduck_constants.py``. THE RULE IS THE LITERAL STRING "1" AND NOTHING
+ELSE (not "true", not "yes", not "TRUE"); it is the same rule in grgworld's
+``paths.shell_enabled`` and the lab's ``walk_env.shell_enabled``. The geoms are
+deleted from the MjSpec and the feet get their 1/1 mask back, reproducing the
+pre-shell model exactly.
 """
 
 import argparse
@@ -92,6 +113,14 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 DEFAULT_MARGIN = 0.003  # m, taken off every side of the mesh extent
+
+# Contact bitmask (see the header for the full pair table). Mirrored verbatim by
+# SHELL_COLLISION in microduck_constants.py, which has to repeat it because
+# mjlab's CollisionCfg rewrites contype/conaffinity on every geom it matches.
+WORLD_BIT = 1  # the world's geoms are MuJoCo's default 1/1
+FEET_BIT = 4  # the two soles' own bit (bit 2 belongs to self_collision_only)
+SHELL_CONTYPE, SHELL_CONAFFINITY = WORLD_BIT, 0
+FEET_CONTYPE, FEET_CONAFFINITY = WORLD_BIT | FEET_BIT, FEET_BIT  # 5, 4
 
 # Axis-aligned bounding box of every VISUAL geom of the body (group 2), in the
 # body's own local frame, metres, as (lo_xyz, hi_xyz). Measured on the compiled
@@ -264,11 +293,14 @@ def build_shell_default(margin: float) -> str:
         f"       to each body's visual mesh extent minus a {margin * 1000:g} mm margin.\n"
         f"       contype 1 / conaffinity 0 = touches the world (default 1/1) and\n"
         f"       NEVER another robot geom, so the self_collision subtree sensor\n"
-        f"       cannot see it. group 3 = the group the ToF rays are cast against.\n"
-        f"       Stripped at load by MICRODUCK_NO_SHELL=1. -->\n"
+        f"       cannot see it. The feet keep their own bit ({FEET_CONTYPE}/{FEET_CONAFFINITY})\n"
+        f"       so the sole-vs-sole pair survives. group 3 = the group the ToF\n"
+        f"       rays are cast against.\n"
+        f"       Stripped at load by MICRODUCK_NO_SHELL=1 (the literal \"1\"). -->\n"
         f"  <default>\n"
         f'    <default class="shell">\n'
-        f'      <geom contype="1" conaffinity="0" group="3" density="0"'
+        f'      <geom contype="{SHELL_CONTYPE}" conaffinity="{SHELL_CONAFFINITY}"'
+        f' group="3" density="0"'
         f' rgba="{SHELL_RGBA}"/>\n'
         f"    </default>\n"
         f"  </default>\n"
@@ -276,11 +308,15 @@ def build_shell_default(margin: float) -> str:
 
 
 def patch_collision_default(lines: list[str]) -> bool:
-    """Give the `collision` default class conaffinity 0 (world contact only).
+    """Give the `collision` default class the feet mask (5/4).
 
-    The feet are the only geoms of that class in the walk model; in a model that
-    keeps more of them they all become world-only too, which is the ADR's rule.
-    Returns True if the class was found and patched.
+    contype 1|4, conaffinity 4: world contact through bit 1, and contact with
+    each other through bit 4 — so the sole-vs-sole pair the velocity task's
+    `self_collisions` penalty prices survives the shell, while no shell geom
+    (contype 1 / conaffinity 0) can ever pair with a foot. The feet are the only
+    geoms of that class in the walk model; in a model that keeps more of them
+    they all share bit 4, which is the ADR's rule. Returns True if the class was
+    found and patched.
     """
     for i, line in enumerate(lines):
         if not COLLISION_DEFAULT_RE.match(line):
@@ -293,15 +329,20 @@ def patch_collision_default(lines: list[str]) -> bool:
             attrs = re.sub(r'\s*\bcontype="[^"]*"', "", attrs)
             attrs = re.sub(r'\s*\bconaffinity="[^"]*"', "", attrs)
             lines[j] = (
-                f'{indent}<geom{attrs} contype="1" conaffinity="0"/>'
-                f"  <!-- world contact only: no robot-robot pair (add_shell.py) -->\n"
+                f'{indent}<geom{attrs} contype="{FEET_CONTYPE}"'
+                f' conaffinity="{FEET_CONAFFINITY}"/>'
+                f"  <!-- world (bit 1) + the other foot (bit 4), never the shell"
+                f" (add_shell.py) -->\n"
             )
             return True
     return False
 
 
 SHELL_BLOCK_START = "<!-- Shell injected by add_shell.py"
-PATCHED_COMMENT = "<!-- world contact only: no robot-robot pair (add_shell.py) -->"
+# The trailing comment this script leaves on the `collision` default's <geom>.
+# Matched by shape, not by exact text, so --replace can still strip a file
+# written by an older revision of the script (the wording has changed once).
+PATCHED_COMMENT_RE = re.compile(r"\s*<!--[^<>]*\(add_shell\.py\)\s*-->")
 
 
 def strip_shell_lines(lines: list[str]) -> list[str]:
@@ -317,7 +358,8 @@ def strip_shell_lines(lines: list[str]) -> list[str]:
     skipping = False
     seen_shell_default = False
     closes = 0
-    for line in lines:
+    start_line = -1
+    for lineno, line in enumerate(lines, 1):
         if skipping:
             if '<default class="shell">' in line:
                 seen_shell_default = True
@@ -328,12 +370,22 @@ def strip_shell_lines(lines: list[str]) -> list[str]:
             continue
         if SHELL_BLOCK_START in line:
             skipping = True
+            start_line = lineno
             continue
         if '<geom' in line and 'class="shell"' in line:
             continue
-        if PATCHED_COMMENT in line:
-            line = line.replace(PATCHED_COMMENT, "").rstrip() + "\n"
+        patched = PATCHED_COMMENT_RE.sub("", line)
+        if patched != line:
+            line = patched.rstrip() + "\n"
         out.append(line)
+    if skipping:
+        # Without this the loop swallows the rest of the file in silence and the
+        # caller writes a truncated model.
+        raise ValueError(
+            f"the shell block opened at line {start_line} is never closed "
+            '(expected <default class="shell"> followed by two </default>) — '
+            "the file is not one this script wrote; strip it by hand"
+        )
     return out
 
 
@@ -417,7 +469,11 @@ def main() -> int:
         if not args.replace:
             print(f"[add_shell] {args.xml} already contains a shell — aborting.")
             return 1
-        lines = strip_shell_lines(lines)
+        try:
+            lines = strip_shell_lines(lines)
+        except ValueError as exc:
+            print(f"[add_shell] ERROR: {exc}")
+            return 1
         print(f"[add_shell] stripped the existing shell from {args.xml} (--replace).")
 
     try:
@@ -453,7 +509,10 @@ def main() -> int:
     print(f"[add_shell] added {len(built)} shell geoms to {args.xml} (margin {args.margin} m):")
     for part, _, summary in built:
         print(f"    {part.name:<19s} on {part.body:<16s} {summary}")
-    print("[add_shell] feet (class collision) set to conaffinity 0: world contact only.")
+    print(
+        f"[add_shell] feet (class collision) set to contype {FEET_CONTYPE} / "
+        f"conaffinity {FEET_CONAFFINITY}: world + the other foot, never the shell."
+    )
     return 0
 
 
