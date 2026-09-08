@@ -44,8 +44,36 @@ assert MICRODUCK_WALK_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_WALK_BA
 assert MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML.exists(), f"XML not found: {MICRODUCK_GROUNDCONTACT_ROLLERS_BACKLASH_XML}"
 
 
+# --- The shell (go-grgs ADR 0011 / docs/specs/shell.md) ----------------------
+# add_shell.py injects world-collision primitives into the walk models
+# (shell_trunk, shell_neck, shell_head, shell_thigh_left/right,
+# shell_shank_left/right) so a policy can feel a wall, and gives the shell AND
+# the feet conaffinity 0: they touch the world (default contype/conaffinity
+# 1/1) and can never touch another robot geom, so the self_collision subtree
+# sensor cannot see them. MICRODUCK_NO_SHELL=1 strips the shell at load and
+# puts the feet back on conaffinity 1, reproducing the pre-shell model exactly.
+# Read once at import — reload this module if you change the env var in a test.
+NO_SHELL: bool = os.environ.get("MICRODUCK_NO_SHELL", "0") == "1"
+SHELL_GEOM_PREFIX = "shell_"
+
+
+def strip_shell(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+    """Delete the shell geoms and give the feet their conaffinity back."""
+    for geom in list(spec.geoms):
+        if geom.name.startswith(SHELL_GEOM_PREFIX):
+            spec.delete(geom)
+    for geom in spec.geoms:
+        if geom.name.endswith("_collision"):
+            geom.conaffinity = 1
+    return spec
+
+
+def _maybe_strip_shell(spec: mujoco.MjSpec) -> mujoco.MjSpec:
+    return strip_shell(spec) if NO_SHELL else spec
+
+
 def get_walk_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML))
+    return _maybe_strip_shell(mujoco.MjSpec.from_file(str(MICRODUCK_WALK_XML)))
 
 
 def get_standup_spec() -> mujoco.MjSpec:
@@ -75,7 +103,7 @@ def get_backlash_spec() -> mujoco.MjSpec:
 
 
 def get_walk_backlash_spec() -> mujoco.MjSpec:
-    return mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML))
+    return _maybe_strip_shell(mujoco.MjSpec.from_file(str(MICRODUCK_WALK_BACKLASH_XML)))
 
 
 def get_rollers_backlash_spec() -> mujoco.MjSpec:
@@ -114,6 +142,27 @@ FULL_COLLISION = CollisionCfg(
     priority={r"^(left|right)_foot_collision$": 1},
     friction={r"^(left|right)_foot_collision$": (1.0,)},
 )
+
+# Shelled walk models only. CollisionCfg REWRITES contype/conaffinity on every
+# geom it matches (and disables every named geom it does not), so the XML's
+# conaffinity="0" is not enough — it has to be repeated here or mjlab would put
+# the feet back on 1 and delete the shell. conaffinity=0 on the whole matched
+# set is the ADR 0011 rule: world contact only, no robot-to-robot pair.
+# `.*_collision` keeps its condim/priority/friction table untouched; the shell
+# is a separate pattern so it never falls into the feet's rules or into the
+# `feet_ground_contact` sensor's `^(left|right)_foot_collision$` match.
+SHELL_COLLISION = CollisionCfg(
+    geom_names_expr=[".*_collision", r"^shell_.*"],
+    contype=1,
+    conaffinity=0,
+    condim={r"^(left|right)_foot_collision$": 3, r"^shell_.*": 3, ".*_collision": 1},
+    priority={r"^(left|right)_foot_collision$": 1},
+    friction={r"^(left|right)_foot_collision$": (1.0,)},
+)
+
+# Under MICRODUCK_NO_SHELL=1 the spec has no shell geoms left, so the walk
+# models fall back to the pre-shell collision cfg byte for byte.
+WALK_COLLISION = FULL_COLLISION if NO_SHELL else SHELL_COLLISION
 
 # -- Old actuator (XML position, MuJoCo built-in PD + friction) --
 # actuators = DelayedActuatorCfg(
@@ -171,7 +220,7 @@ BACKLASH_HOME_FRAME = EntityCfg.InitialStateCfg(
 MICRODUCK_WALK_ROBOT_CFG = EntityCfg(
     spec_fn=get_walk_spec,
     init_state=HOME_FRAME,
-    collisions=(FULL_COLLISION,),
+    collisions=(WALK_COLLISION,),  # shelled model — see SHELL_COLLISION
     articulation=EntityArticulationInfoCfg(
         actuators=(actuators,),
         soft_joint_pos_limit_factor=0.9,
@@ -218,7 +267,7 @@ MICRODUCK_BACKLASH_ROBOT_CFG = EntityCfg(
 MICRODUCK_WALK_BACKLASH_ROBOT_CFG = EntityCfg(
     spec_fn=get_walk_backlash_spec,
     init_state=BACKLASH_HOME_FRAME,
-    collisions=(FULL_COLLISION,),
+    collisions=(WALK_COLLISION,),  # shelled model — mirrors the base walk cfg
     articulation=EntityArticulationInfoCfg(
         actuators=(backlash_actuators,),
         soft_joint_pos_limit_factor=0.9,

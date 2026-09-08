@@ -36,7 +36,8 @@ Never launch a long run without one.
 - `src/mjlab_microduck/tasks/backlash.py` — wraps any env cfg into its backlash twin.
 - `src/mjlab_microduck/robot/microduck_constants.py` — robot cfgs, HOME frame, BAM actuator cfg.
 - `src/mjlab_microduck/robot/microduck/` — MJCF exports from Onshape
-  (onshape-to-robot, one `config_mjcf_*.json` per model) + scenes + `add_backlash.py`.
+  (onshape-to-robot, one `config_mjcf_*.json` per model) + scenes +
+  `add_backlash.py` + `add_shell.py` (post-processors, run last on export).
 - `src/mjlab_microduck/actuator/friction_dr_bam.py` — BAM actuator + friction DR + backlash encoder.
 - `src/mjlab_microduck/export.py` — the ONNX export (normalizer baked in); `scripts/export.py` wraps it.
 - `src/mjlab_microduck/publish/` — `uv run publish`: schema-2 manifest builder + ONNX shape/smoke
@@ -82,6 +83,20 @@ Never launch a long run without one.
   is punished for correcting what it sees.
 - `-Backlash-` task variants must mirror their base task's robot model
   (walk / groundcontact / rollers) so backlash A/B comparisons are unconfounded.
+- **The walk models carry a SHELL** (`add_shell.py`, last post-import command of
+  `config_mjcf_walk*.json`, already applied to the committed
+  `robot_walk{,_backlash}.xml`): `shell_trunk/neck/head/thigh_*/shank_*`
+  primitives fitted to each body's visual-mesh extent minus 3 mm, in ray group
+  3, so a policy can feel a wall (go-grgs ADR 0011). Their bitmask is
+  **contype 1 / conaffinity 0 — and so is the feet's**: they touch the world
+  (default 1/1) and can never touch another robot geom, so the `self_collision`
+  subtree sensor is unchanged (the `self_collision_only` 2/2 geoms keep their
+  bit). `SHELL_COLLISION` in `microduck_constants.py` must repeat that mask —
+  mjlab's `CollisionCfg` rewrites contype/conaffinity and disables every named
+  geom it doesn't match, so the XML alone is not enough. `MICRODUCK_NO_SHELL=1`
+  strips the shell at load and restores the feet, reproducing the pre-shell
+  model exactly (`tests/test_shell.py` locks all of it at the compiled-model
+  door). Name new world-collision geoms `shell_*`, never `*_collision`.
 
 ## Building a new env — the workflow
 
